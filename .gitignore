@@ -11,3 +11,5 @@ dist-electron/
 Thumbs.db
 .env.*
 !.env.example
+supabase.exe  
+supabase/.temp/ 
