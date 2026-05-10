@@ -1,0 +1,13 @@
+.env
+.env.test
+.env.local
+.env.production
+e2e/.auth.json
+node_modules/
+dist/
+dist-electron/
+*.log
+.DS_Store
+Thumbs.db
+.env.*
+!.env.example

@@ -1,0 +1,46 @@
+REMEDACAREOS HOSPITAL MANAGEMENT SYSTEM
+END USER LICENSE AGREEMENT (EULA)
+Version 1.0 | 2026
+
+PLEASE READ THIS AGREEMENT CAREFULLY BEFORE INSTALLING OR USING REMEDACAREOS.
+BY CLICKING "I AGREE" YOU ACCEPT THESE TERMS.
+
+1. DEFINITIONS
+"Software" refers to RemedacareOS Hospital Management System.
+"Licensee" refers to the hospital or healthcare facility using this Software.
+"User" refers to any individual authorized by the Licensee.
+"Patient Data" refers to any health information entered into the Software.
+
+2. GRANT OF LICENSE
+The Developer grants the Licensee a non-exclusive, non-transferable license to
+install and use the Software for internal healthcare management operations.
+
+3. RESTRICTIONS
+The Licensee shall NOT copy, resell, reverse engineer, decompile, modify,
+rent, lease, or transfer the Software to any third party without written consent.
+
+4. DATA PRIVACY
+The Licensee is responsible for compliance with the Kenya Data Protection Act 2019.
+The Developer implements security measures but does not guarantee absolute security.
+
+5. INTELLECTUAL PROPERTY
+The Software is the exclusive property of the Developer protected by copyright law.
+
+6. DISCLAIMER OF WARRANTIES
+THE SOFTWARE IS PROVIDED AS IS WITHOUT WARRANTY OF ANY KIND.
+
+7. LIMITATION OF LIABILITY
+THE DEVELOPER SHALL NOT BE LIABLE FOR ANY INDIRECT OR CONSEQUENTIAL DAMAGES.
+REMEDACAREOS IS A MANAGEMENT TOOL NOT A SUBSTITUTE FOR MEDICAL JUDGMENT.
+
+8. TERMINATION
+This Agreement terminates immediately upon breach of any provision.
+
+9. GOVERNING LAW
+This Agreement is governed by the laws of the Republic of Kenya.
+
+10. CONTACT
+Email: support@remedacare.co.ke
+Website: www.remedacare.co.ke
+
+Copyright 2026 RemedacareOS. All Rights Reserved.
