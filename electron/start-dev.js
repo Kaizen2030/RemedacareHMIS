@@ -1,46 +1,94 @@
 const { spawn } = require('child_process')
 const http = require('http')
+const path = require('path')
 
 const PORT = 5174
-const electronBin = require('electron') // points to the actual binary
+const electronBin = require('electron')
+const vitePackageJson = require.resolve('vite/package.json')
+const viteBin = path.join(path.dirname(vitePackageJson), 'bin', 'vite.js')
+
+let viteProcess = null
+let startedVite = false
+
+function createChildEnv() {
+  const nextEnv = { ...process.env }
+  delete nextEnv.ELECTRON_RUN_AS_NODE
+  return nextEnv
+}
+
+function isViteReady() {
+  return new Promise((resolve) => {
+    const req = http.get(`http://localhost:${PORT}`, () => {
+      resolve(true)
+    })
+
+    req.on('error', () => {
+      resolve(false)
+    })
+
+    req.setTimeout(1000, () => {
+      req.destroy()
+      resolve(false)
+    })
+  })
+}
 
 function waitForVite(retries = 30) {
   return new Promise((resolve, reject) => {
-    const attempt = () => {
-      http.get(`http://localhost:${PORT}`, (res) => {
+    const attempt = async () => {
+      if (await isViteReady()) {
         resolve()
-      }).on('error', () => {
-        if (retries-- > 0) {
-          console.log(`Waiting for Vite on port ${PORT}... (${retries} retries left)`)
-          setTimeout(attempt, 1000)
-        } else {
-          reject(new Error('Vite never started. Check that port ' + PORT + ' is free.'))
-        }
-      })
+        return
+      }
+
+      if (retries-- > 0) {
+        console.log(`Waiting for Vite on port ${PORT}... (${retries} retries left)`)
+        setTimeout(attempt, 1000)
+        return
+      }
+
+      reject(new Error(`Vite never started on port ${PORT}.`))
     }
+
     setTimeout(attempt, 1000)
   })
 }
 
-console.log('Starting Vite...')
-const vite = spawn('npx', ['vite', '--port', String(PORT)], {
-  stdio: 'inherit',
-  shell: true
-})
+function cleanupVite() {
+  if (startedVite && viteProcess && !viteProcess.killed) {
+    viteProcess.kill()
+  }
+}
 
-vite.on('error', (err) => {
-  console.error('Failed to start Vite:', err)
-  process.exit(1)
-})
+async function ensureVite() {
+  if (await isViteReady()) {
+    console.log(`Vite is already running on port ${PORT}. Reusing it.`)
+    return
+  }
 
-waitForVite()
-  .then(() => {
+  console.log('Starting Vite...')
+  startedVite = true
+  viteProcess = spawn(process.execPath, [viteBin, '--port', String(PORT)], {
+    stdio: 'inherit',
+    env: createChildEnv()
+  })
+
+  viteProcess.on('error', (err) => {
+    console.error('Failed to start Vite:', err)
+    process.exit(1)
+  })
+
+  await waitForVite()
+}
+
+async function main() {
+  try {
+    await ensureVite()
     console.log('Vite is ready! Launching Electron...')
 
-    // Use the electron binary directly instead of npx
     const electron = spawn(electronBin, ['.'], {
       stdio: 'inherit',
-      shell: false
+      env: createChildEnv()
     })
 
     electron.on('error', (err) => {
@@ -49,22 +97,24 @@ waitForVite()
 
     electron.on('close', (code) => {
       console.log('Electron closed. Shutting down Vite...')
-      vite.kill()
+      cleanupVite()
       process.exit(code)
     })
-  })
-  .catch((err) => {
+  } catch (err) {
     console.error(err.message)
-    vite.kill()
+    cleanupVite()
     process.exit(1)
-  })
+  }
+}
 
 process.on('SIGINT', () => {
   console.log('\nShutting down...')
-  vite.kill()
+  cleanupVite()
   process.exit(0)
 })
 
 process.on('exit', () => {
-  vite.kill()
+  cleanupVite()
 })
+
+main()
