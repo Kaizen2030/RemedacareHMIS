@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import supabase from '../supabase'
 import { sendPatientNotification } from '../utils/notifications'
+import hmsLogo from '../../icon.png'
 
 const AUTH_GATE_KEY = 'remedacare:auth:gate'
 const KNOWN_USERS_KEY = 'remedacare:auth:known_users'
@@ -10,8 +11,8 @@ const REMEMBER_PREF_KEY = 'remedacare:auth:remember_device'
 const LOGIN_ATTEMPTS_KEY = 'remedacare:auth:login_attempts'
 const BRANDING_CACHE_KEY = 'remedacare:auth:branding'
 const DEFAULT_BRANDING = {
-  hospitalName: 'RemedacareHMIS',
-  logoBase64: '',
+  hospitalName: 'RemedacareHMS',
+  logoBase64: hmsLogo,
   level: 'Kenya',
   primaryColor: '#0F6E56',
 }
@@ -19,6 +20,8 @@ const MFA_WINDOW_MS = 5 * 60 * 1000
 const DEVICE_TRUST_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 const LOGIN_LOCK_WINDOW_MS = 15 * 60 * 1000
 const MAX_LOGIN_ATTEMPTS = 5
+const PASSWORD_RESET_REDIRECT_URL = 'remedacarehms://reset'
+const ACCOUNT_CONFIRM_REDIRECT_URL = 'https://www.pharmacourse.co.ke/activate/remedacarehmis'
 
 function isRlsError(error) {
   const message = error?.message?.toLowerCase() || ''
@@ -616,7 +619,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
       email: profile.email,
       options: {
         shouldCreateUser: false,
-        emailRedirectTo: 'remedacare://reset',
+        emailRedirectTo: PASSWORD_RESET_REDIRECT_URL,
       },
     })
 
@@ -911,8 +914,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
     setLoading(true)
     setError('')
     try {
-      const redirectTo = 'remedacare://reset'
-      const { error: err } = await supabase.auth.resetPasswordForEmail(email, { redirectTo })
+      const { error: err } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: PASSWORD_RESET_REDIRECT_URL })
       if (err) throw err
 
       setResetSent(true)
@@ -934,6 +936,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
         email,
         password,
         options: {
+          emailRedirectTo: ACCOUNT_CONFIRM_REDIRECT_URL,
           data: {
             full_name: name,
             pending_hospital_name: newHospitalName.trim(),
@@ -972,7 +975,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
             <div style={{ ...st.logoIcon, color: brandAccent }}>Hospital</div>
           )}
           <div style={st.hospitalBadge}>Kenya {displayBranding.level || 'Level Facility'}</div>
-          <h1 style={{ ...st.logoText, color: brandAccent }}>{displayBranding.hospitalName || 'RemedacareHMIS'}</h1>
+          <h1 style={{ ...st.logoText, color: brandAccent }}>{displayBranding.hospitalName || 'RemedacareHMS'}</h1>
           <p style={st.logoSub}>Secure clinical sign-in and hospital workspace access</p>
         </div>
 
@@ -1275,7 +1278,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
           </>
         )}
 
-        <p style={st.version}>RemedacareHMIS v1.0 • Secure Hospital Management</p>
+        <p style={st.version}>RemedacareHMS v1.0 • Secure Hospital Management</p>
       </div>
     </div>
   )
@@ -1316,7 +1319,7 @@ const st = {
     zIndex: 1,
   },
   logoArea: { textAlign: 'center', marginBottom: '24px' },
-  logoImage: { width: 76, height: 76, objectFit: 'cover', borderRadius: 18, marginBottom: 10, border: '1px solid #E6ECE8' },
+  logoImage: { width: 76, height: 76, objectFit: 'contain', marginBottom: 10 },
   logoIcon: {
     width: 76,
     height: 76,
@@ -1532,3 +1535,4 @@ const st = {
     marginTop: '20px',
   },
 }
+
