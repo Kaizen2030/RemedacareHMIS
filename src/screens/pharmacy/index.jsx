@@ -4,6 +4,7 @@ import supabase from '../../supabase'
 import { useHospital } from '../../context'
 import useStaff from '../../hooks/useStaff'
 import { findInventoryMatch as matchInventoryDrug, matchesDrugSearch, normalizeDrugText } from '../../utils/pharmacy'
+import { validatePrescriptionPpb } from '../../utils/ppbCatalogue'
 import PatientWorkflowCard from '../../components/PatientWorkflowCard'
 import { executeWithFallback, omitKeys } from '../../utils/dbCompat'
 import { broadcastAntibiogramUpdated, broadcastPrescriptionsChanged, broadcastStewardshipChanged, broadcastWorkflowChanged } from '../../utils/workflowEvents'
@@ -11,6 +12,9 @@ import { buildWorkflowInvoiceNote, createServiceLine, parseWorkflowInvoiceNote, 
 import { buildAmrInterventions, summarizeAmrInterventions } from '../../utils/hospitalSignals'
 import { executeMicrobiologyQuery } from '../../utils/microbiologyResults'
 import { logAudit } from '../../utils/audit'
+import { buildMessage, DEFAULT_TEMPLATES, fetchNotificationConfig, getNotificationSetting, sendPatientNotification } from '../../utils/notifications'
+import { detectPrescriptionInteractions, getAwareClassification, isAntibioticDrug } from '../../utils/consultationClinical'
+import { formatKenyanPhoneForWhatsApp, getDrugCounselling } from '../../utils/pharmacyCounselling'
 import { colors as C, typography } from '../../theme'
 import PharmacyDispenseQueue from './PharmacyDispenseQueue'
 import PharmacyPOS from './PharmacyPOS'
@@ -38,6 +42,7 @@ const PAYMENT_OPTIONS = [
 const NON_INSURANCE = ['Cash', 'M-Pesa']
 const SHA_METHOD = 'SHA (Social Health Authority)'
 const CREDIT_METHOD = 'Credit'
+const SPLIT_METHOD = 'Split Cash + M-Pesa'
 const FILTERS = ['Pending', 'Approved', 'Released', 'Rejected', 'All']
 const PHARMACY_QUEUE_VISIT_STATUSES = ['Prescription', 'Pharmacy', 'Admission Requested', 'Admitted']
 
@@ -80,6 +85,43 @@ const css = {
 
 function formatKES(value) {
   return `KES ${Number(value || 0).toLocaleString()}`
+}
+
+function formatElapsedMinutes(minutes) {
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  const remainder = minutes % 60
+  return remainder ? `${hours}h ${remainder}m` : `${hours}h`
+}
+
+function getPrescriptionAgeMeta(createdAt, nowValue = Date.now()) {
+  const created = new Date(createdAt || 0).getTime()
+  const minutes = created ? Math.max(0, Math.floor((nowValue - created) / 60000)) : 0
+  let color = 'green'
+  let label = `Age ${formatElapsedMinutes(minutes)}`
+  if (minutes >= 240) color = 'red'
+  else if (minutes >= 120) color = 'yellow'
+  return { minutes, color, label }
+}
+
+function matchesAllergyDrug(allergyText = '', drugName = '', genericName = '') {
+  const allergy = normalizeDrugText(allergyText)
+  if (!allergy) return false
+  const candidates = [normalizeDrugText(drugName), normalizeDrugText(genericName)].filter(Boolean)
+  return candidates.some(candidate => candidate && (candidate.includes(allergy) || allergy.includes(candidate)))
+}
+
+function extractAllergyWarnings(allergies, items = []) {
+  const allergyList = String(allergies || '')
+    .split(/[,;\n]/)
+    .map(item => item.trim())
+    .filter(Boolean)
+
+  return allergyList.flatMap(allergy =>
+    items
+      .filter(item => matchesAllergyDrug(allergy, item.rx?.drug_name, item.inventoryItem?.generic_name || item.rx?.generic_name))
+      .map(item => `${item.rx?.drug_name || item.inventoryItem?.drug_name}: recorded allergy "${allergy}"`),
+  )
 }
 
 function getRxStatus(rx) {
@@ -775,6 +817,7 @@ function ReceiptModal({ invoice, hospitalName, onClose }) {
 
 function RxRow({ rx, meta, actionBusy, canApprovePrescription, canReleaseDrugs, onApprove, onReject, onRelease }) {
   const status = getRxStatus(rx)
+  const ageMeta = getPrescriptionAgeMeta(rx.created_at)
   const statusMeta = {
     Pending: { color: 'yellow', label: 'Pending' },
     Approved: { color: 'blue', label: 'Approved' },
@@ -796,8 +839,10 @@ function RxRow({ rx, meta, actionBusy, canApprovePrescription, canReleaseDrugs, 
           <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }}>
             <Badge color={statusMeta.color} label={statusMeta.label} />
             <Badge color={meta.stockColor} label={meta.stockLabel} />
+            <Badge color={ageMeta.color} label={ageMeta.label} />
             <Badge color="purple" label={`${formatKES(meta.unitPrice)} each`} />
             <Badge color="gray" label={`Line total ${formatKES(meta.lineTotal)}`} />
+            {isAntibioticDrug(rx.drug_name) && <Badge color="blue" label={`AWaRe ${getAwareClassification(rx.drug_name)}`} />}
           </div>
           {(rx.approved_by || rx.dispensed_by || rx.reject_reason) && (
             <div style={{ marginTop: '10px', fontSize: '11px', color: C.sub, lineHeight: 1.6 }}>
@@ -913,7 +958,11 @@ function PatientGroupCard({
             </div>
             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', fontSize: '12px', color: C.sub, marginTop: '6px' }}>
               {(group.age || group.gender) && <span>{group.age ? `${group.age}y` : ''} {group.gender || ''}</span>}
-              {group.phone && <span>{group.phone}</span>}
+              {group.phone && (
+                <a href={group.whatsappUrl || '#'} target="_blank" rel="noreferrer" onClick={event => { if (!group.whatsappUrl) event.preventDefault() }} style={{ color: C.blue, textDecoration: 'none', fontWeight: 700 }}>
+                  {group.phone} • WhatsApp
+                </a>
+              )}
               {group.bloodGroup && <span>Blood {group.bloodGroup}</span>}
               {group.visitNumber && <span>Visit {group.visitNumber}</span>}
               {group.visitType && <span>{group.visitType}</span>}
@@ -923,11 +972,13 @@ function PatientGroupCard({
               {latestDate > 0 && <span>{new Date(latestDate).toLocaleString('en-KE')}</span>}
             </div>
             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '12px' }}>
+              <Badge color={group.ageMeta?.color || 'green'} label={group.ageMeta?.label || 'New'} />
               {counts.Pending > 0 && <Badge color="yellow" label={`${counts.Pending} pending`} />}
               {counts.Approved > 0 && <Badge color="blue" label={`${counts.Approved} approved`} />}
               {counts.Released > 0 && <Badge color="green" label={`${counts.Released} released`} />}
               {counts.Rejected > 0 && <Badge color="red" label={`${counts.Rejected} rejected`} />}
               {needsReview && <Badge color="red" label="Review needed" />}
+              {group.amrAlertCount > 0 && <Badge color="red" label={`AMR alert ${group.amrAlertCount}`} />}
             </div>
           </div>
 
@@ -1030,11 +1081,16 @@ export default function Pharmacy() {
 
   const [prescriptions, setPrescriptions] = useState([])
   const [inventory, setInventory] = useState([])
+  const [drugBatches, setDrugBatches] = useState([])
+  const [salesLedgerRows, setSalesLedgerRows] = useState([])
+  const [invoiceRows, setInvoiceRows] = useState([])
+  const [purchaseOrders, setPurchaseOrders] = useState([])
   const [microbiologyResults, setMicrobiologyResults] = useState([])
   const [stewardshipInterventions, setStewardshipInterventions] = useState([])
   const [stewardshipSchemaReady, setStewardshipSchemaReady] = useState(true)
   const [latestVitalsByVisit, setLatestVitalsByVisit] = useState({})
   const [loading, setLoading] = useState(true)
+  const [nowTick, setNowTick] = useState(Date.now())
   const [rxSearch, setRxSearch] = useState('')
   const [rxFilter, setRxFilter] = useState('Pending')
   const [pharmacistName, setPharmacistName] = useState('')
@@ -1042,6 +1098,7 @@ export default function Pharmacy() {
   const [actionBusy, setActionBusy] = useState(false)
   const [rejectModal, setRejectModal] = useState(null)
   const [releaseModal, setReleaseModal] = useState(null)
+  const [ppbRiskModal, setPpbRiskModal] = useState(null)
   const [receiptModal, setReceiptModal] = useState(null)
   const [stewardshipModal, setStewardshipModal] = useState(null)
   const [stewardshipSaving, setStewardshipSaving] = useState(false)
@@ -1071,10 +1128,19 @@ export default function Pharmacy() {
     }
   }, [pharmacistName, pharmacyStaff])
 
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowTick(Date.now()), 60000)
+    return () => window.clearInterval(timer)
+  }, [])
+
   async function fetchData() {
     if (!hospitalId) {
       setPrescriptions([])
       setInventory([])
+      setDrugBatches([])
+      setSalesLedgerRows([])
+      setInvoiceRows([])
+      setPurchaseOrders([])
       setMicrobiologyResults([])
       setStewardshipInterventions([])
       setStewardshipSchemaReady(true)
@@ -1087,9 +1153,30 @@ export default function Pharmacy() {
 
     try {
       // Run core queries — wrap optional ones so they never crash the whole fetch
-      const [rxResult, stockResult] = await Promise.all([
+      const monthStart = new Date()
+      monthStart.setDate(1)
+      monthStart.setHours(0, 0, 0, 0)
+      const ninetyDaysAgo = new Date(Date.now() - (90 * 24 * 60 * 60 * 1000)).toISOString()
+
+      const [rxResult, stockResult, batchResult, ledgerResult, invoiceResult, purchaseOrdersResult] = await Promise.all([
         supabase.from('prescriptions').select('*').eq('hospital_id', hospitalId).in('status', ['Pending', 'Approved', 'Released', 'Rejected']).order('created_at', { ascending: false }),
         supabase.from('pharmacy_inventory').select('id, drug_name, generic_name, category, dosage_form, strength, quantity_in_stock, reorder_level, selling_price, unit_cost, expiry_date, supplier, location').eq('hospital_id', hospitalId).order('drug_name'),
+        executeWithFallback(
+          () => supabase.from('drug_batches').select('id, drug_name, batch_number, quantity_remaining, expiry_date, supplier, status, created_at').eq('hospital_id', hospitalId).order('expiry_date', { ascending: true }),
+          async () => ({ data: [], error: null, compatFallback: true }),
+        ),
+        executeWithFallback(
+          () => supabase.from('sales_ledger').select('id, hospital_id, receipt_number, drug_name, qty_sold, total_kes, payment_method, mpesa_ref, served_by, notes, prescription_id, sold_at').eq('hospital_id', hospitalId).gte('sold_at', ninetyDaysAgo).order('sold_at', { ascending: false }),
+          async () => ({ data: [], error: null, compatFallback: true }),
+        ),
+        executeWithFallback(
+          () => supabase.from('invoices').select('id, amount_kes, paid_kes, status, created_at, invoice_no').eq('hospital_id', hospitalId).gte('created_at', monthStart.toISOString()).order('created_at', { ascending: false }),
+          async () => ({ data: [], error: null, compatFallback: true }),
+        ),
+        executeWithFallback(
+          () => supabase.from('purchase_orders').select('id, lpo_number, supplier_name, expected_delivery, status, created_at, purchase_order_items(item_name, quantity_ordered)').eq('hospital_id', hospitalId).order('created_at', { ascending: false }).limit(80),
+          async () => ({ data: [], error: null, compatFallback: true }),
+        ),
       ])
 
       if (rxResult.error) console.error('Pharmacy prescriptions load failed', rxResult.error)
@@ -1185,6 +1272,10 @@ export default function Pharmacy() {
 
       setPrescriptions(filteredRx)
       setInventory(stockResult.data || [])
+      setDrugBatches(batchResult?.data || [])
+      setSalesLedgerRows(ledgerResult?.data || [])
+      setInvoiceRows(invoiceResult?.data || [])
+      setPurchaseOrders(purchaseOrdersResult?.data || [])
       setMicrobiologyResults(microRows)
       setStewardshipInterventions(interventionRows)
       setStewardshipSchemaReady(stewardshipReady)
@@ -1269,6 +1360,80 @@ export default function Pharmacy() {
     }
   }
 
+  const latestPoByDrug = useMemo(() => {
+    const map = {}
+    purchaseOrders.forEach(order => {
+      ;(order.purchase_order_items || []).forEach(item => {
+        const key = normalizeDrugText(item.item_name)
+        if (!key || map[key]) return
+        map[key] = order
+      })
+    })
+    return map
+  }, [purchaseOrders])
+
+  function getMatchingBatches(inventoryItem) {
+    if (!inventoryItem) return []
+    const names = [inventoryItem.drug_name, inventoryItem.generic_name].map(normalizeDrugText).filter(Boolean)
+    return drugBatches.filter(batch => {
+      const batchName = normalizeDrugText(batch.drug_name)
+      return names.some(name => batchName === name || batchName.includes(name) || name.includes(batchName))
+    })
+  }
+
+  function buildBatchPlan(inventoryItem, quantityNeeded) {
+    const today = new Date().toISOString().slice(0, 10)
+    const batches = getMatchingBatches(inventoryItem)
+      .filter(batch => Number(batch.quantity_remaining || 0) > 0 && String(batch.status || 'Active').toLowerCase() !== 'written off')
+      .sort((a, b) => String(a.expiry_date || '9999-12-31').localeCompare(String(b.expiry_date || '9999-12-31')))
+
+    const validBatches = batches.filter(batch => !batch.expiry_date || batch.expiry_date >= today)
+    const expiredBatches = batches.filter(batch => batch.expiry_date && batch.expiry_date < today)
+    let remaining = Math.max(0, Number(quantityNeeded || 0))
+    const allocations = []
+
+    validBatches.forEach(batch => {
+      if (remaining <= 0) return
+      const available = Number(batch.quantity_remaining || 0)
+      if (available <= 0) return
+      const used = Math.min(remaining, available)
+      allocations.push({
+        batch_id: batch.id,
+        batch_number: batch.batch_number || 'Batch',
+        expiry_date: batch.expiry_date || null,
+        quantity: used,
+      })
+      remaining -= used
+    })
+
+    return {
+      allocations,
+      availableQty: validBatches.reduce((sum, batch) => sum + Number(batch.quantity_remaining || 0), 0),
+      expiredQty: expiredBatches.reduce((sum, batch) => sum + Number(batch.quantity_remaining || 0), 0),
+      shortage: remaining,
+      expiredOnly: validBatches.length === 0 && expiredBatches.length > 0,
+      nextExpiry: validBatches[0]?.expiry_date || expiredBatches[0]?.expiry_date || null,
+    }
+  }
+
+  const stewardshipAlerts = useMemo(() => {
+    try {
+      return buildAmrInterventions({ results: microbiologyResults, prescriptions, interventions: stewardshipInterventions, maxAgeDays: 21 })
+    } catch (e) {
+      console.warn('buildAmrInterventions error', e)
+      return []
+    }
+  }, [microbiologyResults, prescriptions, stewardshipInterventions])
+
+  const stewardshipSummary = useMemo(() => {
+    try {
+      return summarizeAmrInterventions(stewardshipAlerts)
+    } catch (e) {
+      console.warn('summarizeAmrInterventions error', e)
+      return { pendingReview: 0, awaitingPrescriber: 0, highSeverity: 0, resistantOverlap: 0 }
+    }
+  }, [stewardshipAlerts])
+
   const grouped = useMemo(() => {
     const map = new Map()
     prescriptions.forEach(rx => {
@@ -1293,7 +1458,9 @@ export default function Pharmacy() {
           visitStatus: rx.visits?.status || null,
           visitId: rx.visit_id || null,
           patientId: rx.patients?.id || rx.patient_id || null,
+          whatsappUrl: rx.patients?.phone ? `https://wa.me/${formatKenyanPhoneForWhatsApp(rx.patients.phone)}` : null,
           latestVitals: latestVitalsByVisit[rx.visit_id] || null,
+          amrAlertCount: 0,
           drugs: [],
         })
       }
@@ -1305,12 +1472,19 @@ export default function Pharmacy() {
       group.drugs.push(rx)
     })
 
-    return Array.from(map.values()).sort((a, b) => {
+    return Array.from(map.values()).map(group => ({
+      ...group,
+      ageMeta: getPrescriptionAgeMeta(group.drugs.reduce((oldest, rx) => {
+        const created = new Date(rx.created_at || 0).getTime()
+        return !oldest || created < oldest ? created : oldest
+      }, 0), nowTick),
+      amrAlertCount: stewardshipAlerts.filter(item => item.patientId && item.patientId === group.patientId).length,
+    })).sort((a, b) => {
       const aLatest = Math.max(...a.drugs.map(rx => new Date(rx.created_at || 0).getTime()))
       const bLatest = Math.max(...b.drugs.map(rx => new Date(rx.created_at || 0).getTime()))
       return bLatest - aLatest
     })
-  }, [latestVitalsByVisit, prescriptions])
+  }, [latestVitalsByVisit, nowTick, prescriptions, stewardshipAlerts])
 
   const filteredGroups = useMemo(() => {
     return grouped.filter(group => {
@@ -1318,6 +1492,7 @@ export default function Pharmacy() {
       const statusMatch = rxFilter === 'All' || group.drugs.some(rx => getRxStatus(rx) === rxFilter)
       const searchMatch = !search ||
         group.patientName.toLowerCase().includes(search) ||
+        String(group.phone || '').toLowerCase().includes(search) ||
         String(group.visitNumber || '').toLowerCase().includes(search) ||
         String(group.doctor || '').toLowerCase().includes(search) ||
         group.drugs.some(rx => matchesDrugSearch(search, { drug_name: rx.drug_name }))
@@ -1325,24 +1500,6 @@ export default function Pharmacy() {
       return statusMatch && searchMatch
     })
   }, [grouped, rxFilter, rxSearch])
-
-  const stewardshipAlerts = useMemo(() => {
-    try {
-      return buildAmrInterventions({ results: microbiologyResults, prescriptions, interventions: stewardshipInterventions, maxAgeDays: 21 })
-    } catch (e) {
-      console.warn('buildAmrInterventions error', e)
-      return []
-    }
-  }, [microbiologyResults, prescriptions, stewardshipInterventions])
-
-  const stewardshipSummary = useMemo(() => {
-    try {
-      return summarizeAmrInterventions(stewardshipAlerts)
-    } catch (e) {
-      console.warn('summarizeAmrInterventions error', e)
-      return { pendingReview: 0, awaitingPrescriber: 0, highSeverity: 0, resistantOverlap: 0 }
-    }
-  }, [stewardshipAlerts])
 
   const statusCounts = useMemo(() => {
     const counts = { All: prescriptions.length, Pending: 0, Approved: 0, Released: 0, Rejected: 0 }
@@ -1381,6 +1538,68 @@ export default function Pharmacy() {
       releasedToday,
     }
   }, [grouped, prescriptions])
+
+  const reorderItems = useMemo(() => {
+    return inventory
+      .filter(item => Number(item.quantity_in_stock || 0) <= Number(item.reorder_level || 10))
+      .map(item => {
+        const reorderKey = normalizeDrugText(item.drug_name)
+        return {
+          ...item,
+          latestOrder: latestPoByDrug[reorderKey] || null,
+        }
+      })
+      .sort((a, b) => Number(a.quantity_in_stock || 0) - Number(b.quantity_in_stock || 0))
+  }, [inventory, latestPoByDrug])
+
+  const analytics = useMemo(() => {
+    const monthPrefix = new Date().toISOString().slice(0, 7)
+    const monthSales = salesLedgerRows.filter(row => String(row.receipt_number || '').startsWith('RX-') && String(row.sold_at || '').startsWith(monthPrefix))
+    const totalPharmacyRevenue = monthSales.reduce((sum, row) => sum + Number(row.total_kes || 0), 0)
+    const totalHospitalRevenue = invoiceRows.reduce((sum, row) => sum + Number(row.paid_kes || 0), 0)
+    const topMap = {}
+    monthSales.forEach(row => {
+      const key = row.drug_name || 'Drug'
+      if (!topMap[key]) topMap[key] = { drug_name: key, quantity: 0, revenue: 0 }
+      topMap[key].quantity += Number(row.qty_sold || 0)
+      topMap[key].revenue += Number(row.total_kes || 0)
+    })
+    const topDispensed = Object.values(topMap).sort((a, b) => b.quantity - a.quantity).slice(0, 10)
+
+    const thirtyDaysAgo = new Date(Date.now() - (30 * 24 * 60 * 60 * 1000))
+    const slowMoving = inventory.filter(item => {
+      const drugKey = normalizeDrugText(item.drug_name)
+      const lastSale = salesLedgerRows.find(row =>
+        String(row.receipt_number || '').startsWith('RX-')
+        && normalizeDrugText(row.drug_name) === drugKey,
+      )
+      return !lastSale || new Date(lastSale.sold_at || 0) < thirtyDaysAgo
+    })
+
+    const shrinkage = inventory
+      .map(item => {
+        const batchTotal = getMatchingBatches(item)
+          .reduce((sum, batch) => sum + Number(batch.quantity_remaining || 0), 0)
+        const stockTotal = Number(item.quantity_in_stock || 0)
+        return {
+          drug_name: item.drug_name,
+          expected: batchTotal,
+          actual: stockTotal,
+          variance: stockTotal - batchTotal,
+        }
+      })
+      .filter(item => item.variance !== 0)
+      .sort((a, b) => Math.abs(b.variance) - Math.abs(a.variance))
+
+    return {
+      topDispensed,
+      totalPharmacyRevenue,
+      totalHospitalRevenue,
+      pharmacyRevenuePercent: totalHospitalRevenue > 0 ? Math.round((totalPharmacyRevenue / totalHospitalRevenue) * 100) : 0,
+      slowMoving,
+      shrinkage,
+    }
+  }, [getMatchingBatches, inventory, invoiceRows, salesLedgerRows])
 
   function openStewardshipModal(item) {
     setStewardshipModal({
@@ -1597,9 +1816,105 @@ export default function Pharmacy() {
     setReleaseModal({ group, items })
   }
 
+  async function handleGenerateReorderLpo(item, expectedDeliveryDate) {
+    if (!hospitalId || !item) return
+    const supplierName = item.supplier || 'Supplier not set'
+    const lpoNumber = `PH-LPO-${new Date().getFullYear()}-${String(purchaseOrders.length + 1).padStart(4, '0')}`
+    const quantityNeeded = Math.max(1, Number(item.reorder_level || 10) - Number(item.quantity_in_stock || 0) || 1)
+    const totalValue = quantityNeeded * Number(item.unit_cost || 0)
+    const createdAt = new Date().toISOString()
+
+    const { data: order, error } = await supabase
+      .from('purchase_orders')
+      .insert({
+        hospital_id: hospitalId,
+        lpo_number: lpoNumber,
+        supplier_name: supplierName,
+        lpo_date: createdAt.slice(0, 10),
+        expected_delivery: expectedDeliveryDate || null,
+        status: 'Draft',
+        total_value: totalValue,
+        notes: `Generated from Pharmacy reorder list for ${item.drug_name}`,
+        created_by: pharmacistName || 'Pharmacy',
+        created_at: createdAt,
+      })
+      .select('id')
+      .single()
+
+    if (error) {
+      window.notifyFromLegacyAlert(`Could not create the LPO: ${error.message}`)
+      return
+    }
+
+    const { error: itemError } = await supabase.from('purchase_order_items').insert({
+      purchase_order_id: order.id,
+      item_name: item.drug_name,
+      quantity_ordered: quantityNeeded,
+      quantity_received: 0,
+      unit: item.dosage_form || item.strength || 'units',
+      unit_cost: Number(item.unit_cost || 0),
+      total_cost: totalValue,
+      batch_number: null,
+      expiry_date: null,
+      condition: 'Requested by Pharmacy reorder list',
+    })
+
+    if (itemError) {
+      window.notifyFromLegacyAlert(`LPO header saved, but line item creation failed: ${itemError.message}`)
+      return
+    }
+
+    const printWindow = window.open('', '_blank', 'width=900,height=800')
+    if (printWindow) {
+      printWindow.document.write(`
+        <html>
+          <head>
+            <title>${lpoNumber}</title>
+            <style>
+              body { font-family: Arial, sans-serif; padding: 24px; color: #111827; }
+              table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+              th, td { padding: 10px 8px; border-bottom: 1px solid #E5E7EB; text-align: left; }
+              .muted { color: #6B7280; font-size: 12px; }
+            </style>
+          </head>
+          <body>
+            <h1 style="margin-bottom:4px;">${hospitalName || 'Hospital'} Local Purchase Order</h1>
+            <div class="muted">${lpoNumber} • Supplier: ${supplierName}</div>
+            <div class="muted" style="margin-top:6px;">Expected delivery: ${expectedDeliveryDate || 'Not set'}</div>
+            <table>
+              <thead><tr><th>Drug</th><th>Supplier</th><th>Qty</th><th>Unit Cost</th><th>Total</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>${item.drug_name}</td>
+                  <td>${supplierName}</td>
+                  <td>${quantityNeeded}</td>
+                  <td>${formatKES(item.unit_cost || 0)}</td>
+                  <td>${formatKES(totalValue)}</td>
+                </tr>
+              </tbody>
+            </table>
+          </body>
+        </html>
+      `)
+      printWindow.document.close()
+      printWindow.focus()
+      printWindow.print()
+    }
+
+    fetchData()
+  }
+
+  function getPpbRiskResults(selectedItems) {
+    return validatePrescriptionPpb(selectedItems.map(item => ({
+      drug_name: item.inventoryItem?.drug_name || item.rx?.drug_name || '',
+      generic_name: item.inventoryItem?.generic_name || item.rx?.generic_name || '',
+    }))).filter(result => !result.approved || !result.sha_reimbursable)
+  }
+
   function validateReleaseItems(items) {
     const stockByInventoryId = new Map()
     const problems = []
+    const batchPlans = new Map()
 
     items.forEach(item => {
       if (!item?.inventoryItem) {
@@ -1610,6 +1925,14 @@ export default function Pharmacy() {
       const unitPrice = Number(item.inventoryItem.selling_price || 0)
       if (unitPrice <= 0) {
         problems.push(`${item.inventoryItem.drug_name || item.rx?.drug_name}: missing selling price`)
+      }
+      const batchPlan = buildBatchPlan(item.inventoryItem, quantity)
+      batchPlans.set(item.rx.id, batchPlan)
+      if (batchPlan.expiredOnly) {
+        problems.push(`${item.inventoryItem.drug_name}: only expired batch stock is available`)
+      }
+      if (batchPlan.shortage > 0) {
+        problems.push(`${item.inventoryItem.drug_name}: FEFO batches can only cover ${quantity - batchPlan.shortage} of ${quantity}`)
       }
 
       const current = stockByInventoryId.get(item.inventoryItem.id) || {
@@ -1631,10 +1954,11 @@ export default function Pharmacy() {
     return {
       problems,
       stockByInventoryId,
+      batchPlans,
     }
   }
 
-  async function handleRelease(form) {
+  async function handleRelease(form, options = {}) {
     if (!releaseModal?.items?.length) return
     if (!canReleaseDrugs) {
       window.notifyFromLegacyAlert('Only pharmacists can release drugs.')
@@ -1646,9 +1970,29 @@ export default function Pharmacy() {
     }
 
     const paymentMethod = normalizePaymentMethod(form.payment_method)
+    const finalPaymentMethod = options.forceCash ? 'Cash' : paymentMethod
     if (paymentMethod === 'M-Pesa' && !form.mpesa_ref.trim()) {
       window.notifyFromLegacyAlert('Enter the M-Pesa reference before releasing.')
       return
+    }
+    const pharmacistMember = pharmacyStaff.find(member => member.full_name === form.released_by.trim()) || null
+    const expectedPin = String(pharmacistMember?.dispense_pin || pharmacistMember?.pin_code || pharmacistMember?.pin || '').trim()
+    const enteredCode = String(form.security_code || '').trim()
+    if (expectedPin ? enteredCode !== expectedPin : enteredCode.toUpperCase() !== 'RELEASE') {
+      window.notifyFromLegacyAlert(expectedPin ? 'Incorrect pharmacist PIN.' : 'Type RELEASE to confirm this dispense.')
+      return
+    }
+    if (paymentMethod === SPLIT_METHOD) {
+      const splitCashAmount = Math.max(0, Number(form.split_cash_amount || 0))
+      const splitMpesaAmount = Math.max(0, Number(form.split_mpesa_amount || 0))
+      if (splitCashAmount + splitMpesaAmount <= 0) {
+        window.notifyFromLegacyAlert('Enter the cash and/or M-Pesa amounts for split payment.')
+        return
+      }
+      if (splitMpesaAmount > 0 && !form.mpesa_ref.trim()) {
+        window.notifyFromLegacyAlert('Enter the M-Pesa reference for the split payment.')
+        return
+      }
     }
 
     const reviewItems = releaseModal.group?.drugs?.length
@@ -1674,7 +2018,9 @@ export default function Pharmacy() {
         return {
           rx,
           inventoryItem,
-          quantity: Math.max(1, Number(rx.quantity || line.requestedQty || 1)),
+          requestedQuantity: Math.max(1, Number(rx.quantity || line.requestedQty || 1)),
+          quantity: Math.max(1, Number(line.dispenseQty || rx.quantity || line.requestedQty || 1)),
+          pendingQuantity: Math.max(0, Number(rx.quantity || line.requestedQty || 1) - Math.max(1, Number(line.dispenseQty || rx.quantity || line.requestedQty || 1))),
         }
       })
       .filter(Boolean)
@@ -1690,7 +2036,32 @@ export default function Pharmacy() {
       return
     }
 
-    const { problems, stockByInventoryId } = validateReleaseItems(selectedItems)
+    const majorInteractions = detectPrescriptionInteractions(selectedItems.map(item => ({
+      drug_name: item.inventoryItem?.drug_name || item.rx?.drug_name,
+    }))).filter(interaction => interaction.severity === 'Major')
+    const allergyWarnings = extractAllergyWarnings(releaseModal.group?.allergies, selectedItems)
+    if (majorInteractions.length > 0 && !form.acknowledge_interactions) {
+      window.notifyFromLegacyAlert(`Major drug interaction warning:\n\n${majorInteractions.map(item => `${item.pair.join(' + ')}: ${item.message}`).join('\n')}\n\nAcknowledge the warning in the release modal before dispensing.`)
+      return
+    }
+    if (allergyWarnings.length > 0 && !form.acknowledge_allergies) {
+      window.notifyFromLegacyAlert(`Patient allergy warning:\n\n${allergyWarnings.join('\n')}\n\nAcknowledge the warning in the release modal before dispensing.`)
+      return
+    }
+
+    if (paymentMethod === 'SHA' && !options.skipPpbCheck) {
+      const ppbRiskResults = getPpbRiskResults(selectedItems)
+      if (ppbRiskResults.length > 0) {
+        setPpbRiskModal({
+          form,
+          selectedItems,
+          results: ppbRiskResults,
+        })
+        return
+      }
+    }
+
+    const { problems, stockByInventoryId, batchPlans } = validateReleaseItems(selectedItems)
     if (problems.length > 0) {
       window.notifyFromLegacyAlert(`Release blocked:\n\n${problems.join('\n')}`)
       return
@@ -1707,6 +2078,8 @@ export default function Pharmacy() {
     const items = selectedItems.map(item => {
       const unitPrice = Number(item.inventoryItem.selling_price || 0)
       const total = unitPrice * item.quantity
+      const batchPlan = batchPlans.get(item.rx.id) || { allocations: [] }
+      const counselling = getDrugCounselling(item.inventoryItem.drug_name || item.rx.drug_name, item.inventoryItem.generic_name || item.rx.generic_name, item.rx)
       return createServiceLine({
         label: item.inventoryItem.drug_name || item.rx.drug_name,
         qty: item.quantity,
@@ -1721,25 +2094,57 @@ export default function Pharmacy() {
           prescription_id: item.rx.id,
           prescribed_drug: item.rx.drug_name,
           dispensed_drug: item.inventoryItem.drug_name || item.rx.drug_name,
+          batch_numbers: batchPlan.allocations.map(batch => batch.batch_number),
+          batch_expiry_dates: batchPlan.allocations.map(batch => batch.expiry_date),
+          aware_classification: getAwareClassification(item.inventoryItem.drug_name || item.rx.drug_name),
+          counselling_english: counselling.english,
+          counselling_swahili: counselling.swahili,
+          counselling_instructions: counselling.instructions,
+          pending_quantity: item.pendingQuantity,
         },
       })
     })
     const amount = items.reduce((sum, item) => sum + Number(item.total || 0), 0)
-    const isInsurance = isInsurancePaymentMethod(paymentMethod)
-    const isCredit = isCreditPaymentMethod(paymentMethod)
-    const paidAmount = NON_INSURANCE.includes(paymentMethod) ? amount : 0
-    const balanceAmount = NON_INSURANCE.includes(paymentMethod) ? 0 : amount
-    const invoiceStatus = NON_INSURANCE.includes(paymentMethod) ? 'Paid' : 'Pending'
-    const insurer = paymentMethod === 'SHA' ? 'SHA' : (isInsurance ? paymentMethod : null)
+    const isInsurance = isInsurancePaymentMethod(finalPaymentMethod)
+    const isCredit = isCreditPaymentMethod(finalPaymentMethod)
+    const splitCashAmount = Math.max(0, Number(form.split_cash_amount || 0))
+    const splitMpesaAmount = Math.max(0, Number(form.split_mpesa_amount || 0))
+    const splitTotal = splitCashAmount + splitMpesaAmount
+    const paidAmount = finalPaymentMethod === SPLIT_METHOD ? Math.min(amount, splitTotal) : (NON_INSURANCE.includes(finalPaymentMethod) ? amount : 0)
+    const balanceAmount = Math.max(0, amount - paidAmount)
+    const invoiceStatus = balanceAmount <= 0 ? 'Paid' : 'Pending'
+    const insurer = finalPaymentMethod === 'SHA' ? 'SHA' : (isInsurance ? finalPaymentMethod : null)
+    const splitSummary = finalPaymentMethod === SPLIT_METHOD
+      ? `Split payment: ${formatKES(splitCashAmount)} Cash + ${formatKES(splitMpesaAmount)} M-Pesa${form.mpesa_ref?.trim() ? ` (${form.mpesa_ref.trim()})` : ''}`
+      : null
+    const ppbRiskSummary = options.forceCash && Array.isArray(options.ppbResults) && options.ppbResults.length > 0
+      ? `PPB risk override: ${options.ppbResults.map(result => result.drug_name || result.generic_name || 'Drug').join(', ')} moved to patient self-pay`
+      : null
     const receiptSummary = [
       form.notes.trim(),
+      splitSummary,
+      ppbRiskSummary,
       reviewResetIds.length > 0 ? `${reviewResetIds.length} line(s) returned for pharmacist review after partial dispensing` : null,
+      selectedItems.some(item => item.pendingQuantity > 0) ? `Partial dispense: ${selectedItems.filter(item => item.pendingQuantity > 0).map(item => `${item.rx.drug_name} pending ${item.pendingQuantity}`).join(', ')}` : null,
     ].filter(Boolean).join(' | ') || `Pharmacy receipt: ${receiptNumber}`
 
     setActionBusy(true)
 
     for (const [, stock] of stockByInventoryId) {
       const newQty = Math.max(0, stock.stockLeft - stock.quantityNeeded)
+      const relatedSelections = selectedItems.filter(item => String(item.inventoryItem.id) === String(stock.item.id))
+      const allocations = relatedSelections.flatMap(item => batchPlans.get(item.rx.id)?.allocations || [])
+
+      for (const allocation of allocations) {
+        const batchRow = drugBatches.find(batch => String(batch.id) === String(allocation.batch_id))
+        if (!batchRow) continue
+        const batchRemaining = Math.max(0, Number(batchRow.quantity_remaining || 0) - Number(allocation.quantity || 0))
+        await executeWithFallback(
+          () => supabase.from('drug_batches').update({ quantity_remaining: batchRemaining }).eq('id', allocation.batch_id).eq('hospital_id', hospitalId),
+          async () => ({ data: null, error: null, compatFallback: true }),
+        )
+      }
+
       const { error } = await supabase
         .from('pharmacy_inventory')
         .update({ quantity_in_stock: newQty })
@@ -1753,21 +2158,62 @@ export default function Pharmacy() {
       }
     }
 
-    const { error: rxError } = await supabase
-      .from('prescriptions')
-      .update({
+    for (const item of selectedItems) {
+      const releasePayload = {
         status: 'Released',
         dispensed_by: form.released_by.trim(),
         dispensed_at: soldAt,
+        payment_method: finalPaymentMethod,
         reject_reason: null,
-      })
-      .in('id', ids)
-      .eq('hospital_id', hospitalId)
+        quantity: item.quantity,
+        notes: [
+          item.rx.notes || '',
+          item.pendingQuantity > 0 ? `Partial dispense completed. Pending balance: ${item.pendingQuantity}.` : '',
+        ].filter(Boolean).join(' | ') || null,
+      }
+      const { error: rxError } = await executeWithFallback(
+        () => supabase.from('prescriptions').update(releasePayload).eq('id', item.rx.id).eq('hospital_id', hospitalId),
+        async () => supabase.from('prescriptions').update(omitKeys(releasePayload, ['notes'])).eq('id', item.rx.id).eq('hospital_id', hospitalId),
+      )
 
-    if (rxError) {
-      setActionBusy(false)
-      window.notifyFromLegacyAlert(`Prescription release failed: ${rxError.message}`)
-      return
+      if (rxError) {
+        setActionBusy(false)
+        window.notifyFromLegacyAlert(`Prescription release failed: ${rxError.message}`)
+        return
+      }
+
+      if (item.pendingQuantity > 0) {
+        const clonePayload = {
+          hospital_id: hospitalId,
+          patient_id: item.rx.patient_id || patientId,
+          visit_id: item.rx.visit_id || visitId || null,
+          patient_name: item.rx.patient_name || patientName,
+          drug_name: item.rx.drug_name,
+          generic_name: item.rx.generic_name || item.inventoryItem.generic_name || null,
+          dosage: item.rx.dosage || null,
+          frequency: item.rx.frequency || null,
+          duration: item.rx.duration || null,
+          route: item.rx.route || null,
+          quantity: item.pendingQuantity,
+          prn: item.rx.prn || false,
+          status: 'Pending',
+          prescribed_by: item.rx.prescribed_by || null,
+          payment_method: finalPaymentMethod,
+          reject_reason: null,
+          approved_by: null,
+          dispensed_by: null,
+          dispensed_at: null,
+          notes: `Pending balance created after partial dispense from prescription ${item.rx.id}.`,
+          created_at: soldAt,
+        }
+        const { error: cloneError } = await executeWithFallback(
+          () => supabase.from('prescriptions').insert(clonePayload),
+          async () => supabase.from('prescriptions').insert(omitKeys(clonePayload, ['generic_name', 'route', 'prn', 'notes'])),
+        )
+        if (cloneError) {
+          console.warn('Could not create pending balance prescription', cloneError)
+        }
+      }
     }
 
     if (reviewResetIds.length > 0) {
@@ -1797,10 +2243,10 @@ export default function Pharmacy() {
       drug_name: item.label,
       qty_sold: item.qty,
       total_kes: item.total,
-      payment_method: paymentMethod,
+      payment_method: finalPaymentMethod,
       mpesa_ref: form.mpesa_ref.trim() || null,
       served_by: form.released_by.trim(),
-      notes: receiptSummary,
+      notes: `${receiptSummary}${item.meta?.batch_numbers?.length ? ` | Batch: ${item.meta.batch_numbers.join(', ')}` : ''}`,
       prescription_id: item.prescription_id || item.source_id,
       sold_at: soldAt,
     }))
@@ -1826,7 +2272,7 @@ export default function Pharmacy() {
       amount_kes: amount,
       paid_kes: paidAmount,
       balance_kes: balanceAmount,
-      payment_method: paymentMethod,
+      payment_method: finalPaymentMethod,
       insurer,
       sha_member_no: null,
       status: invoiceStatus,
@@ -1886,13 +2332,79 @@ export default function Pharmacy() {
       details: {
         pharmacist: pharmacistName,
         patient: releaseModal?.group?.patientName,
+        ppb_override: Boolean(options.forceCash),
       },
     })
 
+    if (options.forceCash && Array.isArray(options.ppbResults) && options.ppbResults.length > 0) {
+      const flagRows = options.ppbResults.flatMap(result => {
+        const matchingItems = selectedItems.filter(item => {
+          const drugName = normalizeDrugText(item.inventoryItem?.drug_name || item.rx?.drug_name || '')
+          const genericName = normalizeDrugText(item.inventoryItem?.generic_name || item.rx?.generic_name || '')
+          return drugName === normalizeDrugText(result.drug_name) || genericName === normalizeDrugText(result.generic_name)
+        })
+
+        return matchingItems.map(item => ({
+          hospital_id: hospitalId,
+          prescription_id: item.rx?.id || null,
+          drug_name: item.inventoryItem?.drug_name || item.rx?.drug_name || result.drug_name,
+          action_taken: 'patient_pays_cash',
+          flagged_at: soldAt,
+          pharmacist_id: pharmacistMember?.id || null,
+        }))
+      })
+
+      if (flagRows.length > 0) {
+        const { error: flagError } = await supabase.from('ppb_dispensing_flags').insert(flagRows)
+        if (flagError) {
+          console.warn('PPB flag logging failed', flagError)
+          window.notifyFromLegacyAlert(`Receipt created, but PPB risk logging failed: ${flagError.message}`)
+        }
+      }
+    }
+
+    void (async () => {
+      try {
+        const notificationConfig = await fetchNotificationConfig(hospitalId)
+        const rxSetting = getNotificationSetting(notificationConfig, 'prescription_ready')
+        if (!rxSetting.enabled) return
+
+        const phone = releaseModal.group?.phone || selectedItems[0]?.rx?.patients?.phone || null
+        if (!phone) return
+
+        const drugLabel = items.length === 1
+          ? items[0]?.label || selectedItems[0]?.rx?.drug_name || 'prescription'
+          : `${items.length} prescription items`
+
+        const message = buildMessage(rxSetting.template || DEFAULT_TEMPLATES.prescription_ready, {
+          patient_name: patientName,
+          hospital_name: hospitalName || 'RemedacareHMIS',
+          drug_name: drugLabel,
+        })
+
+        const result = await sendPatientNotification({
+          phone,
+          message,
+          hospitalName,
+          notificationType: 'prescription_ready',
+          patientId,
+          hospitalId,
+        })
+
+        if (!result.success && !result.skipped && result.error) {
+          console.warn('Prescription notification failed:', result.error)
+        }
+      } catch (error) {
+        console.warn('Prescription notification failed:', error)
+      }
+    })()
+
     setReleaseModal(null)
+    setPpbRiskModal(null)
     setReceiptModal({
       ...(createdInvoice || invoicePayload),
       receipt_number: receiptNumber,
+      served_by: form.released_by.trim(),
     })
 
     broadcastPrescriptionsChanged({ ids, source: 'pharmacy-release' })
@@ -1901,7 +2413,7 @@ export default function Pharmacy() {
       ids,
       receipt_number: receiptNumber,
       invoice_no: invoiceNo,
-      payment_method: paymentMethod,
+      payment_method: finalPaymentMethod,
       review_reset_ids: reviewResetIds,
     })
 
@@ -1946,6 +2458,9 @@ export default function Pharmacy() {
           loading={loading}
           fetchData={fetchData}
           openStewardshipModal={openStewardshipModal}
+          reorderItems={reorderItems}
+          analytics={analytics}
+          handleGenerateReorderLpo={handleGenerateReorderLpo}
           C={C}
           css={css}
           StatCard={StatCard}
@@ -1993,6 +2508,7 @@ export default function Pharmacy() {
         handleReject={handleReject}
         handleSaveStewardshipAdvice={handleSaveStewardshipAdvice}
         getRxMeta={getRxMeta}
+        buildBatchPlan={buildBatchPlan}
         hospitalName={hospitalName}
         pharmacistName={pharmacistName}
         pharmacyStaff={pharmacyStaff}
@@ -2005,6 +2521,58 @@ export default function Pharmacy() {
         formatKES={formatKES}
         getStaffRoleLabel={getStaffRoleLabel}
       />
+
+      {ppbRiskModal && (
+        <div style={css.overlay}>
+          <div style={{ ...css.modal, width: '640px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '10px', alignItems: 'flex-start', marginBottom: '14px' }}>
+              <div>
+                <h3 style={css.modalTitle}>⚠️ SHA Reimbursement Risk</h3>
+                <div style={css.modalSub}>
+                  The drugs below are not PPB-verified for SHA reimbursement. Continuing will convert this release to patient self-pay.
+                </div>
+              </div>
+              <button style={{ ...css.btn, ...css.btnGhost, padding: '7px 12px' }} onClick={() => !actionBusy && setPpbRiskModal(null)}>Close</button>
+            </div>
+
+            <div style={{ ...css.card, padding: '14px 16px', marginBottom: '16px', background: '#FFF7ED', border: '1px solid #F6D28B' }}>
+              <div style={{ fontSize: '12px', color: '#9A3412', fontWeight: 700, marginBottom: '8px' }}>
+                The following drugs are not on the PPB National Product Catalogue or are not eligible for SHA reimbursement:
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                {ppbRiskModal.results.map(result => (
+                  <div key={`${result.drug_name}-${result.generic_name}`} style={{ border: `1px solid ${C.border}`, borderRadius: '12px', padding: '11px 12px', background: C.surface }}>
+                    <div style={{ fontSize: '13px', fontWeight: 800, color: C.text }}>{result.drug_name || result.generic_name || 'Drug'}</div>
+                    <div style={{ fontSize: '11px', color: C.sub, marginTop: '4px' }}>
+                      {!result.approved
+                        ? 'Not found in the bundled PPB catalogue.'
+                        : 'Found in PPB catalogue but marked non-reimbursable for SHA.'}
+                    </div>
+                    {result.ppb_reg_number && (
+                      <div style={{ fontSize: '11px', color: C.sub, marginTop: '4px' }}>PPB Reg: {result.ppb_reg_number}</div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
+              <button style={{ ...css.btn, ...css.btnGhost }} onClick={() => setPpbRiskModal(null)} disabled={actionBusy}>Cancel Dispensing</button>
+              <button
+                style={{ ...css.btn, ...css.btnDanger }}
+                disabled={actionBusy}
+                onClick={() => handleRelease(ppbRiskModal.form, {
+                  skipPpbCheck: true,
+                  forceCash: true,
+                  ppbResults: ppbRiskModal.results,
+                })}
+              >
+                {actionBusy ? 'Processing...' : 'Dispense — Patient Pays Cash'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   </div>
   )

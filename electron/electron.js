@@ -10,7 +10,7 @@ function createWindow() {
       contextIsolation: true
     },
     icon: path.join(__dirname, 'public/icon.png'), // optional
-    title: 'RemedacareOS'
+    title: 'RemedacareHMIS'
   })
 
   win.loadURL('http://localhost:5173') // your Vite dev port

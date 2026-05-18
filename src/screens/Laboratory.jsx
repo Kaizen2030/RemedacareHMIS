@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { QRCodeSVG } from 'qrcode.react'
+import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts'
 import { canPerformAction } from '../access'
 import supabase from '../supabase'
 import { useHospital } from '../context'
 import useStaff from '../hooks/useStaff'
-import PatientWorkflowCard from '../components/PatientWorkflowCard'
 import { executeWithFallback, omitKeys } from '../utils/dbCompat'
 import { logAudit } from '../utils/audit'
 import { buildWorkflowInvoiceNote, createServiceLine, SERVICE_SOURCES, stringifyServiceLines } from '../utils/workflowBilling'
+import { buildMessage, DEFAULT_TEMPLATES, fetchNotificationConfig, getNotificationSetting, sendPatientNotification } from '../utils/notifications'
 import {
   deriveMicrobiologyResultSummary,
   getLabTestsForCategory,
@@ -14,6 +17,22 @@ import {
   isMicrobiologySensitivityOrder,
   LAB_TEST_CATEGORIES,
 } from '../utils/labCatalog'
+import { generateSampleBarcode, getSampleStatusFromLabRow } from '../utils/labWorkflow'
+import {
+  MICRO_ANTIBIOTIC_OPTIONS,
+  buildCriticalAlerts,
+  buildStructuredDefaults,
+  calculateEgfr,
+  evaluateStructuredValue,
+  getMicroEmpiricRecommendation,
+  matchStructuredTemplate,
+  normalizeSusceptibilityChoice,
+  summarizeStructuredResult,
+} from '../utils/labStructuredResults'
+import LabOrdersTab from './laboratory/LabOrdersTab'
+import LabResultsTab from './laboratory/LabResultsTab'
+import LabReferralsTab from './laboratory/LabReferralsTab'
+import LabSampleLabel from './laboratory/LabSampleLabel'
 
 // ── Microbiology C&S tests that need antibiogram PDF upload instead of simple result entry ──
 function isCultureSensitivityTest(testType, category) {
@@ -47,11 +66,52 @@ const PRIORITY_COLORS = {
   STAT: { bg: '#FCEBEB', color: '#A32D2D' },
 }
 
+const SAMPLE_STATUS_COLORS = {
+  Ordered: { bg: '#F3F4F6', color: '#555', border: '#D1D5DB' },
+  Collected: { bg: '#FEF3C7', color: '#B45309', border: '#FCD34D' },
+  'In Progress': { bg: '#DBEAFE', color: '#1D4ED8', border: '#93C5FD' },
+  'Referred Out': { bg: '#F3E8FF', color: '#7C3AED', border: '#D8B4FE' },
+  Resulted: { bg: '#DCFCE7', color: '#15803D', border: '#86EFAC' },
+}
+
+const LAB_STAGE_PIPELINE = ['Ordered', 'Sample Collected', 'Processing', 'Results Ready', 'Reviewed']
+const AGE_BUCKET_COLORS = {
+  fresh: { bg: '#E1F5EE', color: '#0F6E56', border: '#9FE1CB' },
+  watch: { bg: '#FFF3DC', color: '#C07000', border: '#FAC775' },
+  late: { bg: '#FFF0E3', color: '#C46600', border: '#FDBA74' },
+  critical: { bg: '#FCEBEB', color: '#A32D2D', border: '#F09595' },
+}
+
 const PAGE_SIZE = 100
 const PAGE_SIZE_OPTIONS = [25, 50, 100, 200]
+const REFERRAL_LABS = ['Lancet Kenya', 'AAR Healthcare', 'Pathologists Lancet', 'KEMRI', 'Aga Khan Hospital Lab', 'Other']
+const REFERRAL_SAMPLE_TYPES = ['Blood', 'Urine', 'Stool', 'Swab', 'Tissue', 'CSF', 'Other']
+const REFERRAL_TRANSPORT_METHODS = ['In-house', 'Patient carries', 'Courier']
 
 function formatKES(value) {
   return `KES ${Number(value || 0).toLocaleString()}`
+}
+
+function buildStandaloneReferralNotes(testName, notes) {
+  const cleanTestName = String(testName || '').trim()
+  const cleanNotes = String(notes || '').trim()
+  if (!cleanTestName) return cleanNotes
+  return [`Test: ${cleanTestName}`, cleanNotes].filter(Boolean).join('\n')
+}
+
+function extractStandaloneReferralTestName(referral) {
+  const linkedName = referral?.lab_tests?.test_name || referral?.lab_tests?.test_type
+  if (linkedName) return linkedName
+  const match = String(referral?.special_instructions || '').match(/^Test:\s*(.+)$/m)
+  return match?.[1]?.trim() || 'Standalone referral'
+}
+
+function getReferralDisplayStatus(referral) {
+  if (!referral) return 'Sent'
+  if (referral.status === 'Result Received') return 'Result Received'
+  if (referral.status === 'Overdue') return 'Overdue'
+  if (referral.expected_return_date && new Date(referral.expected_return_date) < new Date()) return 'Overdue'
+  return referral.status || 'Sent'
 }
 
 function hasLinkedLabInvoice(invoices, test) {
@@ -67,6 +127,135 @@ function hasLinkedLabInvoice(invoices, test) {
   })
 }
 
+function getPatientNumber(patient) {
+  return patient?.patient_number || patient?.patient_no || patient?.mrn || patient?.national_id || patient?.id || '—'
+}
+
+function getTimeDiffMinutes(startAt, endAt = Date.now()) {
+  const start = new Date(startAt || 0).getTime()
+  if (!start) return 0
+  return Math.max(0, Math.floor((endAt - start) / 60000))
+}
+
+function formatAgingLabel(totalMinutes) {
+  if (totalMinutes < 60) return `${totalMinutes}m`
+  const hours = Math.floor(totalMinutes / 60)
+  const mins = totalMinutes % 60
+  return mins ? `${hours}h ${mins}m` : `${hours}h`
+}
+
+function getAgingMeta(test, nowValue = Date.now()) {
+  const minutes = getTimeDiffMinutes(test?.ordered_at, nowValue)
+  let bucket = 'fresh'
+  if (minutes >= 480) bucket = 'critical'
+  else if (minutes >= 240) bucket = 'late'
+  else if (minutes >= 60) bucket = 'watch'
+  return {
+    minutes,
+    label: formatAgingLabel(minutes),
+    bucket,
+    colors: AGE_BUCKET_COLORS[bucket],
+    overFourHours: minutes >= 240,
+  }
+}
+
+function getWorkflowStage(test) {
+  if (test?.reviewed_at) return 'Reviewed'
+  if (test?.results_ready_at || test?.sample_status === 'Resulted' || test?.status === 'Complete') return 'Results Ready'
+  if (test?.processing_started_at || test?.sample_status === 'In Progress' || test?.status === 'In Progress') return 'Processing'
+  if (test?.sample_collected_at || test?.sample_status === 'Collected') return 'Sample Collected'
+  return 'Ordered'
+}
+
+function getNextWorkflowStage(test) {
+  const currentStage = getWorkflowStage(test)
+  const currentIndex = LAB_STAGE_PIPELINE.indexOf(currentStage)
+  return LAB_STAGE_PIPELINE[Math.min(currentIndex + 1, LAB_STAGE_PIPELINE.length - 1)]
+}
+
+function getStageActionLabel(test) {
+  const currentStage = getWorkflowStage(test)
+  if (currentStage === 'Ordered') return 'Mark Sample Collected'
+  if (currentStage === 'Sample Collected') return 'Start Processing'
+  if (currentStage === 'Results Ready') return 'Mark Reviewed'
+  return 'Advance Stage'
+}
+
+function buildStageUpdatePayload(test, nextStage, performer = '') {
+  const now = new Date().toISOString()
+  const payload = {}
+  if (nextStage === 'Sample Collected') {
+    payload.sample_status = 'Collected'
+    payload.sample_collected_at = now
+  }
+  if (nextStage === 'Processing') {
+    payload.sample_status = 'In Progress'
+    payload.status = 'In Progress'
+    payload.processing_started_at = now
+    payload.sample_collected_at = test?.sample_collected_at || now
+  }
+  if (nextStage === 'Reviewed') {
+    payload.reviewed_at = now
+    payload.reviewed_by = performer || null
+  }
+  return payload
+}
+
+function getSampleTypeLabel(test) {
+  return inferMicrobiologySampleType(test?.test_type || '') || 'Sample'
+}
+
+function openSampleLabelPrintWindow(test, patientRecord) {
+  const sampleBarcode = test.sample_barcode || generateSampleBarcode()
+  const patientNumber = getPatientNumber(patientRecord)
+  const collectionStamp = new Date().toLocaleString('en-KE')
+  const printWindow = window.open('', '_blank', 'width=520,height=320')
+  if (!printWindow) return
+  const labelMarkup = renderToStaticMarkup(
+    <LabSampleLabel
+      test={test}
+      patientRecord={patientRecord}
+      sampleBarcode={sampleBarcode}
+      patientNumber={patientNumber}
+      collectionStamp={collectionStamp}
+    />
+  )
+
+  printWindow.document.write(`
+    <html>
+      <head>
+        <title>Sample Label</title>
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.6/JsBarcode.all.min.js"></script>
+        <style>
+          @page { size: 50mm 25mm; margin: 0; }
+          body { margin: 0; font-family: Arial, sans-serif; background: #fff; }
+          .page { width: 50mm; height: 25mm; display: flex; align-items: center; justify-content: center; }
+          .label { width: 50mm; height: 25mm; box-sizing: border-box; border: 1px solid #CFE2D7; padding: 2.2mm; display: grid; grid-template-columns: 1fr; gap: 1.2mm; }
+          .top { display: flex; justify-content: space-between; gap: 3mm; font-size: 7.2px; color: #2A3A34; }
+          .name { font-weight: 700; font-size: 8px; color: #111; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+          .meta { font-size: 6.8px; color: #47554F; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+          .barcode-wrap { display: flex; align-items: center; justify-content: center; }
+          svg { width: 100%; height: 10mm; }
+          .code { font-size: 7px; font-weight: 700; text-align: center; letter-spacing: 0.2px; }
+          @media print {
+            body * { visibility: hidden; }
+            .page, .page * { visibility: visible; }
+            .page { position: absolute; left: 0; top: 0; }
+          }
+        </style>
+      </head>
+      <body>
+        ${labelMarkup}
+        <script>
+          JsBarcode('#sample-barcode', '${sampleBarcode}', { format: 'CODE128', displayValue: false, margin: 0, height: 32, width: 1.4 });
+          setTimeout(() => window.print(), 250);
+        </script>
+      </body>
+    </html>
+  `)
+  printWindow.document.close()
+}
+
 // ── Convert file to base64 ────────────────────────────────────────────────────
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
@@ -78,7 +267,7 @@ function fileToBase64(file) {
 }
 
 export default function Laboratory() {
-  const { hospitalId, userRole, navigate } = useHospital()
+  const { hospitalId, hospitalName, userRole, navigate } = useHospital()
   const [tests, setTests] = useState([])
   const [invoices, setInvoices] = useState([])
   const [labChargeCodes, setLabChargeCodes] = useState([])
@@ -92,13 +281,21 @@ export default function Laboratory() {
   const [filterPatient, setFilterPatient] = useState('')
   const [filterSource, setFilterSource] = useState('All')
   const today = new Date().toISOString().split('T')[0]
+  const [nowTick, setNowTick] = useState(Date.now())
   const [dateFrom, setDateFrom] = useState(today)
   const [dateTo, setDateTo] = useState(today)
+  const [scannerValue, setScannerValue] = useState('')
 
   const [selected, setSelected] = useState(null)
   const [showOrderModal, setShowOrderModal] = useState(false)
   const [showResultModal, setShowResultModal] = useState(false)
   const [showAssignModal, setShowAssignModal] = useState(false)
+  const [showReferralModal, setShowReferralModal] = useState(false)
+  const [showReferralResultModal, setShowReferralResultModal] = useState(false)
+  const [referrals, setReferrals] = useState([])
+  const [selectedReferral, setSelectedReferral] = useState(null)
+  const [referralTestSearch, setReferralTestSearch] = useState('')
+  const [referralPatientSearch, setReferralPatientSearch] = useState('')
 
   // ── NEW: Antibiogram PDF upload modal ─────────────────────────────────────
   const [showAntibiogramModal, setShowAntibiogramModal] = useState(false)
@@ -114,6 +311,7 @@ export default function Laboratory() {
     esbl: false,
     mrsa: false,
     carbapenem_r: false,
+    susceptibility_profile: {},
   })
   const [antibiogramFile, setAntibiogramFile] = useState(null)
   const [antibiogramFileName, setAntibiogramFileName] = useState('')
@@ -145,11 +343,31 @@ export default function Laboratory() {
     result_text: '', result_value: '', reference_range: '',
     interpretation: '', performed_by: '', result_notes: '',
     result_file_url: '',
+    structured_values: {},
+    structured_template_key: '',
   })
 
   const [assignTech, setAssignTech] = useState('')
   const [customTech, setCustomTech] = useState('')
   const [activeTab, setActiveTab] = useState('tests')
+  const [referralForm, setReferralForm] = useState({
+    linked_mode: 'linked',
+    lab_test_id: '',
+    standalone_patient_id: '',
+    standalone_test_name: '',
+    referred_to: REFERRAL_LABS[0],
+    sample_type: 'Blood',
+    date_sent: new Date().toISOString().slice(0, 10),
+    transport_method: 'In-house',
+    expected_tat_days: 3,
+    special_instructions: '',
+    referral_cost: '',
+  })
+  const [referralResultForm, setReferralResultForm] = useState({
+    result_text: '',
+    result_date: new Date().toISOString().slice(0, 10),
+    external_reference: '',
+  })
 
   const [patients, setPatients] = useState([])
   const [patientSearch, setPatientSearch] = useState('')
@@ -168,17 +386,18 @@ export default function Laboratory() {
 
   useEffect(() => {
     if (!hospitalId) { setLoading(false); return }
-    fetchPatients(); fetchLabChargeCodes()
+    fetchPatients(); fetchLabChargeCodes(); fetchReferrals()
   }, [hospitalId])
 
   useEffect(() => {
     if (!hospitalId) return undefined
-    fetchTests(); fetchInvoices()
-    const localHandler = () => { fetchTests(); fetchInvoices() }
+    fetchTests(); fetchInvoices(); fetchReferrals()
+    const localHandler = () => { fetchTests(); fetchInvoices(); fetchReferrals() }
     const channel = supabase
       .channel(`laboratory-screen-${hospitalId}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'lab_tests', filter: `hospital_id=eq.${hospitalId}` }, () => fetchTests())
       .on('postgres_changes', { event: '*', schema: 'public', table: 'invoices', filter: `hospital_id=eq.${hospitalId}` }, () => fetchInvoices())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'lab_referrals', filter: `hospital_id=eq.${hospitalId}` }, () => fetchReferrals())
       .subscribe()
     window.addEventListener('remedacare:workflow_changed', localHandler)
     return () => {
@@ -189,8 +408,32 @@ export default function Laboratory() {
 
   useEffect(() => {
     if (!hospitalId) return
-    fetchTests(); fetchInvoices()
+    fetchTests(); fetchInvoices(); fetchReferrals()
   }, [hospitalId, dateFrom, dateTo, testPage, testPageSize, invoicePage, invoicePageSize])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowTick(Date.now()), 60000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (!tests.length) return
+    try {
+      const params = new URLSearchParams(window.location.search)
+      const targetId = params.get('labResultId')
+      if (!targetId) return
+      const match = tests.find(test => String(test.id) === String(targetId))
+      if (!match) return
+      setActiveTab('tests')
+      setSelected(match)
+    } catch (_) {}
+  }, [tests])
+
+  useEffect(() => {
+    if (!selected?.id || !tests.length) return
+    const fresh = tests.find(test => test.id === selected.id)
+    if (fresh) setSelected(prev => ({ ...prev, ...fresh }))
+  }, [tests, selected?.id])
 
   async function fetchTests() {
     setLoading(true)
@@ -227,6 +470,16 @@ export default function Laboratory() {
       .range(start, end)
     setInvoices(data || [])
     setInvoiceTotalCount(count || 0)
+  }
+
+  async function fetchReferrals() {
+    if (!hospitalId) return
+    const { data } = await supabase
+      .from('lab_referrals')
+      .select('*, patients(id, full_name, patient_number, mrn), lab_tests(id, test_name, test_type, patient_name)')
+      .eq('hospital_id', hospitalId)
+      .order('date_sent', { ascending: false })
+    setReferrals(data || [])
   }
 
   async function fetchLabChargeCodes() {
@@ -320,7 +573,7 @@ export default function Laboratory() {
 
   async function fetchPatients() {
     const { data } = await supabase.from('patients')
-      .select('id, patient_no, full_name, phone, age, gender, blood_group, allergies, chronic_conditions')
+      .select('*')
       .eq('hospital_id', hospitalId)
       .order('full_name')
       .limit(300)
@@ -340,21 +593,161 @@ export default function Laboratory() {
     setOrderForm(f => ({ ...f, patient_name: p.full_name, phone: p.phone || '' }))
   }
 
+  function openReferralModal() {
+    setReferralForm({
+      linked_mode: 'linked',
+      lab_test_id: '',
+      standalone_patient_id: '',
+      standalone_test_name: '',
+      referred_to: REFERRAL_LABS[0],
+      sample_type: 'Blood',
+      date_sent: new Date().toISOString().slice(0, 10),
+      transport_method: 'In-house',
+      expected_tat_days: 3,
+      special_instructions: '',
+      referral_cost: '',
+    })
+    setReferralTestSearch('')
+    setReferralPatientSearch('')
+    setShowReferralModal(true)
+  }
+
+  async function handleSaveReferral() {
+    const linkedTest = tests.find(test => test.id === referralForm.lab_test_id) || null
+    const standalonePatient = patients.find(patient => patient.id === referralForm.standalone_patient_id) || null
+    const patientId = linkedTest?.patient_id || standalonePatient?.id || null
+    const visitId = linkedTest?.visit_id || null
+    const testName = linkedTest?.test_name || linkedTest?.test_type || referralForm.standalone_test_name
+
+    if (!patientId) {
+      window.notifyFromLegacyAlert('Select a patient or link the referral to an existing lab test.')
+      return
+    }
+    if (!testName) {
+      window.notifyFromLegacyAlert('Select a pending test or enter the standalone test name.')
+      return
+    }
+    if (!referralForm.referred_to) {
+      window.notifyFromLegacyAlert('Enter the referral facility name.')
+      return
+    }
+
+    setSaving(true)
+    const sentDate = new Date(`${referralForm.date_sent}T00:00:00`)
+    const expectedDate = new Date(sentDate)
+    expectedDate.setDate(expectedDate.getDate() + Number(referralForm.expected_tat_days || 0))
+
+    const payload = {
+      hospital_id: hospitalId,
+      patient_id: patientId,
+      visit_id: visitId,
+      lab_test_id: linkedTest?.id || null,
+      referred_to: referralForm.referred_to,
+      sample_type: referralForm.sample_type,
+      transport_method: referralForm.transport_method,
+      date_sent: referralForm.date_sent,
+      expected_return_date: expectedDate.toISOString().slice(0, 10),
+      referral_cost: Number(referralForm.referral_cost || 0),
+      special_instructions: linkedTest
+        ? (referralForm.special_instructions || null)
+        : buildStandaloneReferralNotes(testName, referralForm.special_instructions),
+      status: 'Sent',
+      created_at: new Date().toISOString(),
+    }
+
+    const { error } = await supabase.from('lab_referrals').insert(payload)
+    if (error) {
+      window.notifyFromLegacyAlert('Error saving referral: ' + error.message)
+      setSaving(false)
+      return
+    }
+
+    if (linkedTest?.id) {
+      await supabase.from('lab_tests').update({ sample_status: 'Referred Out' }).eq('id', linkedTest.id)
+      if (selected?.id === linkedTest.id) {
+        setSelected({ ...linkedTest, sample_status: 'Referred Out' })
+      }
+    }
+
+    setShowReferralModal(false)
+    setSaving(false)
+    fetchTests()
+    fetchReferrals()
+  }
+
+  function openReferralResultModal(referral) {
+    setSelectedReferral(referral)
+    setReferralResultForm({
+      result_text: referral.result_text || '',
+      result_date: referral.result_date || new Date().toISOString().slice(0, 10),
+      external_reference: referral.external_reference || '',
+    })
+    setShowReferralResultModal(true)
+  }
+
+  async function handleSaveReferralResult() {
+    if (!selectedReferral) return
+    if (!referralResultForm.result_text.trim()) {
+      window.notifyFromLegacyAlert('Enter the result text before saving.')
+      return
+    }
+    setSaving(true)
+    const referralUpdate = {
+      status: 'Result Received',
+      result_text: referralResultForm.result_text.trim(),
+      result_date: referralResultForm.result_date,
+      external_reference: referralResultForm.external_reference || null,
+    }
+    const { error } = await supabase.from('lab_referrals').update(referralUpdate).eq('id', selectedReferral.id)
+    if (error) {
+      window.notifyFromLegacyAlert('Error saving referral result: ' + error.message)
+      setSaving(false)
+      return
+    }
+
+    if (selectedReferral.lab_test_id) {
+      await supabase.from('lab_tests').update({
+        result_text: referralResultForm.result_text.trim(),
+        result_notes: referralResultForm.external_reference ? `External lab reference: ${referralResultForm.external_reference}` : null,
+        resulted_at: referralResultForm.result_date ? `${referralResultForm.result_date}T12:00:00` : new Date().toISOString(),
+        status: 'Complete',
+        sample_status: 'Resulted',
+      }).eq('id', selectedReferral.lab_test_id)
+    }
+
+    setShowReferralResultModal(false)
+    setSelectedReferral(null)
+    setSaving(false)
+    fetchTests()
+    fetchReferrals()
+  }
+
+  async function markReferralOverdue(referral) {
+    setSaving(true)
+    await supabase.from('lab_referrals').update({ status: 'Overdue' }).eq('id', referral.id)
+    setSaving(false)
+    fetchReferrals()
+  }
+
   // ── Open antibiogram upload modal for C&S tests ───────────────────────────
   function openAntibiogramModal(test) {
+    const existingProfile = test?.result_json?.susceptibility_profile && typeof test.result_json.susceptibility_profile === 'object'
+      ? test.result_json.susceptibility_profile
+      : {}
     setSelected(test)
     setAntibiogramForm({
-      organism: '',
+      organism: test?.result_value || '',
       sample_type: inferMicrobiologySampleType(test.test_type) || 'Urine',
       growth: 'Heavy',
-      result_summary: '',
-      interpretation: '',
-      performed_by: test.assigned_to || '',
+      result_summary: test?.result_text || '',
+      interpretation: test?.interpretation || '',
+      performed_by: test?.performed_by || test.assigned_to || '',
       verified_by: '',
-      notes: test.notes || '',
+      notes: test.result_notes || test.notes || '',
       esbl: false,
       mrsa: false,
       carbapenem_r: false,
+      susceptibility_profile: existingProfile,
     })
     setAntibiogramFile(null)
     setAntibiogramFileName('')
@@ -374,6 +767,13 @@ export default function Laboratory() {
     const today = now.split('T')[0]
 
     try {
+      const susceptibilityProfile = Object.fromEntries(
+        Object.entries(antibiogramForm.susceptibility_profile || {})
+          .map(([drug, value]) => [drug, normalizeSusceptibilityChoice(value)])
+          .filter(([, value]) => value),
+      )
+      const empiricRecommendation = getMicroEmpiricRecommendation(antibiogramForm.organism, susceptibilityProfile)
+
       // Step 1 — Convert PDF/image to base64 for storage
       setAntibiogramUploadStep('Reading file...')
       const base64DataUrl = await fileToBase64(antibiogramFile)
@@ -406,18 +806,42 @@ export default function Laboratory() {
         antibiogramForm.esbl ? 'ESBL: Positive' : null,
         antibiogramForm.mrsa ? 'MRSA: Positive' : null,
         antibiogramForm.carbapenem_r ? 'Carbapenem Resistant: Yes' : null,
+        Object.keys(susceptibilityProfile).length ? `Sensitivity: ${Object.entries(susceptibilityProfile).map(([drug, sir]) => `${drug} ${sir}`).join(', ')}` : null,
+        empiricRecommendation ? `Empiric note: ${empiricRecommendation}` : null,
       ].filter(Boolean).join('\n')
 
-      const { error: labUpdateError } = await supabase.from('lab_tests').update({
-        result_text: resultText,
-        result_value: antibiogramForm.organism || 'Culture complete — see antibiogram',
-        interpretation: antibiogramForm.interpretation || null,
-        performed_by: antibiogramForm.performed_by,
-        result_notes: antibiogramForm.notes || null,
-        result_file_url: fileUrl || null,
-        status: 'Complete',
-        resulted_at: now,
-      }).eq('id', test.id)
+      const { error: labUpdateError } = await executeWithFallback(
+        () => supabase.from('lab_tests').update({
+          result_text: resultText,
+          result_value: antibiogramForm.organism || 'Culture complete — see antibiogram',
+          interpretation: antibiogramForm.interpretation || null,
+          performed_by: antibiogramForm.performed_by,
+          result_notes: antibiogramForm.notes || null,
+          result_file_url: fileUrl || null,
+          status: 'Complete',
+          sample_status: 'Resulted',
+          resulted_at: now,
+          results_ready_at: now,
+          result_json: {
+            susceptibility_profile: susceptibilityProfile,
+            esbl: antibiogramForm.esbl,
+            mrsa: antibiogramForm.mrsa,
+            carbapenem_r: antibiogramForm.carbapenem_r,
+            recommendation: empiricRecommendation,
+          },
+        }).eq('id', test.id),
+        async () => supabase.from('lab_tests').update({
+          result_text: resultText,
+          result_value: antibiogramForm.organism || 'Culture complete — see antibiogram',
+          interpretation: antibiogramForm.interpretation || null,
+          performed_by: antibiogramForm.performed_by,
+          result_notes: antibiogramForm.notes || null,
+          result_file_url: fileUrl || null,
+          status: 'Complete',
+          sample_status: 'Resulted',
+          resulted_at: now,
+        }).eq('id', test.id),
+      )
 
       if (labUpdateError) throw new Error('Lab test update failed: ' + labUpdateError.message)
 
@@ -442,7 +866,7 @@ export default function Laboratory() {
         mrsa: antibiogramForm.mrsa,
         carbapenem_r: antibiogramForm.carbapenem_r,
         vre: false,
-        susceptibility_profile: {},
+        susceptibility_profile: susceptibilityProfile,
         updated_at: now,
         // Store file reference in ai_suggestion field if no storage URL
         ai_suggestion: fileUrl ? null : `PDF uploaded: ${antibiogramFile.name} (${(antibiogramFile.size / 1024).toFixed(0)} KB) — view in lab reports`,
@@ -476,7 +900,7 @@ export default function Laboratory() {
         visit_id: test.visit_id,
         test_id: test.id,
         organism: antibiogramForm.organism,
-        result_summary: resultText,
+        result_summary: `${resultText}${empiricRecommendation ? `\n\n${empiricRecommendation}` : ''}`,
         interpretation: antibiogramForm.interpretation || null,
         created_at: now,
       }, { onConflict: 'test_id' }).then(() => {}).catch(() => {}) // ignore if antibiograms table missing
@@ -600,6 +1024,7 @@ export default function Laboratory() {
     const receiptNumber = `LAB-${Date.now().toString().slice(-8)}`
     const orderedAt = new Date().toISOString()
     const assignedTo = (orderForm.assigned_to || '').trim()
+    const sampleBarcode = generateSampleBarcode(new Date(orderedAt))
     const { data: createdTest, error } = await supabase.from('lab_tests').insert({
       hospital_id: hospitalId,
       patient_id: selectedPatient?.id || null,
@@ -612,6 +1037,8 @@ export default function Laboratory() {
       ordered_by: orderForm.ordered_by,
       assigned_to: assignedTo || null,
       status: assignedTo ? 'In Progress' : 'Pending',
+      sample_barcode: sampleBarcode,
+      sample_status: assignedTo ? 'In Progress' : 'Ordered',
       payment_method: orderForm.payment_method,
       mpesa_ref: orderForm.mpesa_ref || null,
       amount,
@@ -646,8 +1073,160 @@ export default function Laboratory() {
     setPatientResults([])
   }
 
+  function emptyResultForm(test = null) {
+    const template = matchStructuredTemplate(test?.test_type, test?.category)
+    return {
+      result_text: '',
+      result_value: '',
+      reference_range: '',
+      interpretation: '',
+      performed_by: test?.assigned_to || '',
+      result_notes: '',
+      result_file_url: '',
+      structured_values: template ? buildStructuredDefaults(template) : {},
+      structured_template_key: template?.key || '',
+    }
+  }
+
+  function buildResultFormFromTest(test) {
+    const template = matchStructuredTemplate(test?.test_type, test?.category)
+    const existingStructured = test?.result_json && typeof test.result_json === 'object' ? test.result_json : {}
+    return {
+      result_text: test?.result_text || '',
+      result_value: test?.result_value || '',
+      reference_range: test?.reference_range || '',
+      interpretation: test?.interpretation || '',
+      performed_by: test?.performed_by || test?.assigned_to || '',
+      result_notes: test?.result_notes || '',
+      result_file_url: test?.result_file_url || '',
+      structured_values: template ? { ...buildStructuredDefaults(template), ...existingStructured } : {},
+      structured_template_key: template?.key || '',
+    }
+  }
+
+  function openResultEntry(test) {
+    if (!test) return
+    setSelected(test)
+    if (isCultureSensitivityTest(test.test_type, test.category)) {
+      openAntibiogramModal(test)
+      return
+    }
+    setResultForm(buildResultFormFromTest(test))
+    setShowResultModal(true)
+  }
+
+  function printLabResultReport(test) {
+    if (!test) return
+    const patientRecord = patientsById[test.patient_id] || patients.find(patient => patient.full_name === test.patient_name) || null
+    const verificationUrl = `${window.location.origin}${window.location.pathname}?labResultId=${test.id}`
+    const reportMarkup = renderToStaticMarkup(
+      <div style={{ fontFamily: 'Arial, sans-serif', padding: 32, color: '#1F2937' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, marginBottom: 24 }}>
+          <div>
+            <div style={{ fontSize: 24, fontWeight: 800 }}>{hospitalName || 'RemedacareHMIS'}</div>
+            <div style={{ fontSize: 12, color: '#6B7280' }}>Laboratory Result Report</div>
+            <div style={{ fontSize: 12, color: '#6B7280', marginTop: 6 }}>Logo / Letterhead placeholder</div>
+          </div>
+          <QRCodeSVG value={verificationUrl} size={96} />
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 20 }}>
+          <div><strong>Patient:</strong> {patientRecord?.full_name || test.patient_name || 'Patient'}</div>
+          <div><strong>Patient No:</strong> {getPatientNumber(patientRecord)}</div>
+          <div><strong>DOB:</strong> {patientRecord?.date_of_birth || '—'}</div>
+          <div><strong>Gender:</strong> {patientRecord?.gender || '—'}</div>
+          <div><strong>Test:</strong> {test.test_type}</div>
+          <div><strong>Sample Type:</strong> {getSampleTypeLabel(test)}</div>
+          <div><strong>Ordered At:</strong> {test.ordered_at ? new Date(test.ordered_at).toLocaleString('en-KE') : '—'}</div>
+          <div><strong>Reported At:</strong> {test.resulted_at ? new Date(test.resulted_at).toLocaleString('en-KE') : '—'}</div>
+        </div>
+        <div style={{ border: '1px solid #D1D5DB', borderRadius: 12, overflow: 'hidden', marginBottom: 20 }}>
+          <div style={{ background: '#F9FAFB', padding: '10px 14px', fontWeight: 700 }}>Result Summary</div>
+          <div style={{ padding: 16 }}>
+            {test.result_value && <div style={{ fontSize: 18, fontWeight: 800, marginBottom: 8 }}>{test.result_value}</div>}
+            <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.5 }}>{test.result_text || 'No structured result text recorded.'}</div>
+            {test.reference_range && <div style={{ marginTop: 12 }}><strong>Reference range:</strong> {test.reference_range}</div>}
+            {test.interpretation && <div style={{ marginTop: 8 }}><strong>Interpretation:</strong> {test.interpretation}</div>}
+          </div>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginTop: 30 }}>
+          <div>
+            <div><strong>Lab Tech:</strong> {test.performed_by || test.assigned_to || '—'}</div>
+            <div><strong>Reviewed:</strong> {test.reviewed_at ? new Date(test.reviewed_at).toLocaleString('en-KE') : 'Pending review'}</div>
+          </div>
+          <div style={{ fontSize: 12, color: '#6B7280' }}>Scan QR to verify result</div>
+        </div>
+      </div>,
+    )
+    const printWindow = window.open('', '_blank', 'width=900,height=720')
+    if (!printWindow) return
+    printWindow.document.write(`
+      <html>
+        <head>
+          <title>Lab Result Report</title>
+          <style>
+            @page { size: A4; margin: 14mm; }
+            body { margin: 0; background: #fff; }
+            @media print {
+              body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+            }
+          </style>
+        </head>
+        <body>${reportMarkup}<script>setTimeout(() => window.print(), 250)</script></body>
+      </html>
+    `)
+    printWindow.document.close()
+  }
+
+  function setEntireSusceptibilityProfile(value) {
+    setAntibiogramForm(prev => ({
+      ...prev,
+      susceptibility_profile: value
+        ? Object.fromEntries(MICRO_ANTIBIOTIC_OPTIONS.map(drug => [drug, value]))
+        : {},
+    }))
+  }
+
+  async function handleScannerLookup() {
+    const code = scannerValue.trim().toUpperCase()
+    if (!code) return
+    const test = tests.find(item => String(item.sample_barcode || '').toUpperCase() === code)
+    if (!test) {
+      window.notifyFromLegacyAlert(`No lab sample found for barcode ${code}.`)
+      return
+    }
+    setSelected(test)
+    setScannerValue('')
+    openResultEntry(test)
+  }
+
+  async function updateSampleStatus(test, sampleStatus) {
+    const payload = { sample_status: sampleStatus }
+    if (sampleStatus === 'In Progress') payload.status = 'In Progress'
+    if (sampleStatus === 'Resulted') payload.status = 'Complete'
+    if (sampleStatus === 'Collected') payload.sample_collected_at = new Date().toISOString()
+    if (sampleStatus === 'In Progress') payload.processing_started_at = new Date().toISOString()
+    if (sampleStatus === 'Resulted') payload.results_ready_at = new Date().toISOString()
+    const { error } = await executeWithFallback(
+      () => supabase.from('lab_tests').update(payload).eq('id', test.id),
+      async () => supabase.from('lab_tests').update(omitKeys(payload, ['sample_collected_at', 'processing_started_at', 'results_ready_at'])).eq('id', test.id),
+    )
+    if (error) {
+      window.notifyFromLegacyAlert('Error updating sample status: ' + error.message)
+      return
+    }
+    fetchTests()
+    if (selected?.id === test.id) setSelected({ ...selected, ...payload })
+  }
+
   async function updateStatus(test, status) {
-    const { error } = await supabase.from('lab_tests').update({ status }).eq('id', test.id)
+    const nextSampleStatus = status === 'In Progress' ? 'In Progress' : getSampleStatusFromLabRow(test)
+    const extraPayload = status === 'In Progress'
+      ? { processing_started_at: test?.processing_started_at || new Date().toISOString() }
+      : {}
+    const { error } = await executeWithFallback(
+      () => supabase.from('lab_tests').update({ status, sample_status: nextSampleStatus, ...extraPayload }).eq('id', test.id),
+      async () => supabase.from('lab_tests').update({ status, sample_status: nextSampleStatus }).eq('id', test.id),
+    )
     if (error) { window.notifyFromLegacyAlert('Error updating status: ' + error.message); return }
     // Auto-invoice doctor-ordered tests the moment they are picked up
     if (status === 'In Progress' && test.source === 'Doctor' && !hasLinkedLabInvoice(invoices, test)) {
@@ -655,14 +1234,37 @@ export default function Laboratory() {
     }
     fetchTests()
     try { window.dispatchEvent(new CustomEvent('remedacare:workflow_changed', { detail: { test_id: test.id, status } })) } catch (e) {}
-    if (selected?.id === test.id) setSelected({ ...selected, status })
+    if (selected?.id === test.id) setSelected({ ...selected, status, sample_status: nextSampleStatus })
+  }
+
+  async function advanceWorkflowStage(test) {
+    if (!test) return
+    const currentStage = getWorkflowStage(test)
+    if (currentStage === 'Processing') {
+      openResultEntry(test)
+      return
+    }
+    if (currentStage === 'Reviewed') return
+    const nextStage = getNextWorkflowStage(test)
+    const payload = buildStageUpdatePayload(test, nextStage, selected?.performed_by || selected?.assigned_to || '')
+    const result = await executeWithFallback(
+      () => supabase.from('lab_tests').update(payload).eq('id', test.id),
+      async () => supabase.from('lab_tests').update(omitKeys(payload, ['sample_collected_at', 'processing_started_at', 'reviewed_at', 'reviewed_by'])).eq('id', test.id),
+    )
+    if (result.error) {
+      window.notifyFromLegacyAlert('Error advancing workflow stage: ' + result.error.message)
+      return
+    }
+    fetchTests()
+    if (selected?.id === test.id) setSelected({ ...selected, ...payload })
   }
 
   async function handleAssignTechnician() {
     const tech = assignTech === '__custom__' ? customTech : assignTech
     if (!tech) { window.notifyFromLegacyAlert('Select or enter technician name'); return }
     setSaving(true)
-    const { error } = await supabase.from('lab_tests').update({ assigned_to: tech, status: selected.status === 'Pending' ? 'In Progress' : selected.status }).eq('id', selected.id)
+    const nextStatus = selected.status === 'Pending' ? 'In Progress' : selected.status
+    const { error } = await supabase.from('lab_tests').update({ assigned_to: tech, status: nextStatus, sample_status: nextStatus === 'In Progress' ? 'In Progress' : getSampleStatusFromLabRow(selected) }).eq('id', selected.id)
     if (error) { window.notifyFromLegacyAlert('Error assigning technician: ' + error.message); setSaving(false); return }
     // Auto-invoice doctor-ordered tests when assigned
     if (selected.source === 'Doctor' && !hasLinkedLabInvoice(invoices, selected)) {
@@ -681,19 +1283,43 @@ export default function Laboratory() {
       window.notifyFromLegacyAlert('Only lab technicians can post results.')
       return
     }
-    if (!resultForm.result_text && !resultForm.result_value) { window.notifyFromLegacyAlert('Enter result details'); return }
+    const template = matchStructuredTemplate(selected?.test_type, selected?.category)
+    const patientRecord = patientsById[selected?.patient_id] || patients.find(patient => patient.full_name === selected?.patient_name) || null
+    const structuredValues = { ...(resultForm.structured_values || {}) }
+    if (template?.key === 'rfts' && !structuredValues.egfr) {
+      structuredValues.egfr = calculateEgfr(structuredValues, patientRecord)
+    }
+    const structuredSummary = template ? summarizeStructuredResult(template, structuredValues) : null
+    const criticalAlerts = template ? buildCriticalAlerts(template, structuredValues) : []
+    if (!resultForm.result_text && !resultForm.result_value && !structuredSummary?.resultText) {
+      window.notifyFromLegacyAlert('Enter result details')
+      return
+    }
+    if (criticalAlerts.length > 0) {
+      const confirmed = window.confirm(`Critical value detected.\n\n${criticalAlerts.join('\n')}\n\nNotify clinician before saving.\nContinue to save?`)
+      if (!confirmed) return
+    }
     setSaving(true)
-    const { error: updateErr } = await supabase.from('lab_tests').update({
-      result_text: resultForm.result_text || null,
-      result_value: resultForm.result_value || null,
-      reference_range: resultForm.reference_range || null,
-      interpretation: resultForm.interpretation || null,
+    const updatePayload = {
+      result_text: resultForm.result_text || structuredSummary?.resultText || null,
+      result_value: resultForm.result_value || structuredSummary?.resultValue || null,
+      reference_range: resultForm.reference_range || (template ? template.fields.map(field => `${field.label}: ${field.reference}`).join(' | ') : null),
+      interpretation: resultForm.interpretation || structuredSummary?.interpretation || null,
       performed_by: resultForm.performed_by || null,
       result_notes: resultForm.result_notes || null,
       result_file_url: resultForm.result_file_url || null,
       status: 'Complete',
+      sample_status: 'Resulted',
       resulted_at: new Date().toISOString(),
-    }).eq('id', selected.id)
+      results_ready_at: new Date().toISOString(),
+      result_json: template ? structuredValues : null,
+      result_template_key: template?.key || null,
+      critical_flags: criticalAlerts,
+    }
+    const { error: updateErr } = await executeWithFallback(
+      () => supabase.from('lab_tests').update(updatePayload).eq('id', selected.id),
+      async () => supabase.from('lab_tests').update(omitKeys(updatePayload, ['results_ready_at', 'result_json', 'result_template_key', 'critical_flags'])).eq('id', selected.id),
+    )
     if (updateErr) { window.notifyFromLegacyAlert('Error saving result: ' + updateErr.message); setSaving(false); return }
 
     if (isMicrobiologySensitivityOrder(selected.test_type, selected.category)) {
@@ -724,26 +1350,69 @@ export default function Laboratory() {
       details: {
         test: selected?.test_type,
         patient: selected?.patient_name,
-        result: resultForm?.result_value,
+        result: resultForm?.result_value || structuredSummary?.resultValue,
       },
     })
 
+    void (async () => {
+      try {
+        const phone = patientRecord?.phone || selected.phone || ''
+        if (!phone) return
+
+        const notificationConfig = await fetchNotificationConfig(hospitalId)
+        const labSetting = getNotificationSetting(notificationConfig, 'lab_result')
+        if (!labSetting.enabled) return
+
+        const message = buildMessage(labSetting.template || DEFAULT_TEMPLATES.lab_result, {
+          patient_name: selected.patient_name || patientRecord?.full_name || 'Patient',
+          hospital_name: hospitalName || 'RemedacareHMIS',
+          test_name: selected.test_type || selected.test_name || 'lab test',
+        })
+
+        const result = await sendPatientNotification({
+          phone,
+          message,
+          hospitalName,
+          notificationType: 'lab_result',
+          patientId: selected.patient_id,
+          hospitalId,
+        })
+
+        if (!result.success && !result.skipped && result.error) {
+          console.warn('Lab result notification failed:', result.error)
+        }
+      } catch (error) {
+        console.warn('Lab result notification failed:', error)
+      }
+    })()
+
     setShowResultModal(false)
-    setResultForm({ result_text: '', result_value: '', reference_range: '', interpretation: '', performed_by: '', result_notes: '', result_file_url: '' })
+    setResultForm(emptyResultForm())
     fetchTests()
     setSaving(false)
   }
 
-  const filtered = tests.filter(t => {
+  const enrichedTests = useMemo(() => tests.map(test => ({
+    ...test,
+    aging: getAgingMeta(test, nowTick),
+    workflowStage: getWorkflowStage(test),
+  })), [tests, nowTick])
+
+  const filtered = useMemo(() => enrichedTests.filter(t => {
     const query = search.trim().toLowerCase()
-    const matchSearch = !query || [t.test_type, t.patient_name, t.ordered_by, t.assigned_to, t.notes, t.category].some(f => f?.toLowerCase().includes(query))
+    const matchSearch = !query || [t.test_type, t.patient_name, t.ordered_by, t.assigned_to, t.notes, t.category, t.sample_barcode].some(f => String(f || '').toLowerCase().includes(query))
     const matchStatus = filterStatus === 'All' || t.status === filterStatus
     const matchPriority = filterPriority === 'All' || t.priority === filterPriority
     const matchCat = filterCategory === 'All' || t.category === filterCategory
     const matchPatient = !filterPatient || t.patient_name === filterPatient
     const matchSource = filterSource === 'All' || (filterSource === 'Doctor' ? !!t.visit_id : !t.visit_id)
     return matchSearch && matchStatus && matchPriority && matchCat && matchPatient && matchSource
-  })
+  }).sort((a, b) => {
+    const priorityRank = { STAT: 0, Urgent: 1, Routine: 2 }
+    const priorityDiff = (priorityRank[a.priority] ?? 9) - (priorityRank[b.priority] ?? 9)
+    if (priorityDiff !== 0) return priorityDiff
+    return (b.aging?.minutes || 0) - (a.aging?.minutes || 0)
+  }), [enrichedTests, search, filterStatus, filterPriority, filterCategory, filterPatient, filterSource])
 
   const counts = {
     All: tests.length,
@@ -752,6 +1421,107 @@ export default function Laboratory() {
     Completed: tests.filter(t => t.status === 'Complete').length,
     Critical: tests.filter(t => t.status === 'Critical').length,
   }
+
+  const dashboardMetrics = useMemo(() => {
+    const weekAgo = Date.now() - (7 * 24 * 60 * 60 * 1000)
+    const statuses = [
+      { name: 'Pending', value: tests.filter(test => test.status === 'Pending').length, color: '#C07000' },
+      { name: 'In Progress', value: tests.filter(test => test.status === 'In Progress').length, color: '#1a6fb5' },
+      { name: 'Complete', value: tests.filter(test => test.status === 'Complete').length, color: '#0F6E56' },
+      { name: 'Critical', value: tests.filter(test => test.status === 'Critical').length, color: '#A32D2D' },
+    ].filter(item => item.value > 0)
+
+    const weeklyByCategory = tests
+      .filter(test => new Date(test.ordered_at || 0).getTime() >= weekAgo && test.resulted_at)
+      .reduce((acc, test) => {
+        const key = test.category || 'Other'
+        const tatHours = (new Date(test.resulted_at).getTime() - new Date(test.ordered_at || 0).getTime()) / 3600000
+        if (!acc[key]) acc[key] = { total: 0, count: 0 }
+        if (Number.isFinite(tatHours) && tatHours >= 0) {
+          acc[key].total += tatHours
+          acc[key].count += 1
+        }
+        return acc
+      }, {})
+
+    const categoryTat = Object.entries(weeklyByCategory)
+      .map(([category, value]) => ({
+        category,
+        avgHours: value.count ? Number((value.total / value.count).toFixed(1)) : 0,
+      }))
+      .sort((a, b) => b.avgHours - a.avgHours)
+
+    const pendingByTechnician = tests
+      .filter(test => ['Pending', 'In Progress', 'Critical'].includes(test.status))
+      .reduce((acc, test) => {
+        const key = test.assigned_to || 'Unassigned'
+        acc[key] = (acc[key] || 0) + 1
+        return acc
+      }, {})
+
+    const unreviewed = tests
+      .filter(test => test.status === 'Complete' && !test.reviewed_at)
+      .sort((a, b) => new Date(a.resulted_at || 0).getTime() - new Date(b.resulted_at || 0).getTime())
+
+    return {
+      statuses,
+      categoryTat,
+      pendingByTechnician: Object.entries(pendingByTechnician).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count),
+      unreviewed,
+    }
+  }, [tests])
+
+  const activeResultTemplate = useMemo(
+    () => matchStructuredTemplate(selected?.test_type, selected?.category),
+    [selected],
+  )
+  const activeStructuredAlerts = useMemo(
+    () => activeResultTemplate ? buildCriticalAlerts(activeResultTemplate, resultForm.structured_values || {}) : [],
+    [activeResultTemplate, resultForm.structured_values],
+  )
+  const antibiogramProfileSummary = useMemo(() => {
+    const entries = Object.entries(antibiogramForm.susceptibility_profile || {})
+      .map(([drug, value]) => [drug, normalizeSusceptibilityChoice(value)])
+      .filter(([, value]) => value)
+    return {
+      testedCount: entries.length,
+      sensitive: entries.filter(([, value]) => value === 'S').length,
+      intermediate: entries.filter(([, value]) => value === 'I').length,
+      resistant: entries.filter(([, value]) => value === 'R').length,
+      resistantDrugs: entries.filter(([, value]) => value === 'R').map(([drug]) => drug).slice(0, 4),
+    }
+  }, [antibiogramForm.susceptibility_profile])
+  const inferredMicroFlags = useMemo(() => {
+    const organism = String(antibiogramForm.organism || '').toLowerCase()
+    return {
+      mrsa: organism.includes('mrsa') || organism.includes('methicillin resistant'),
+      esbl: organism.includes('esbl') || organism.includes('extended spectrum'),
+      carbapenem_r: organism.includes('cre') || organism.includes('carbapenem'),
+    }
+  }, [antibiogramForm.organism])
+
+  const pendingReferralTests = tests.filter(test =>
+    ['Pending', 'In Progress', 'Critical'].includes(test.status) &&
+    getSampleStatusFromLabRow(test) !== 'Resulted'
+  )
+  const filteredReferralTests = pendingReferralTests.filter(test => {
+    const q = referralTestSearch.trim().toLowerCase()
+    if (!q) return true
+    return `${test.patient_name || ''} ${test.test_name || ''} ${test.test_type || ''}`.toLowerCase().includes(q)
+  })
+  const filteredReferralPatients = patients.filter(patient => {
+    const q = referralPatientSearch.trim().toLowerCase()
+    if (!q) return false
+    return `${patient.full_name || ''} ${getPatientNumber(patient)}`.toLowerCase().includes(q)
+  }).slice(0, 6)
+  const pendingReferrals = referrals.filter(referral => getReferralDisplayStatus(referral) === 'Sent')
+  const overdueReferrals = referrals.filter(referral => getReferralDisplayStatus(referral) === 'Overdue')
+  const referralResultsThisMonth = referrals.filter(referral => {
+    if (getReferralDisplayStatus(referral) !== 'Result Received' || !referral.result_date) return false
+    const resultDate = new Date(referral.result_date)
+    const now = new Date()
+    return resultDate.getMonth() === now.getMonth() && resultDate.getFullYear() === now.getFullYear()
+  })
 
   const groupedByPatient = filtered.reduce((acc, t) => {
     const key = t.patient_name || 'Unknown'
@@ -800,22 +1570,161 @@ export default function Laboratory() {
       {/* HEADER */}
       <div style={s.header}>
         <div>
-          <h1 style={s.title}>🔬 Laboratory</h1>
+          <h1 style={s.title}>Laboratory</h1>
           <p style={s.subtitle}>
-            {counts.All} total &nbsp;•&nbsp;
-            <span style={{ color: '#C07000', fontWeight: 600 }}>{counts.Pending} pending</span> &nbsp;•&nbsp;
-            <span style={{ color: '#1a6fb5', fontWeight: 600 }}>{counts.Processing} processing</span> &nbsp;•&nbsp;
-            <span style={{ color: '#0F6E56', fontWeight: 600 }}>{counts.Completed} completed</span>
+            {activeTab === 'referrals' ? (
+              <>
+                {referrals.length} total referrals &nbsp;&bull;&nbsp;
+                <span style={{ color: '#C07000', fontWeight: 600 }}>{pendingReferrals.length} pending</span> &nbsp;&bull;&nbsp;
+                <span style={{ color: '#A32D2D', fontWeight: 600 }}>{overdueReferrals.length} overdue</span> &nbsp;&bull;&nbsp;
+                <span style={{ color: '#0F6E56', fontWeight: 600 }}>{referralResultsThisMonth.length} results this month</span>
+              </>
+            ) : activeTab === 'dashboard' ? (
+              <>
+                <span style={{ color: '#0F6E56', fontWeight: 600 }}>{dashboardMetrics.statuses.reduce((sum, item) => sum + item.value, 0)} tracked tests</span> &nbsp;&bull;&nbsp;
+                <span style={{ color: '#C07000', fontWeight: 600 }}>{dashboardMetrics.unreviewed.length} results ready for doctor review</span> &nbsp;&bull;&nbsp;
+                <span style={{ color: '#A32D2D', fontWeight: 600 }}>{filtered.filter(test => test.aging?.overFourHours && test.status !== 'Complete').length} pending over 4h</span>
+              </>
+            ) : (
+              <>
+                {counts.All} total &nbsp;&bull;&nbsp;
+                <span style={{ color: '#C07000', fontWeight: 600 }}>{counts.Pending} pending</span> &nbsp;&bull;&nbsp;
+                <span style={{ color: '#1a6fb5', fontWeight: 600 }}>{counts.Processing} processing</span> &nbsp;&bull;&nbsp;
+                <span style={{ color: '#0F6E56', fontWeight: 600 }}>{counts.Completed} completed</span>
+              </>
+            )}
           </p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button style={{ ...s.btn, background: activeTab === 'technicians' ? '#7B5EA7' : '#fff', color: activeTab === 'technicians' ? '#fff' : '#0F6E56', border: `1px solid ${activeTab === 'technicians' ? '#7B5EA7' : '#0F6E56'}` }} onClick={() => setActiveTab(activeTab === 'technicians' ? 'tests' : 'technicians')}>
-            👥 Technicians
+          <button style={{ ...s.btn, background: activeTab === 'dashboard' ? '#1a6fb5' : '#fff', color: activeTab === 'dashboard' ? '#fff' : '#1a6fb5', border: '1px solid #1a6fb5' }} onClick={() => setActiveTab('dashboard')}>
+            Dashboard
           </button>
-          <button style={s.btn} onClick={() => { resetOrderForm(); setShowOrderModal(true) }}>+ Order Lab Test</button>
-          <button style={{ ...s.btn, background: '#fff', color: '#0F6E56', border: '1px solid #0F6E56' }} onClick={fetchTests}>↻ Refresh</button>
+          <button style={{ ...s.btn, background: activeTab === 'tests' ? '#0F6E56' : '#fff', color: activeTab === 'tests' ? '#fff' : '#0F6E56', border: '1px solid #0F6E56' }} onClick={() => setActiveTab('tests')}>
+            Tests
+          </button>
+          <button style={{ ...s.btn, background: activeTab === 'technicians' ? '#7B5EA7' : '#fff', color: activeTab === 'technicians' ? '#fff' : '#7B5EA7', border: '1px solid #7B5EA7' }} onClick={() => setActiveTab('technicians')}>
+            Technicians
+          </button>
+          <button style={{ ...s.btn, background: activeTab === 'referrals' ? '#B45309' : '#fff', color: activeTab === 'referrals' ? '#fff' : '#B45309', border: '1px solid #B45309' }} onClick={() => setActiveTab('referrals')}>
+            Referrals
+          </button>
+          {activeTab === 'referrals' ? (
+            <button style={{ ...s.btn, background: '#B45309' }} onClick={openReferralModal}>+ New Referral</button>
+          ) : activeTab === 'dashboard' ? (
+            <button style={{ ...s.btn, background: '#1a6fb5' }} onClick={() => setActiveTab('tests')}>Open Active Queue</button>
+          ) : (
+            <button style={s.btn} onClick={() => { resetOrderForm(); setShowOrderModal(true) }}>+ Order Lab Test</button>
+          )}
+          <button style={{ ...s.btn, background: '#fff', color: '#0F6E56', border: '1px solid #0F6E56' }} onClick={() => { fetchTests(); fetchReferrals(); fetchInvoices() }}>Refresh</button>
         </div>
       </div>
+
+      {activeTab !== 'referrals' && activeTab !== 'dashboard' && (
+      <LabResultsTab
+        variant="scanner"
+        styles={s}
+        scannerValue={scannerValue}
+        setScannerValue={setScannerValue}
+        handleScannerLookup={handleScannerLookup}
+      />
+      )}
+
+      {activeTab === 'dashboard' && (
+        <div style={{ display: 'grid', gap: 16 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: 14 }}>
+            <div style={s.metricCard}>
+              <div style={s.metricLabel}>Pending Queue</div>
+              <div style={s.metricValue}>{tests.filter(test => test.status === 'Pending').length}</div>
+              <div style={s.metricSub}>Including {filtered.filter(test => test.priority === 'STAT' && test.status !== 'Complete').length} STAT orders</div>
+            </div>
+            <div style={s.metricCard}>
+              <div style={s.metricLabel}>Results Ready</div>
+              <div style={s.metricValue}>{dashboardMetrics.unreviewed.length}</div>
+              <div style={s.metricSub}>Awaiting clinician review</div>
+            </div>
+            <div style={s.metricCard}>
+              <div style={s.metricLabel}>Over 4h Aging</div>
+              <div style={s.metricValue}>{filtered.filter(test => test.aging?.overFourHours && test.status !== 'Complete').length}</div>
+              <div style={s.metricSub}>Backlog needing escalation</div>
+            </div>
+            <div style={s.metricCard}>
+              <div style={s.metricLabel}>Average Weekly TAT</div>
+              <div style={s.metricValue}>{dashboardMetrics.categoryTat[0]?.avgHours ? `${dashboardMetrics.categoryTat[0].avgHours}h` : '—'}</div>
+              <div style={s.metricSub}>{dashboardMetrics.categoryTat[0]?.category || 'No completed tests this week'}</div>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1fr', gap: 16, alignItems: 'stretch' }}>
+            <div style={s.dashboardCard}>
+              <div style={s.dashboardCardTitle}>Tests By Status</div>
+              <div style={{ height: 260 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <PieChart>
+                    <Pie data={dashboardMetrics.statuses} dataKey="value" nameKey="name" outerRadius={90} innerRadius={48} paddingAngle={2}>
+                      {dashboardMetrics.statuses.map(item => <Cell key={item.name} fill={item.color} />)}
+                    </Pie>
+                    <RechartsTooltip formatter={value => [`${value} tests`, 'Count']} />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            <div style={s.dashboardCard}>
+              <div style={s.dashboardCardTitle}>Average Turnaround This Week</div>
+              <div style={{ display: 'grid', gap: 10 }}>
+                {dashboardMetrics.categoryTat.length === 0 && <div style={{ color: '#6B7280', fontSize: 13 }}>No completed tests recorded this week yet.</div>}
+                {dashboardMetrics.categoryTat.map(item => (
+                  <div key={item.category}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
+                      <span style={{ fontWeight: 600, color: '#1F2937' }}>{item.category}</span>
+                      <span style={{ color: '#0F6E56', fontWeight: 700 }}>{item.avgHours}h</span>
+                    </div>
+                    <div style={{ background: '#E5E7EB', borderRadius: 999, height: 8 }}>
+                      <div style={{ width: `${Math.min(100, item.avgHours * 8)}%`, background: item.avgHours > 8 ? '#A32D2D' : item.avgHours > 4 ? '#C07000' : '#0F6E56', borderRadius: 999, height: '100%' }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+            <div style={s.dashboardCard}>
+              <div style={s.dashboardCardTitle}>Pending By Technician</div>
+              <div style={{ display: 'grid', gap: 10 }}>
+                {dashboardMetrics.pendingByTechnician.length === 0 && <div style={{ color: '#6B7280', fontSize: 13 }}>No active pending workload.</div>}
+                {dashboardMetrics.pendingByTechnician.map(item => (
+                  <div key={item.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', border: '1px solid #E5E7EB', borderRadius: 10 }}>
+                    <span style={{ fontSize: 13, color: '#1F2937', fontWeight: 600 }}>{item.name}</span>
+                    <span style={{ ...s.pill, background: item.name === 'Unassigned' ? '#FCEBEB' : '#E3F0FB', color: item.name === 'Unassigned' ? '#A32D2D' : '#1a6fb5' }}>{item.count}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div style={s.dashboardCard}>
+              <div style={s.dashboardCardTitle}>Results Not Yet Reviewed By Doctor</div>
+              <div style={{ display: 'grid', gap: 10 }}>
+                {dashboardMetrics.unreviewed.length === 0 && <div style={{ color: '#0F6E56', fontSize: 13, fontWeight: 600 }}>All completed results have been reviewed.</div>}
+                {dashboardMetrics.unreviewed.slice(0, 8).map(test => (
+                  <button
+                    key={test.id}
+                    type="button"
+                    onClick={() => { setActiveTab('tests'); setSelected(test) }}
+                    style={{ ...s.listButton, justifyContent: 'space-between' }}
+                  >
+                    <span style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+                      <span style={{ fontWeight: 700, color: '#1F2937', fontSize: 13 }}>{test.patient_name}</span>
+                      <span style={{ fontSize: 12, color: '#6B7280' }}>{test.test_type}</span>
+                    </span>
+                    <span style={{ ...s.pill, background: '#FFF3DC', color: '#C07000' }}>{test.resulted_at ? new Date(test.resulted_at).toLocaleString('en-KE', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : 'Ready'}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* TECHNICIANS VIEW */}
       {activeTab === 'technicians' && (() => {
@@ -884,328 +1793,114 @@ export default function Laboratory() {
         )
       })()}
 
+      {activeTab === 'referrals' && (
+        <LabReferralsTab
+          referrals={referrals}
+          pendingReferrals={pendingReferrals}
+          overdueReferrals={overdueReferrals}
+          referralResultsThisMonth={referralResultsThisMonth}
+          search={search}
+          setSearch={setSearch}
+          extractStandaloneReferralTestName={extractStandaloneReferralTestName}
+          getReferralDisplayStatus={getReferralDisplayStatus}
+          getPatientNumber={getPatientNumber}
+          openReferralResultModal={openReferralResultModal}
+          markReferralOverdue={markReferralOverdue}
+          styles={s}
+        />
+      )}
+
       {/* TESTS VIEW */}
       {activeTab === 'tests' && (
-        <div>
-          <div style={s.tabRow}>
-            {['All', 'Pending', 'In Progress', 'Complete', 'Critical'].map(st => (
-              <button key={st} style={{ ...s.tabBtn, ...(filterStatus === st ? s.tabBtnActive : {}) }} onClick={() => setFilterStatus(st)}>
-                {st === 'Pending' ? '⏳' : st === 'In Progress' ? '🔄' : st === 'Complete' ? '✅' : st === 'Critical' ? '🚨' : '📋'} {st}
-                <span style={{ ...s.tabCount, ...(filterStatus === st ? s.tabCountActive : {}) }}>{counts[st] ?? tests.filter(t => t.status === st).length}</span>
-              </button>
-            ))}
-          </div>
-
-          {/* FILTERS */}
-          <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap', alignItems: 'center' }}>
-            <div style={{ position: 'relative', flex: 1, minWidth: 220 }}>
-              <span style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', fontSize: 13 }}>🔍</span>
-              <input style={{ ...s.input, paddingLeft: 30 }} placeholder="Search test, patient, doctor, technician..." value={search} onChange={e => setSearch(e.target.value)} />
-            </div>
-            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-              <div style={{ display: 'flex', flexDirection: 'column', minWidth: 140 }}>
-                <label style={{ fontSize: 11, color: '#555', marginBottom: 2 }}>From</label>
-                <input type="date" style={{ ...s.input, width: '100%' }} value={dateFrom} max={dateTo} onChange={e => setDateFrom(e.target.value)} />
-              </div>
-              <div style={{ display: 'flex', flexDirection: 'column', minWidth: 140 }}>
-                <label style={{ fontSize: 11, color: '#555', marginBottom: 2 }}>To</label>
-                <input type="date" style={{ ...s.input, width: '100%' }} value={dateTo} min={dateFrom} onChange={e => setDateTo(e.target.value)} />
-              </div>
-            </div>
-            <select style={{ ...s.input, width: 'auto', minWidth: 160 }} value={filterPatient} onChange={e => setFilterPatient(e.target.value)}>
-              <option value="">All Patients</option>
-              {uniquePatients.map(name => <option key={name} value={name}>{name}</option>)}
-            </select>
-            <select style={{ ...s.input, width: 'auto' }} value={filterSource} onChange={e => setFilterSource(e.target.value)}>
-              <option value="All">All Sources</option>
-              <option value="Doctor">Doctor Orders</option>
-              <option value="Walk-in">Walk-in</option>
-            </select>
-            <select style={{ ...s.input, width: 'auto' }} value={filterPriority} onChange={e => setFilterPriority(e.target.value)}>
-              <option value="All">All Priorities</option>
-              <option>Routine</option><option>Urgent</option><option>STAT</option>
-            </select>
-            <select style={{ ...s.input, width: 'auto' }} value={filterCategory} onChange={e => setFilterCategory(e.target.value)}>
-              <option value="All">All Categories</option>
-              {LAB_TEST_CATEGORIES.map(c => <option key={c}>{c}</option>)}
-            </select>
-            {(filterPatient || filterSource !== 'All' || filterPriority !== 'All' || filterCategory !== 'All' || search) && (
-              <button style={{ ...s.input, width: 'auto', background: '#FCEBEB', color: '#A32D2D', border: '1px solid #F09595', cursor: 'pointer', fontWeight: 600, fontSize: 12 }}
-                onClick={() => { setSearch(''); setFilterPatient(''); setFilterSource('All'); setFilterPriority('All'); setFilterCategory('All') }}>
-                Clear filters
-              </button>
-            )}
-          </div>
-
-          {/* PATIENT CHIPS */}
-          {uniquePatients.length > 0 && (
-            <div style={{ display: 'flex', gap: 8, marginBottom: 14, overflowX: 'auto', paddingBottom: 6 }}>
-              {uniquePatients.map(name => (
-                <button key={name} style={{ ...s.chip, ...(filterPatient === name ? s.chipActive : {}), whiteSpace: 'nowrap' }} onClick={() => { setFilterPatient(name); setSearch('') }}>
-                  {name} <span style={{ marginLeft: 6, fontWeight: 800 }}>{(groupedByPatient[name] || []).length}</span>
-                </button>
-              ))}
-              <button style={s.chip} onClick={() => { setFilterPatient(''); setSearch('') }}>Show all</button>
-            </div>
-          )}
-
-          {/* PATIENT CARDS */}
-          {patientCards.length > 0 && (
-            <div style={{ marginBottom: 16 }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '.6px', marginBottom: 10 }}>Patient Cards</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(280px,1fr))', gap: 12 }}>
-                {patientCards.slice(0, filterPatient ? patientCards.length : 6).map(card => (
-                  <div key={card.key} style={filterPatient === card.patientName ? s.patientCardActive : {}}
-                    onClick={() => { setFilterPatient(card.patientName); const next = card.items.find(i => i.status !== 'Complete') || card.items[0]; if (next) setSelected(next) }}>
-                    <PatientWorkflowCard
-                      patientName={card.patientName}
-                      patient={card.patient || {}}
-                      visit={{ chiefComplaint: card.items[0]?.notes || '', visitType: card.visitId ? 'Doctor Order' : 'Walk-in' }}
-                      badges={[
-                        ...(card.patient?.allergies ? [{ label: 'Allergy noted', bg: '#FCEBEB', color: '#A32D2D' }] : []),
-                        ...(card.visitId ? [{ label: 'Doctor order', bg: '#F0EAFC', color: '#7B5EA7' }] : []),
-                      ]}
-                      accentColor="#0F6E56" background="#FFFFFF">
-                      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                        <span style={{ ...s.pill, background: '#FFF3DC', color: '#C07000' }}>{card.pending} pending</span>
-                        <span style={{ ...s.pill, background: '#E3F0FB', color: '#1a6fb5' }}>{card.processing} processing</span>
-                        <span style={{ ...s.pill, background: '#E1F5EE', color: '#0F6E56' }}>{card.completed} complete</span>
-                        {card.critical > 0 && <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>{card.critical} critical</span>}
-                      </div>
-                      <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                        {card.items.slice(0, 3).map(item => (
-                          <div key={item.id} style={{ fontSize: 12, color: '#444', display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                              {isCultureSensitivityTest(item.test_type, item.category) ? '🧫 ' : ''}{item.test_type}
-                            </span>
-                            <span style={{ color: item.assigned_to ? '#1a6fb5' : '#C07000', fontWeight: 600, whiteSpace: 'nowrap' }}>{item.assigned_to || 'Unassigned'}</span>
-                          </div>
-                        ))}
-                        {card.items.length > 3 && <div style={{ fontSize: 11, color: '#888' }}>+{card.items.length - 3} more ordered tests</div>}
-                      </div>
-                      <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid #EEF2F7', display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-                        <div>
-                          <div style={{ fontSize: 11, color: '#888', fontWeight: 700, textTransform: 'uppercase' }}>Billing</div>
-                          <div style={{ fontSize: 13, color: '#111', fontWeight: 700, marginTop: 3 }}>{card.totalAmount > 0 ? `${formatKES(card.billedAmount)} billed of ${formatKES(card.totalAmount)}` : 'Charges to be set in billing'}</div>
-                          <div style={{ fontSize: 11, color: card.unbilledTests.length > 0 ? '#C07000' : '#0F6E56', marginTop: 4 }}>{card.unbilledTests.length > 0 ? `${card.unbilledTests.length} test(s) still not billed` : `Balance ${formatKES(card.balanceAmount)}`}</div>
-                        </div>
-                        <button style={{ ...s.actionBtn, background: '#F0EAFC', color: '#7B5EA7', border: '1px solid #D4C5F5' }} onClick={e => { e.stopPropagation(); navigate?.('billing', { patientName: card.patientName, visitId: card.visitId || null, source: 'laboratory', openedAt: Date.now() }) }}>
-                          Open Billing
-                        </button>
-                      </div>
-                    </PatientWorkflowCard>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* MAIN LIST + DETAIL */}
-          <div style={{ display: 'flex', gap: 16 }}>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              {filtered.length === 0 ? (
-                <div style={s.empty}><div style={{ fontSize: 48 }}>🔬</div><div style={{ marginTop: 12, fontWeight: 600, color: '#555' }}>No tests found</div></div>
-              ) : (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {filtered.map(test => {
-                    const sc = STATUS_COLORS[test.status] || STATUS_COLORS.Pending
-                    const pc = PRIORITY_COLORS[test.priority] || PRIORITY_COLORS.Routine
-                    const isSelected = selected?.id === test.id
-                    const isFromDoctor = !!test.visit_id
-                    const isCultureTest = isCultureSensitivityTest(test.test_type, test.category)
-                    const linkedInvoice = invoices.find(inv => hasLinkedLabInvoice([inv], test))
-
-                    return (
-                      <div key={test.id} className="test-card"
-                        style={{ ...s.testCard, border: isSelected ? '2px solid #0F6E56' : '1px solid #eee', background: isSelected ? '#f0faf7' : '#fff' }}
-                        onClick={() => setSelected(isSelected ? null : test)}>
-
-                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14, flex: 1, minWidth: 0 }}>
-                          <div style={{ width: 42, height: 42, borderRadius: 10, background: isCultureTest ? '#F0EAFC' : '#E1F5EE', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, flexShrink: 0 }}>
-                            {isCultureTest ? '🧫' : test.category === 'Haematology' ? '🩸' : test.category === 'Microbiology' ? '🦠' : test.category === 'Radiology' ? '🩻' : test.category === 'Urinalysis' ? '🧪' : test.category === 'Parasitology' ? '🔬' : test.category === 'Immunology' ? '🛡️' : test.category === 'Serology' ? '💉' : '🔬'}
-                          </div>
-
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
-                              <span style={{ fontWeight: 700, fontSize: 14, color: '#111' }}>{test.test_type}</span>
-                              <span style={{ ...s.pill, background: sc.bg, color: sc.color, border: `1px solid ${sc.border}` }}>{test.status}</span>
-                              <span style={{ ...s.pill, background: pc.bg, color: pc.color }}>{test.priority}</span>
-                              {test.category && <span style={{ ...s.pill, background: '#f5f5f5', color: '#666' }}>{test.category}</span>}
-                              {/* Special badge for C&S tests */}
-                              {isCultureTest && <span style={{ ...s.pill, background: '#F5F0FF', color: '#7B3AED', border: '1px solid #DDD6FE' }}>🧫 C&S — Antibiogram</span>}
-                              {isFromDoctor && <span style={{ ...s.pill, background: '#F0EAFC', color: '#7B5EA7', border: '1px solid #D4C5F5' }}>📋 Doctor Order</span>}
-                              {linkedInvoice
-                                ? <span style={{ ...s.pill, background: '#E1F5EE', color: '#0F6E56', border: '1px solid #9FE1CB' }}>✅ Billed</span>
-                                : <span style={{ ...s.pill, background: '#FFF3DC', color: '#C07000', border: '1px solid #FAC775' }}>⚠ Billing Pending</span>}
-                            </div>
-                            <div style={{ fontSize: 12, color: '#666', display: 'flex', gap: 14, flexWrap: 'wrap' }}>
-                              <span>👤 {test.patient_name}</span>
-                              {test.ordered_by && <span>🩺 Dr. {test.ordered_by}</span>}
-                              {test.assigned_to ? <span style={{ color: '#1a6fb5', fontWeight: 600 }}>🔬 {test.assigned_to}</span> : <span style={{ color: '#C07000' }}>⚠ Unassigned</span>}
-                              <span>🕐 {test.ordered_at ? new Date(test.ordered_at).toLocaleString('en-KE', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—'}</span>
-                              {test.amount > 0 && <span style={{ color: '#0F6E56', fontWeight: 600 }}>KES {parseFloat(test.amount).toLocaleString()}</span>}
-                            </div>
-                            {test.notes && <div style={{ fontSize: 11, color: '#888', marginTop: 3 }}>📝 {test.notes}</div>}
-
-                            {/* C&S hint */}
-                            {isCultureTest && test.status !== 'Complete' && (
-                              <div style={{ marginTop: 6, background: '#F5F0FF', border: '1px solid #DDD6FE', borderRadius: 6, padding: '5px 10px', fontSize: 11, color: '#7B3AED', fontWeight: 600 }}>
-                                🧫 Culture & Sensitivity — use "Upload Antibiogram" to attach the VITEK/WHONET PDF and record the organism
-                              </div>
-                            )}
-
-                            {/* Result preview */}
-                            {test.status === 'Complete' && test.result_text && (
-                              <div style={{ marginTop: 8, background: '#E1F5EE', borderRadius: 6, padding: '6px 10px', fontSize: 12, color: '#0F6E56', fontWeight: 500 }}>
-                                {test.result_text.slice(0, 120)}{test.result_text.length > 120 ? '...' : ''}
-                              </div>
-                            )}
-                            {test.status === 'Complete' && isCultureTest && (
-                              <div style={{ marginTop: 4, fontSize: 11, color: '#7B3AED', fontWeight: 600 }}>
-                                🧫 Full S/I/R antibiogram available — view in Antibiogram screen
-                              </div>
-                            )}
-                            {test.status === 'Complete' && isFromDoctor && (
-                              <div style={{ marginTop: 4, fontSize: 11, color: '#7B5EA7', fontWeight: 600 }}>✅ Result sent back to Doctor queue</div>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* ACTION BUTTONS */}
-                        <div style={{ display: 'flex', gap: 6, flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }} onClick={e => e.stopPropagation()}>
-                          {test.status !== 'Complete' && test.status !== 'Critical' && (
-                            <button className="action-btn" style={{ ...s.actionBtn, background: '#F0EAFC', color: '#7B5EA7', border: '1px solid #D4C5F5' }}
-                              onClick={() => { setSelected(test); setAssignTech(test.assigned_to || ''); setShowAssignModal(true) }}>
-                              👤 {test.assigned_to ? 'Reassign' : 'Assign'}
-                            </button>
-                          )}
-                          {test.status === 'Pending' && (
-                            <button className="action-btn" style={{ ...s.actionBtn, background: '#E3F0FB', color: '#1a6fb5', border: '1px solid #90C4F0' }} onClick={() => updateStatus(test, 'In Progress')}>▶ Process</button>
-                          )}
-                          {/* SPLIT: C&S gets Upload Antibiogram, others get Enter Result */}
-                          {(test.status === 'Pending' || test.status === 'In Progress') && (
-                            isCultureTest ? (
-                              <button className="action-btn" style={{ ...s.actionBtn, background: '#F5F0FF', color: '#7B3AED', border: '1px solid #DDD6FE', fontWeight: 700 }}
-                                onClick={() => openAntibiogramModal(test)}>
-                                🧫 Upload Antibiogram
-                              </button>
-                            ) : (
-                              <button className="action-btn" style={{ ...s.actionBtn, background: '#E1F5EE', color: '#0F6E56', border: '1px solid #9FE1CB' }}
-                                onClick={() => { setSelected(test); setResultForm({ result_text: '', result_value: '', reference_range: '', interpretation: '', performed_by: '', result_notes: '', result_file_url: '' }); setShowResultModal(true) }}>
-                                📝 Enter Result
-                              </button>
-                            )
-                          )}
-                          {test.status === 'Complete' && (
-                            isCultureTest ? (
-                              <button className="action-btn" style={{ ...s.actionBtn, background: '#F5F0FF', color: '#7B3AED', border: '1px solid #DDD6FE' }}
-                                onClick={() => openAntibiogramModal(test)}>
-                                🧫 Update C&S
-                              </button>
-                            ) : (
-                              <button className="action-btn" style={{ ...s.actionBtn, background: '#f5f5f5', color: '#555' }}
-                                onClick={() => { setSelected(test); setShowResultModal(true) }}>
-                                ✏️ Edit
-                              </button>
-                            )
-                          )}
-                          {test.status !== 'Critical' && test.status !== 'Complete' && (
-                            <button className="action-btn" style={{ ...s.actionBtn, background: '#FCEBEB', color: '#A32D2D', border: '1px solid #F09595' }} onClick={() => updateStatus(test, 'Critical')}>🚨</button>
-                          )}
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginTop: 16, flexWrap: 'wrap' }}>
-                <div style={{ fontSize: 12, color: '#555' }}>
-                  Showing {tests.length} of {testTotalCount || 0} lab tests
-                </div>
-                <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-                  <label style={{ fontSize: 12, color: '#555' }}>Show:</label>
-                  <select style={{ ...s.input, width: 'auto' }} value={testPageSize} onChange={e => { setTestPageSize(Number(e.target.value)); setTestPage(1) }}>
-                    {PAGE_SIZE_OPTIONS.map(size => <option key={size} value={size}>{size}</option>)}
-                  </select>
-                  <button style={{ ...s.actionBtn, ...(testPage <= 1 ? s.btnGhost : s.btnPri), padding: '8px 12px' }} disabled={testPage <= 1} onClick={() => setTestPage(prev => Math.max(prev - 1, 1))}>← Previous</button>
-                  <span style={{ fontSize: 12, color: '#555' }}>Page {testPage} of {Math.max(1, Math.ceil((testTotalCount || 0) / testPageSize))}</span>
-                  <button style={{ ...s.actionBtn, ...(testPage >= Math.ceil((testTotalCount || 0) / testPageSize) ? s.btnGhost : s.btnPri), padding: '8px 12px' }} disabled={testPage >= Math.ceil((testTotalCount || 0) / testPageSize)} onClick={() => setTestPage(prev => prev + 1)}>Next →</button>
-                </div>
-              </div>
-            </div>
-
-            {/* DETAIL PANEL */}
-            {selected && (
-              <div style={s.detailPanel}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-                  <div style={{ fontWeight: 700, fontSize: 15, color: '#111' }}>Test Details</div>
-                  <button style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', color: '#aaa' }} onClick={() => setSelected(null)}>✕</button>
-                </div>
-                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 14 }}>
-                  <span style={{ ...s.pill, background: STATUS_COLORS[selected.status]?.bg, color: STATUS_COLORS[selected.status]?.color, border: `1px solid ${STATUS_COLORS[selected.status]?.border}`, fontSize: 12 }}>{selected.status}</span>
-                  {selected.visit_id && <span style={{ ...s.pill, background: '#F0EAFC', color: '#7B5EA7', border: '1px solid #D4C5F5', fontSize: 12 }}>📋 Doctor Order</span>}
-                  {isCultureSensitivityTest(selected.test_type, selected.category) && <span style={{ ...s.pill, background: '#F5F0FF', color: '#7B3AED', border: '1px solid #DDD6FE', fontSize: 12 }}>🧫 C&S</span>}
-                </div>
-                {[
-                  ['Test', selected.test_type],
-                  ['Category', selected.category],
-                  ['Priority', selected.priority],
-                  ['Patient', selected.patient_name],
-                  ['Phone', selected.phone || '—'],
-                  ['Ordered By', selected.ordered_by ? `Dr. ${selected.ordered_by}` : '—'],
-                  ['Assigned To', selected.assigned_to || '—'],
-                  ['Ordered At', selected.ordered_at ? new Date(selected.ordered_at).toLocaleString('en-KE') : '—'],
-                  ['Notes', selected.notes || '—'],
-                ].map(([label, val]) => (
-                  <div key={label} style={{ marginBottom: 10, paddingBottom: 10, borderBottom: '1px solid #f5f5f5' }}>
-                    <div style={{ fontSize: 10, color: '#aaa', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: 2 }}>{label}</div>
-                    <div style={{ fontSize: 13, color: '#111', fontWeight: 500 }}>{val}</div>
-                  </div>
-                ))}
-                {selected.status === 'Complete' && (
-                  <div style={{ marginTop: 4 }}>
-                    <div style={s.sectionLabel}>Results</div>
-                    {selected.result_value && <div style={{ fontSize: 18, fontWeight: 800, color: '#0F6E56', marginBottom: 6 }}>{selected.result_value}</div>}
-                    {selected.result_text && <div style={{ background: '#f9fafb', borderRadius: 8, padding: 12, fontSize: 13, color: '#333', marginBottom: 8, whiteSpace: 'pre-wrap' }}>{selected.result_text}</div>}
-                    {selected.interpretation && <div style={{ background: selected.interpretation?.toLowerCase().includes('abnormal') || selected.interpretation?.toLowerCase().includes('positive') ? '#FCEBEB' : '#E1F5EE', borderRadius: 8, padding: '8px 12px', fontSize: 12, fontWeight: 600, color: selected.interpretation?.toLowerCase().includes('abnormal') || selected.interpretation?.toLowerCase().includes('positive') ? '#A32D2D' : '#0F6E56', marginBottom: 8 }}>{selected.interpretation}</div>}
-                    {selected.performed_by && <div style={{ fontSize: 11, color: '#888', marginTop: 4 }}>By: {selected.performed_by}</div>}
-                    {selected.resulted_at && <div style={{ fontSize: 11, color: '#888' }}>Completed: {new Date(selected.resulted_at).toLocaleString('en-KE')}</div>}
-                    {selected.visit_id && <div style={{ marginTop: 10, background: '#E1F5EE', borderRadius: 8, padding: '8px 12px', fontSize: 12, color: '#0F6E56', fontWeight: 600 }}>Patient returned to Doctor queue</div>}
-                  </div>
-                )}
-                <div style={{ marginTop: 16, display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  {selected.status !== 'Complete' && selected.status !== 'Critical' && (
-                    <>
-                      <button style={{ ...s.btn, width: '100%', background: '#7B5EA7' }} onClick={() => { setAssignTech(selected.assigned_to || ''); setShowAssignModal(true) }}>
-                        👤 {selected.assigned_to ? 'Reassign Technician' : 'Assign Technician'}
-                      </button>
-                      {isCultureSensitivityTest(selected.test_type, selected.category) ? (
-                        <button style={{ ...s.btn, width: '100%', background: '#7B3AED' }} onClick={() => openAntibiogramModal(selected)}>
-                          🧫 Upload Antibiogram PDF
-                        </button>
-                      ) : (
-                        <button style={{ ...s.btn, width: '100%' }} onClick={() => { setResultForm({ result_text: '', result_value: '', reference_range: '', interpretation: '', performed_by: '', result_notes: '', result_file_url: '' }); setShowResultModal(true) }}>
-                          📝 Enter Result
-                        </button>
-                      )}
-                      {selected.status === 'Pending' && (
-                        <button style={{ ...s.btn, background: '#1a6fb5', width: '100%' }} onClick={() => updateStatus(selected, 'In Progress')}>▶ Mark Processing</button>
-                      )}
-                    </>
-                  )}
-                  {selected.status === 'Complete' && (
-                    isCultureSensitivityTest(selected.test_type, selected.category) ? (
-                      <button style={{ ...s.btn, background: '#7B3AED', width: '100%' }} onClick={() => openAntibiogramModal(selected)}>🧫 Update C&S Result</button>
-                    ) : (
-                      <button style={{ ...s.btn, background: '#f5f5f5', color: '#555', width: '100%' }} onClick={() => setShowResultModal(true)}>✏️ Edit Result</button>
-                    )
-                  )}
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
+        <LabOrdersTab
+          styles={s}
+          filterStatus={filterStatus}
+          setFilterStatus={setFilterStatus}
+          counts={counts}
+          search={search}
+          setSearch={setSearch}
+          dateFrom={dateFrom}
+          setDateFrom={setDateFrom}
+          dateTo={dateTo}
+          setDateTo={setDateTo}
+          filterPatient={filterPatient}
+          setFilterPatient={setFilterPatient}
+          uniquePatients={uniquePatients}
+          filterSource={filterSource}
+          setFilterSource={setFilterSource}
+          filterPriority={filterPriority}
+          setFilterPriority={setFilterPriority}
+          filterCategory={filterCategory}
+          setFilterCategory={setFilterCategory}
+          labTestCategories={LAB_TEST_CATEGORIES}
+          groupedByPatient={groupedByPatient}
+          patientCards={patientCards}
+          setSelected={setSelected}
+          selected={selected}
+          isCultureSensitivityTest={isCultureSensitivityTest}
+          navigate={navigate}
+          formatKES={formatKES}
+          filtered={filtered}
+          statusColors={STATUS_COLORS}
+          sampleStatusColors={SAMPLE_STATUS_COLORS}
+          getSampleStatusFromLabRow={getSampleStatusFromLabRow}
+          priorityColors={PRIORITY_COLORS}
+          invoices={invoices}
+          hasLinkedLabInvoice={hasLinkedLabInvoice}
+          updateStatus={updateStatus}
+          updateSampleStatus={updateSampleStatus}
+          getAgingMeta={getAgingMeta}
+          getWorkflowStage={getWorkflowStage}
+          labStagePipeline={LAB_STAGE_PIPELINE}
+          advanceWorkflowStage={advanceWorkflowStage}
+          getStageActionLabel={getStageActionLabel}
+          openSampleLabelPrintWindow={openSampleLabelPrintWindow}
+          openResultEntry={openResultEntry}
+          printLabResultReport={printLabResultReport}
+          patientsById={patientsById}
+          patients={patients}
+          openAntibiogramModal={openAntibiogramModal}
+          setShowResultModal={setShowResultModal}
+          setResultForm={setResultForm}
+          setAssignTech={setAssignTech}
+          setShowAssignModal={setShowAssignModal}
+          testTotalCount={testTotalCount}
+          tests={tests}
+          testPageSize={testPageSize}
+          setTestPageSize={setTestPageSize}
+          pageSizeOptions={PAGE_SIZE_OPTIONS}
+          testPage={testPage}
+          setTestPage={setTestPage}
+          detailPanel={
+            <LabResultsTab
+              styles={s}
+              selected={selected}
+              setSelected={setSelected}
+              statusColors={STATUS_COLORS}
+              sampleStatusColors={SAMPLE_STATUS_COLORS}
+              getSampleStatusFromLabRow={getSampleStatusFromLabRow}
+              isCultureSensitivityTest={isCultureSensitivityTest}
+              getPatientNumber={getPatientNumber}
+              patientsById={patientsById}
+              patients={patients}
+              setAssignTech={setAssignTech}
+              setShowAssignModal={setShowAssignModal}
+              updateSampleStatus={updateSampleStatus}
+              openSampleLabelPrintWindow={openSampleLabelPrintWindow}
+              openResultEntry={openResultEntry}
+              openAntibiogramModal={openAntibiogramModal}
+              setResultForm={setResultForm}
+              setShowResultModal={setShowResultModal}
+              updateStatus={updateStatus}
+              getAgingMeta={getAgingMeta}
+              getWorkflowStage={getWorkflowStage}
+              labStagePipeline={LAB_STAGE_PIPELINE}
+              advanceWorkflowStage={advanceWorkflowStage}
+              getStageActionLabel={getStageActionLabel}
+              printLabResultReport={printLabResultReport}
+            />
+          }
+        />
       )}
 
       {/* ===== ANTIBIOGRAM UPLOAD MODAL ===== */}
@@ -1214,7 +1909,7 @@ export default function Laboratory() {
           <div style={{ ...s.modal, maxWidth: 640 }} onClick={e => e.stopPropagation()}>
             <div style={s.modalHeader}>
               <div>
-                <h2 style={s.modalTitle}>🧫 Upload Culture & Sensitivity Report</h2>
+                <h2 style={s.modalTitle}>🧫 Culture & Sensitivity Workbench</h2>
                 <div style={{ fontSize: 13, color: '#888', marginTop: 2 }}>{selected.test_type} — {selected.patient_name}</div>
                 {selected.visit_id && <div style={{ fontSize: 12, color: '#7B5EA7', marginTop: 2, fontWeight: 600 }}>📋 Doctor-ordered — completing this returns patient to Doctor queue</div>}
               </div>
@@ -1252,12 +1947,38 @@ export default function Laboratory() {
                 ℹ After uploading, the full S/I/R antibiogram table can be completed in the <strong>Antibiogram screen</strong>. This step records the organism, sends the result to Consultation and Pharmacy, and returns the patient to the Doctor queue.
               </div>
 
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: 10, marginBottom: 16 }}>
+                <div style={s.microCard}>
+                  <div style={s.microCardLabel}>Sample Barcode</div>
+                  <div style={s.microCardValue}>{selected.sample_barcode || 'Pending barcode'}</div>
+                </div>
+                <div style={s.microCard}>
+                  <div style={s.microCardLabel}>Sample Type</div>
+                  <div style={s.microCardValue}>{antibiogramForm.sample_type || getSampleTypeLabel(selected)}</div>
+                </div>
+                <div style={s.microCard}>
+                  <div style={s.microCardLabel}>Queue Age</div>
+                  <div style={s.microCardValue}>{getAgingMeta(selected, nowTick).label}</div>
+                </div>
+                <div style={s.microCard}>
+                  <div style={s.microCardLabel}>Current Stage</div>
+                  <div style={s.microCardValue}>{getWorkflowStage(selected)}</div>
+                </div>
+              </div>
+
               <div style={s.sectionLabel}>Culture Result</div>
               <div style={s.formGrid2}>
                 <div style={s.formGroup}>
                   <label style={s.label}>Organism Identified *</label>
                   <input style={s.input} placeholder="e.g. Escherichia coli, MRSA, No Growth"
                     value={antibiogramForm.organism} onChange={e => setAntibiogramForm(f => ({ ...f, organism: e.target.value }))} />
+                  {(inferredMicroFlags.mrsa || inferredMicroFlags.esbl || inferredMicroFlags.carbapenem_r) && (
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
+                      {inferredMicroFlags.mrsa && <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D', border: '1px solid #F09595' }}>MRSA keyword detected</span>}
+                      {inferredMicroFlags.esbl && <span style={{ ...s.pill, background: '#FFF3DC', color: '#C07000', border: '1px solid #FAC775' }}>ESBL keyword detected</span>}
+                      {inferredMicroFlags.carbapenem_r && <span style={{ ...s.pill, background: '#FEE2E2', color: '#991B1B', border: '1px solid #FCA5A5' }}>CRE keyword detected</span>}
+                    </div>
+                  )}
                 </div>
                 <div style={s.formGroup}>
                   <label style={s.label}>Sample Type</label>
@@ -1289,6 +2010,87 @@ export default function Laboratory() {
                   </label>
                 ))}
               </div>
+
+              <div style={{ marginBottom: 16 }}>
+                <div style={s.sectionLabel}>Sensitivity Pattern</div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 12, alignItems: 'center' }}>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ ...s.pill, background: '#E1F5EE', color: '#0F6E56', border: '1px solid #9FE1CB' }}>{antibiogramProfileSummary.sensitive} Sensitive</span>
+                    <span style={{ ...s.pill, background: '#FFF3DC', color: '#C07000', border: '1px solid #FAC775' }}>{antibiogramProfileSummary.intermediate} Intermediate</span>
+                    <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D', border: '1px solid #F09595' }}>{antibiogramProfileSummary.resistant} Resistant</span>
+                    <span style={{ ...s.pill, background: '#F3F4F6', color: '#555', border: '1px solid #D1D5DB' }}>{antibiogramProfileSummary.testedCount} Tested</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button type="button" style={s.microQuickBtn} onClick={() => setEntireSusceptibilityProfile('S')}>Mark all S</button>
+                    <button type="button" style={s.microQuickBtn} onClick={() => setEntireSusceptibilityProfile('')}>Clear grid</button>
+                    <button
+                      type="button"
+                      style={{ ...s.microQuickBtn, background: '#FFF7ED', borderColor: '#FCD34D', color: '#92400E' }}
+                      onClick={() => {
+                        setEntireSusceptibilityProfile('')
+                        setAntibiogramForm(prev => ({
+                          ...prev,
+                          growth: 'No Growth',
+                          interpretation: 'No growth — culture negative',
+                        }))
+                      }}
+                    >
+                      No growth template
+                    </button>
+                  </div>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 10 }}>
+                  {MICRO_ANTIBIOTIC_OPTIONS.map(drug => (
+                    <div key={drug} style={{ border: '1px solid #E5E7EB', borderRadius: 10, padding: 10 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: '#1F2937', marginBottom: 8 }}>{drug}</div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 6 }}>
+                        {[
+                          ['', 'NT', '#F3F4F6', '#555'],
+                          ['S', 'S', '#E1F5EE', '#0F6E56'],
+                          ['I', 'I', '#FFF3DC', '#C07000'],
+                          ['R', 'R', '#FCEBEB', '#A32D2D'],
+                        ].map(([value, label, bg, color]) => {
+                          const active = (antibiogramForm.susceptibility_profile?.[drug] || '') === value
+                          return (
+                            <button
+                              key={label}
+                              type="button"
+                              onClick={() => setAntibiogramForm(prev => ({
+                                ...prev,
+                                susceptibility_profile: {
+                                  ...(prev.susceptibility_profile || {}),
+                                  [drug]: value,
+                                },
+                              }))}
+                              style={{
+                                border: `1px solid ${active ? color : '#D1D5DB'}`,
+                                background: active ? bg : '#fff',
+                                color: active ? color : '#6B7280',
+                                borderRadius: 8,
+                                padding: '8px 0',
+                                fontSize: 11,
+                                fontWeight: 700,
+                                cursor: 'pointer',
+                              }}
+                            >
+                              {label}
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ background: '#EFF6FF', border: '1px solid #BFDBFE', borderRadius: 10, padding: '10px 14px', fontSize: 12, color: '#1D4ED8', marginBottom: 16 }}>
+                <strong>Empiric recommendation:</strong> {getMicroEmpiricRecommendation(antibiogramForm.organism, antibiogramForm.susceptibility_profile)}
+              </div>
+              {antibiogramProfileSummary.resistantDrugs.length > 0 && (
+                <div style={{ background: '#FFF7ED', border: '1px solid #FCD34D', borderRadius: 10, padding: '10px 14px', fontSize: 12, color: '#92400E', marginBottom: 16 }}>
+                  <strong>Top resistant drugs:</strong> {antibiogramProfileSummary.resistantDrugs.join(', ')}
+                </div>
+              )}
 
               <div style={s.formGroup}>
                 <label style={s.label}>Result Summary / Clinical Notes</label>
@@ -1374,6 +2176,226 @@ export default function Laboratory() {
             <div style={s.modalFooter}>
               <button style={s.cancelBtn} onClick={() => setShowAssignModal(false)}>Cancel</button>
               <button style={{ ...s.submitBtn, background: '#7B5EA7' }} onClick={handleAssignTechnician} disabled={saving}>{saving ? 'Saving...' : '✅ Assign & Process'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showReferralModal && (
+        <div style={s.overlay} onClick={() => !saving && setShowReferralModal(false)}>
+          <div style={{ ...s.modal, maxWidth: 620 }} onClick={e => e.stopPropagation()}>
+            <div style={s.modalHeader}>
+              <div>
+                <h2 style={s.modalTitle}>External Lab Referral</h2>
+                <div style={{ fontSize: 13, color: '#888', marginTop: 2 }}>Send an ordered sample out or create a standalone referral.</div>
+              </div>
+              <button style={s.closeBtn} onClick={() => !saving && setShowReferralModal(false)}>×</button>
+            </div>
+            <div style={s.modalBody}>
+              <div style={s.sectionLabel}>Referral Source</div>
+              <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                {[
+                  { key: 'linked', label: 'Link Existing Test' },
+                  { key: 'standalone', label: 'Standalone Referral' },
+                ].map(option => (
+                  <button
+                    key={option.key}
+                    style={{
+                      ...s.actionBtn,
+                      flex: 1,
+                      padding: '10px 12px',
+                      background: referralForm.linked_mode === option.key ? '#0F6E56' : '#fff',
+                      color: referralForm.linked_mode === option.key ? '#fff' : '#0F6E56',
+                      border: '1px solid #0F6E56',
+                    }}
+                    onClick={() => setReferralForm(prev => ({ ...prev, linked_mode: option.key, lab_test_id: '', standalone_patient_id: '', standalone_test_name: '' }))}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+
+              {referralForm.linked_mode === 'linked' ? (
+                <>
+                  <div style={s.formGroup}>
+                    <label style={s.label}>Search Pending Test</label>
+                    <input
+                      style={s.input}
+                      placeholder="Type patient name or test name..."
+                      value={referralTestSearch}
+                      onChange={e => setReferralTestSearch(e.target.value)}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14, maxHeight: 190, overflowY: 'auto' }}>
+                    {filteredReferralTests.map(test => (
+                      <div
+                        key={test.id}
+                        style={{
+                          padding: '10px 12px',
+                          borderRadius: 10,
+                          border: `1px solid ${referralForm.lab_test_id === test.id ? '#0F6E56' : '#E6ECE8'}`,
+                          background: referralForm.lab_test_id === test.id ? '#F3FBF8' : '#fff',
+                          cursor: 'pointer',
+                        }}
+                        onClick={() => setReferralForm(prev => ({
+                          ...prev,
+                          lab_test_id: test.id,
+                          standalone_patient_id: '',
+                          standalone_test_name: '',
+                          sample_type: prev.sample_type || 'Blood',
+                        }))}
+                      >
+                        <div style={{ fontWeight: 700, color: '#111' }}>{test.patient_name}</div>
+                        <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>{test.test_name || test.test_type} • {test.sample_barcode || 'No barcode yet'}</div>
+                      </div>
+                    ))}
+                    {filteredReferralTests.length === 0 && (
+                      <div style={{ background: '#FAFBFD', border: '1px dashed #D7E5DE', borderRadius: 10, padding: 12, fontSize: 12, color: '#777' }}>No pending in-house test matches that search.</div>
+                    )}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={s.formGroup}>
+                    <label style={s.label}>Search Patient</label>
+                    <input
+                      style={s.input}
+                      placeholder="Type patient name or number..."
+                      value={referralPatientSearch}
+                      onChange={e => setReferralPatientSearch(e.target.value)}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 14, maxHeight: 160, overflowY: 'auto' }}>
+                    {filteredReferralPatients.map(patient => (
+                      <div
+                        key={patient.id}
+                        style={{
+                          padding: '10px 12px',
+                          borderRadius: 10,
+                          border: `1px solid ${referralForm.standalone_patient_id === patient.id ? '#0F6E56' : '#E6ECE8'}`,
+                          background: referralForm.standalone_patient_id === patient.id ? '#F3FBF8' : '#fff',
+                          cursor: 'pointer',
+                        }}
+                        onClick={() => setReferralForm(prev => ({ ...prev, standalone_patient_id: patient.id, lab_test_id: '' }))}
+                      >
+                        <div style={{ fontWeight: 700, color: '#111' }}>{patient.full_name}</div>
+                        <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>{getPatientNumber(patient)} • {patient.gender || '-'} {patient.age ? `• ${patient.age}y` : ''}</div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={s.formGroup}>
+                    <label style={s.label}>Standalone Test Name</label>
+                    <input
+                      style={s.input}
+                      placeholder="e.g. Histopathology review, specialized PCR"
+                      value={referralForm.standalone_test_name}
+                      onChange={e => setReferralForm(prev => ({ ...prev, standalone_test_name: e.target.value }))}
+                    />
+                  </div>
+                </>
+              )}
+
+              <div style={s.formGrid2}>
+                <div style={s.formGroup}>
+                  <label style={s.label}>Referred To</label>
+                  <input
+                    style={s.input}
+                    list="lab-referral-labs"
+                    value={referralForm.referred_to}
+                    onChange={e => setReferralForm(prev => ({ ...prev, referred_to: e.target.value }))}
+                  />
+                  <datalist id="lab-referral-labs">
+                    {REFERRAL_LABS.map(lab => <option key={lab} value={lab} />)}
+                  </datalist>
+                </div>
+                <div style={s.formGroup}>
+                  <label style={s.label}>Sample Type</label>
+                  <select style={s.input} value={referralForm.sample_type} onChange={e => setReferralForm(prev => ({ ...prev, sample_type: e.target.value }))}>
+                    {REFERRAL_SAMPLE_TYPES.map(type => <option key={type}>{type}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              <div style={s.formGrid2}>
+                <div style={s.formGroup}>
+                  <label style={s.label}>Date Sent</label>
+                  <input style={s.input} type="date" value={referralForm.date_sent} onChange={e => setReferralForm(prev => ({ ...prev, date_sent: e.target.value }))} />
+                </div>
+                <div style={s.formGroup}>
+                  <label style={s.label}>Transport Method</label>
+                  <select style={s.input} value={referralForm.transport_method} onChange={e => setReferralForm(prev => ({ ...prev, transport_method: e.target.value }))}>
+                    {REFERRAL_TRANSPORT_METHODS.map(method => <option key={method}>{method}</option>)}
+                  </select>
+                </div>
+              </div>
+
+              <div style={s.formGrid2}>
+                <div style={s.formGroup}>
+                  <label style={s.label}>Expected TAT (days)</label>
+                  <input style={s.input} type="number" min="0" value={referralForm.expected_tat_days} onChange={e => setReferralForm(prev => ({ ...prev, expected_tat_days: e.target.value }))} />
+                </div>
+                <div style={s.formGroup}>
+                  <label style={s.label}>Referral Cost (KES)</label>
+                  <input style={s.input} type="number" min="0" value={referralForm.referral_cost} onChange={e => setReferralForm(prev => ({ ...prev, referral_cost: e.target.value }))} />
+                </div>
+              </div>
+
+              <div style={s.formGroup}>
+                <label style={s.label}>Special Instructions</label>
+                <textarea
+                  style={{ ...s.input, minHeight: 84, resize: 'vertical' }}
+                  placeholder="Sample handling notes, packaging requirements, contact person..."
+                  value={referralForm.special_instructions}
+                  onChange={e => setReferralForm(prev => ({ ...prev, special_instructions: e.target.value }))}
+                />
+              </div>
+            </div>
+            <div style={s.modalFooter}>
+              <button style={s.cancelBtn} onClick={() => !saving && setShowReferralModal(false)}>Cancel</button>
+              <button style={{ ...s.submitBtn, background: '#B45309' }} onClick={handleSaveReferral} disabled={saving}>
+                {saving ? 'Saving...' : 'Save Referral'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showReferralResultModal && selectedReferral && (
+        <div style={s.overlay} onClick={() => !saving && setShowReferralResultModal(false)}>
+          <div style={{ ...s.modal, maxWidth: 560 }} onClick={e => e.stopPropagation()}>
+            <div style={s.modalHeader}>
+              <div>
+                <h2 style={s.modalTitle}>Record External Result</h2>
+                <div style={{ fontSize: 13, color: '#888', marginTop: 2 }}>{extractStandaloneReferralTestName(selectedReferral)} — {selectedReferral.patients?.full_name || selectedReferral.lab_tests?.patient_name || 'Unknown patient'}</div>
+              </div>
+              <button style={s.closeBtn} onClick={() => !saving && setShowReferralResultModal(false)}>×</button>
+            </div>
+            <div style={s.modalBody}>
+              <div style={s.formGroup}>
+                <label style={s.label}>Result Text</label>
+                <textarea
+                  style={{ ...s.input, minHeight: 110, resize: 'vertical' }}
+                  placeholder="Enter the full result returned by the external laboratory..."
+                  value={referralResultForm.result_text}
+                  onChange={e => setReferralResultForm(prev => ({ ...prev, result_text: e.target.value }))}
+                />
+              </div>
+              <div style={s.formGrid2}>
+                <div style={s.formGroup}>
+                  <label style={s.label}>Result Date</label>
+                  <input style={s.input} type="date" value={referralResultForm.result_date} onChange={e => setReferralResultForm(prev => ({ ...prev, result_date: e.target.value }))} />
+                </div>
+                <div style={s.formGroup}>
+                  <label style={s.label}>External Reference</label>
+                  <input style={s.input} placeholder="Reference / accession number" value={referralResultForm.external_reference} onChange={e => setReferralResultForm(prev => ({ ...prev, external_reference: e.target.value }))} />
+                </div>
+              </div>
+            </div>
+            <div style={s.modalFooter}>
+              <button style={s.cancelBtn} onClick={() => !saving && setShowReferralResultModal(false)}>Cancel</button>
+              <button style={{ ...s.submitBtn, background: '#1a6fb5' }} onClick={handleSaveReferralResult} disabled={saving}>
+                {saving ? 'Saving...' : 'Save Result'}
+              </button>
             </div>
           </div>
         </div>
@@ -1469,6 +2491,42 @@ export default function Laboratory() {
               <button style={s.closeBtn} onClick={() => setShowResultModal(false)}>✕</button>
             </div>
             <div style={s.modalBody}>
+              {activeResultTemplate && (
+                <div style={{ marginBottom: 16 }}>
+                  <div style={s.sectionLabel}>{activeResultTemplate.label} Structured Entry</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: 12 }}>
+                    {activeResultTemplate.fields.map(field => {
+                      const evaluation = evaluateStructuredValue(field, resultForm.structured_values?.[field.key])
+                      const isAlert = evaluation.status === 'low' || evaluation.status === 'high'
+                      return (
+                        <div key={field.key} style={{ border: `1px solid ${evaluation.critical ? '#F09595' : isAlert ? '#FCD34D' : '#E5E7EB'}`, borderRadius: 10, padding: 12, background: evaluation.critical ? '#FFF5F5' : isAlert ? '#FFF9ED' : '#fff' }}>
+                          <label style={{ ...s.label, marginBottom: 8 }}>{field.label}{field.unit ? ` (${field.unit})` : ''}</label>
+                          <input
+                            style={s.input}
+                            readOnly={field.readOnly}
+                            value={resultForm.structured_values?.[field.key] || ''}
+                            onChange={e => setResultForm(prev => {
+                              const nextValues = { ...(prev.structured_values || {}), [field.key]: e.target.value }
+                              if (activeResultTemplate.key === 'rfts') {
+                                nextValues.egfr = calculateEgfr(nextValues, patientsById[selected?.patient_id] || patients.find(patient => patient.full_name === selected?.patient_name) || null)
+                              }
+                              return { ...prev, structured_values: nextValues }
+                            })}
+                          />
+                          <div style={{ fontSize: 11, color: '#6B7280', marginTop: 6 }}>Ref: {field.reference || 'Use lab standard range'}</div>
+                          {isAlert && <div style={{ fontSize: 11, color: evaluation.critical ? '#A32D2D' : '#C07000', marginTop: 6, fontWeight: 700 }}>{evaluation.status === 'low' ? 'Below range' : 'Above range'}</div>}
+                        </div>
+                      )
+                    })}
+                  </div>
+                </div>
+              )}
+              {activeStructuredAlerts.length > 0 && (
+                <div style={{ background: '#FCEBEB', border: '1px solid #F09595', borderRadius: 10, padding: '10px 14px', color: '#A32D2D', fontSize: 12, fontWeight: 700, marginBottom: 14 }}>
+                  ⚠️ Critical value — notify clinician before saving
+                  <div style={{ fontWeight: 500, marginTop: 6 }}>{activeStructuredAlerts.join(' ')}</div>
+                </div>
+              )}
               <div style={s.formGroup}>
                 <label style={s.label}>Result Text / Full Report</label>
                 <textarea style={{ ...s.input, height: 100, resize: 'vertical' }} placeholder="Enter full result report, findings, or detailed text..." value={resultForm.result_text} onChange={e => setResultForm(f => ({ ...f, result_text: e.target.value }))} />
@@ -1541,7 +2599,20 @@ const s = {
   chip: { fontSize: 11, padding: '5px 12px', borderRadius: 99, border: '1px solid #e0e0e0', background: '#fff', cursor: 'pointer', fontWeight: 500, color: '#555' },
   chipActive: { background: '#0F6E56', color: '#fff', border: '1px solid #0F6E56' },
   actionBtn: { fontSize: 12, padding: '6px 12px', borderRadius: 6, cursor: 'pointer', fontWeight: 600, whiteSpace: 'nowrap', border: 'none' },
+  btnPri: { background: '#0F6E56', color: '#fff' },
+  btnGhost: { background: '#F3F4F6', color: '#9CA3AF', border: '1px solid #E5E7EB' },
   empty: { textAlign: 'center', padding: '80px 20px', color: '#999' },
+  metricCard: { background: '#fff', border: '1px solid #E5E7EB', borderRadius: 14, padding: 16, boxShadow: '0 2px 10px rgba(15,110,86,0.04)' },
+  metricLabel: { fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.7px', color: '#6B7280' },
+  metricValue: { fontSize: 28, fontWeight: 800, color: '#111827', marginTop: 8 },
+  metricSub: { fontSize: 12, color: '#6B7280', marginTop: 6 },
+  dashboardCard: { background: '#fff', border: '1px solid #E5E7EB', borderRadius: 16, padding: 18, boxShadow: '0 2px 10px rgba(15,110,86,0.04)' },
+  dashboardCardTitle: { fontSize: 14, fontWeight: 800, color: '#111827', marginBottom: 14 },
+  listButton: { width: '100%', border: '1px solid #E5E7EB', borderRadius: 10, background: '#fff', padding: '10px 12px', display: 'flex', alignItems: 'center', cursor: 'pointer', textAlign: 'left' },
+  microCard: { background: '#F8FAFC', border: '1px solid #E2E8F0', borderRadius: 12, padding: 12 },
+  microCardLabel: { fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.6px', color: '#64748B' },
+  microCardValue: { fontSize: 13, fontWeight: 700, color: '#111827', marginTop: 6 },
+  microQuickBtn: { border: '1px solid #D1D5DB', background: '#fff', color: '#374151', borderRadius: 8, padding: '8px 10px', fontSize: 11, fontWeight: 700, cursor: 'pointer' },
   overlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 20 },
   modal: { background: '#fff', borderRadius: 16, width: '100%', maxWidth: 700, maxHeight: '90vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,0.2)', animation: 'fadeIn 0.2s ease' },
   modalHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', padding: '18px 24px', borderBottom: '1px solid #f0f0f0' },
@@ -1556,3 +2627,4 @@ const s = {
   cancelBtn: { padding: '10px 20px', border: '1px solid #ddd', borderRadius: 8, background: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#555' },
   submitBtn: { padding: '10px 24px', border: 'none', borderRadius: 8, background: '#0F6E56', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
 }
+

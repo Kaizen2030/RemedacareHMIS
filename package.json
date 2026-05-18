@@ -2,23 +2,34 @@
   "name": "remedacare-os",
   "private": true,
   "version": "1.0.1",
-  "description": "RemedacareOS Hospital Management System",
-  "author": "RemedacareOS",
+  "description": "RemedacareHMIS Hospital Management System",
+  "author": "RemedacareHMIS",
   "main": "electron/main.js",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "test": "vitest run",
+    "test:smoke": "vitest run src/app.smoke.test.jsx",
     "test:watch": "vitest",
     "preview": "vite preview",
     "electron:dev": "node electron/start-dev.js",
     "electron:build": "vite build && electron-builder",
-    "test:e2e": "npx playwright test",
-    "test:e2e:ui": "npx playwright test --ui"
+    "test:e2e": "playwright test",
+    "test:e2e:live": "npx playwright test e2e/live-app.spec.js",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:headed": "playwright test --headed"
   },
   "build": {
-    "appId": "com.remedacareos.app",
-    "productName": "RemedacareOS",
+    "appId": "com.remedacarehmis.app",
+    "productName": "RemedacareHMIS",
+    "protocols": [
+      {
+        "name": "RemedaCare",
+        "schemes": [
+          "remedacare"
+        ]
+      }
+    ],
     "directories": {
       "output": "dist-electron"
     },
@@ -43,7 +54,7 @@
       "license": "license.txt",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "RemedacareOS",
+      "shortcutName": "RemedacareHMIS",
       "runAfterFinish": true,
       "perMachine": false,
       "deleteAppDataOnUninstall": false
@@ -53,21 +64,25 @@
     "@google/generative-ai": "^0.2.1",
     "@supabase/supabase-js": "^2.39.0",
     "pdfjs-dist": "^3.11.122",
+    "qrcode.react": "^4.2.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.30.1",
+    "recharts": "^3.8.1",
     "tesseract.js": "^7.0.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@playwright/test": "^1.60.0",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.3.0",
-    "@playwright/test": "^1.44.0",
+    "@types/react": "^18.3.12",
     "@vitejs/plugin-react": "^4.0.3",
     "concurrently": "^8.2.0",
     "electron": "^28.3.3",
     "electron-builder": "^24.13.3",
     "jsdom": "^26.1.0",
+    "typescript": "^5.6.3",
     "vite": "^4.4.5",
     "vitest": "^3.2.1",
     "wait-on": "^9.0.5"
