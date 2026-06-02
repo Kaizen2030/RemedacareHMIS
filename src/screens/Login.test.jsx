@@ -41,6 +41,7 @@ describe('Login password recovery', () => {
     signInWithPassword.mockReset()
     resetPasswordForEmail.mockReset()
     signUp.mockReset()
+    window.localStorage.removeItem('remedacare:auth:pending_signup_email')
     signInWithPassword.mockResolvedValue({
       data: { user: { id: 'user-1', email: 'admin@hospital.co.ke' } },
       error: null,
@@ -139,7 +140,7 @@ describe('Login password recovery', () => {
 
     fireEvent.click(screen.getByText('Create one'))
     fireEvent.change(screen.getByPlaceholderText('My Hospital'), {
-      target: { value: 'Brightpath General' },
+      target: { value: 'RemedacareHMS General' },
     })
     fireEvent.change(screen.getByPlaceholderText('Kenya'), {
       target: { value: 'Nairobi' },
@@ -153,6 +154,9 @@ describe('Login password recovery', () => {
     fireEvent.change(screen.getByPlaceholderText('At least 8 characters'), {
       target: { value: 'Secret123!' },
     })
+    fireEvent.change(screen.getByPlaceholderText('Re-enter password'), {
+      target: { value: 'Secret123!' },
+    })
     fireEvent.click(screen.getAllByText('Create Account')[1])
 
     await waitFor(() => {
@@ -164,6 +168,22 @@ describe('Login password recovery', () => {
         }),
       })
     })
+  })
+
+  it('retains the signup email after a confirmation link opens the login screen', async () => {
+    window.localStorage.setItem('remedacare:auth:pending_signup_email', 'admin@hospital.co.ke')
+
+    render(
+      <Login
+        onLogin={vi.fn()}
+        isPasswordRecovery={false}
+        activationMessage="Email confirmed. Your email address is ready. Enter your password to sign in."
+        onResetDone={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByDisplayValue('admin@hospital.co.ke')).toBeInTheDocument()
+    expect(screen.getByText('Email confirmed. Your email address is ready. Enter your password to sign in.')).toBeInTheDocument()
   })
 })
 

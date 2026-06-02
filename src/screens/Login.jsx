@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import supabase from '../supabase'
 import { sendPatientNotification } from '../utils/notifications'
 import { getAuthConfirmRedirectUrl, getAuthResetRedirectUrl } from '../utils/authUrls'
-import hmsLogo from '../../icon.ico'
+import hmsLogo from '../../icon.png'
 
 const AUTH_GATE_KEY = 'remedacare:auth:gate'
 const KNOWN_USERS_KEY = 'remedacare:auth:known_users'
@@ -12,10 +12,10 @@ const REMEMBER_PREF_KEY = 'remedacare:auth:remember_device'
 const LOGIN_ATTEMPTS_KEY = 'remedacare:auth:login_attempts'
 const BRANDING_CACHE_KEY = 'remedacare:auth:branding'
 const DEFAULT_BRANDING = {
-  hospitalName: 'Brightpath Travel Scholars',
+  hospitalName: 'RemedacareHMS',
   logoBase64: hmsLogo,
   level: 'Kenya',
-  primaryColor: '#5B21B6',
+  primaryColor: '#0F6E56',
 }
 const MFA_WINDOW_MS = 5 * 60 * 1000
 const DEVICE_TRUST_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
@@ -23,6 +23,7 @@ const LOGIN_LOCK_WINDOW_MS = 15 * 60 * 1000
 const MAX_LOGIN_ATTEMPTS = 5
 const PASSWORD_RESET_REDIRECT_URL = getAuthResetRedirectUrl()
 const ACCOUNT_CONFIRM_REDIRECT_URL = getAuthConfirmRedirectUrl()
+const PENDING_SIGNUP_EMAIL_KEY = 'remedacare:auth:pending_signup_email'
 
 function isRlsError(error) {
   const message = error?.message?.toLowerCase() || ''
@@ -208,6 +209,21 @@ function maskPhone(phone = '') {
   return `${clean.slice(0, 4)}***${clean.slice(-2)}`
 }
 
+function readPendingSignupEmail() {
+  if (typeof window === 'undefined') return ''
+  return String(window.localStorage.getItem(PENDING_SIGNUP_EMAIL_KEY) || '')
+}
+
+function writePendingSignupEmail(email) {
+  if (typeof window === 'undefined') return
+  const cleanEmail = String(email || '').trim()
+  if (!cleanEmail) {
+    window.localStorage.removeItem(PENDING_SIGNUP_EMAIL_KEY)
+    return
+  }
+  window.localStorage.setItem(PENDING_SIGNUP_EMAIL_KEY, cleanEmail)
+}
+
 function getErrorMessage(err) {
   if (!err) return ''
   if (typeof err === 'string') return err
@@ -297,7 +313,7 @@ function getPasswordStrength(password = '') {
   if (!password) return { label: 'Enter a password', color: '#9CA3AF', score: 0 }
   if (score <= 2) return { label: 'Weak', color: '#DC2626', score }
   if (score === 3) return { label: 'Fair', color: '#D97706', score }
-  if (score === 4) return { label: 'Strong', color: '#5B21B6', score }
+  if (score === 4) return { label: 'Strong', color: '#0F6E56', score }
   return { label: 'Very strong', color: '#0B5F4B', score }
 }
 
@@ -480,11 +496,14 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
   const [newHospitalName, setNewHospitalName] = useState('')
   const [newHospitalLocation, setNewHospitalLocation] = useState('Kenya')
   const [showPassword, setShowPassword] = useState(false)
+  const [showSignupPassword, setShowSignupPassword] = useState(false)
+  const [showSignupConfirmPassword, setShowSignupConfirmPassword] = useState(false)
   const [showResetPassword, setShowResetPassword] = useState(false)
   const [showConfirmPassword, setShowConfirmPassword] = useState(false)
   const [resetSent, setResetSent] = useState(false)
   const [newPassword, setNewPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
+  const [signupConfirmPassword, setSignupConfirmPassword] = useState('')
   const [pendingUser, setPendingUser] = useState(null)
   const [showFirstNewPw, setShowFirstNewPw] = useState(false)
   const [showFirstConfirmPw, setShowFirstConfirmPw] = useState(false)
@@ -512,7 +531,14 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
   useEffect(() => {
     setActivationMessage(activationNotice || '')
     if (activationNotice) {
+      const pendingEmail = readPendingSignupEmail()
+      if (pendingEmail) {
+        setEmail(pendingEmail)
+      }
       setMode((current) => (current === 'reset' ? current : 'login'))
+      setShowPassword(false)
+      setShowSignupPassword(false)
+      setShowSignupConfirmPassword(false)
     }
   }, [activationNotice])
 
@@ -599,7 +625,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
           if (isActivationLink(urlObj)) {
             setMode('login')
             setError('')
-            setActivationMessage('Your account has been activated. Sign in to open your Brightpath workspace.')
+            setActivationMessage('Your account has been activated. Sign in to open your RemedacareHMS workspace.')
           }
         })
       }
@@ -611,7 +637,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
       } else if (isActivationLink(urlObj)) {
         setMode('login')
         setError('')
-        setActivationMessage('Your account has been activated. Sign in to open your Brightpath workspace.')
+        setActivationMessage('Your account has been activated. Sign in to open your RemedacareHMS workspace.')
       }
       return undefined
     }
@@ -721,6 +747,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
     clearFailedAttempts(profile?.email || authUser?.email)
     rememberKnownUser(profile?.email || authUser?.email, profile?.branding)
     writeBrandingCache(profile?.branding)
+    writePendingSignupEmail('')
     if (typeof window !== 'undefined') {
       window.localStorage.setItem(REMEMBER_PREF_KEY, rememberPreference ? 'true' : 'false')
       if (rememberPreference) {
@@ -1006,8 +1033,9 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
   }
 
   async function handleSignup() {
-    if (!email || !password || !name || !newHospitalName) return setError('All fields are required')
+    if (!email || !password || !signupConfirmPassword || !name || !newHospitalName) return setError('All fields are required')
     if (password.length < 8) return setError('Password must be at least 8 characters')
+    if (password !== signupConfirmPassword) return setError('Passwords do not match')
     setLoading(true)
     setError('')
 
@@ -1027,20 +1055,22 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
 
       if (err) throw err
 
+      writePendingSignupEmail(email)
       window.notifyFromLegacyAlert('Account created. Check your Pharmcourse email to activate the app, then sign in.')
       setMode('login')
-      setName('')
-      setEmail('')
       setPassword('')
+      setSignupConfirmPassword('')
       setNewHospitalName('')
       setNewHospitalLocation('Kenya')
+      setShowSignupPassword(false)
+      setShowSignupConfirmPassword(false)
     } catch (e) {
       setError(getAuthEmailErrorMessage(e, 'signup confirmation'))
     }
     setLoading(false)
   }
 
-  const brandAccent = displayBranding.primaryColor || '#5B21B6'
+  const brandAccent = displayBranding.primaryColor || '#0F6E56'
   const strengthForDisplay = mode === 'signup' ? getPasswordStrength(password) : getPasswordStrength(newPassword)
   const lockExpiresAt = getActiveLock(email)
 
@@ -1055,7 +1085,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
             <div style={{ ...st.logoIcon, color: brandAccent }}>Hospital</div>
           )}
           <div style={st.hospitalBadge}>Kenya {displayBranding.level || 'Level Facility'}</div>
-          <h1 style={{ ...st.logoText, color: brandAccent }}>{displayBranding.hospitalName || 'Brightpath Travel Scholars'}</h1>
+          <h1 style={{ ...st.logoText, color: brandAccent }}>{displayBranding.hospitalName || 'RemedacareHMS'}</h1>
           <p style={st.logoSub}>Secure clinical sign-in and hospital workspace access</p>
         </div>
 
@@ -1067,13 +1097,26 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
           <div style={st.tabs}>
             <button
               style={{ ...st.tab, ...(mode === 'login' ? st.tabActive(brandAccent) : {}) }}
-              onClick={() => { setMode('login'); setError('') }}
+              onClick={() => {
+                setMode('login')
+                setError('')
+                setShowPassword(false)
+                setShowSignupPassword(false)
+                setShowSignupConfirmPassword(false)
+                setSignupConfirmPassword('')
+              }}
             >
               Sign In
             </button>
             <button
               style={{ ...st.tab, ...(mode === 'signup' ? st.tabActive(brandAccent) : {}) }}
-              onClick={() => { setMode('signup'); setError('') }}
+              onClick={() => {
+                setMode('signup')
+                setError('')
+                setShowPassword(false)
+                setShowSignupPassword(false)
+                setShowSignupConfirmPassword(false)
+              }}
             >
               Create Account
             </button>
@@ -1091,7 +1134,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
               <label style={st.label}>New Password</label>
               <div style={{ position: 'relative' }}>
                 <input
-                  style={st.input}
+                  style={{ ...st.input, paddingRight: '72px' }}
                   type={showFirstNewPw ? 'text' : 'password'}
                   placeholder="At least 8 characters"
                   value={newPassword}
@@ -1111,7 +1154,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
               <label style={st.label}>Confirm Password</label>
               <div style={{ position: 'relative' }}>
                 <input
-                  style={st.input}
+                  style={{ ...st.input, paddingRight: '72px' }}
                   type={showFirstConfirmPw ? 'text' : 'password'}
                   placeholder="Re-enter password"
                   value={confirmPassword}
@@ -1186,7 +1229,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
               <label style={st.label}>New Password</label>
               <div style={{ position: 'relative' }}>
                 <input
-                  style={st.input}
+                  style={{ ...st.input, paddingRight: '72px' }}
                   type={showResetPassword ? 'text' : 'password'}
                   placeholder="At least 8 characters"
                   value={newPassword}
@@ -1206,7 +1249,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
               <label style={st.label}>Confirm Password</label>
               <div style={{ position: 'relative' }}>
                 <input
-                  style={st.input}
+                  style={{ ...st.input, paddingRight: '72px' }}
                   type={showConfirmPassword ? 'text' : 'password'}
                   placeholder="Re-enter password"
                   value={confirmPassword}
@@ -1296,7 +1339,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
               <label style={st.label}>Password</label>
               <div style={{ position: 'relative' }}>
                 <input
-                  style={st.input}
+                  style={{ ...st.input, paddingRight: '72px' }}
                   type={showPassword ? 'text' : 'password'}
                   placeholder="Enter password"
                   value={password}
@@ -1315,9 +1358,20 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
             <button style={{ ...st.btnPrimary, background: brandAccent }} onClick={handleLogin} disabled={loading}>
               {loading ? 'Signing in...' : 'Sign In'}
             </button>
-            <p style={st.footerNote}>
+              <p style={st.footerNote}>
               Don't have an account?{' '}
-              <span style={{ ...st.link, color: brandAccent }} onClick={() => { setMode('signup'); setError('') }}>Create one</span>
+              <span
+                style={{ ...st.link, color: brandAccent }}
+                onClick={() => {
+                  setMode('signup')
+                  setError('')
+                  setShowPassword(false)
+                  setShowSignupPassword(false)
+                  setShowSignupConfirmPassword(false)
+                }}
+              >
+                Create one
+              </span>
             </p>
           </>
         )}
@@ -1365,14 +1419,29 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
               <label style={st.label}>Password</label>
               <div style={{ position: 'relative' }}>
                 <input
-                  style={st.input}
-                  type={showPassword ? 'text' : 'password'}
+                  style={{ ...st.input, paddingRight: '72px' }}
+                  type={showSignupPassword ? 'text' : 'password'}
                   placeholder="At least 8 characters"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                 />
-                <button type="button" onClick={() => setShowPassword((v) => !v)} style={st.eyeBtn}>
-                  {showPassword ? 'Hide' : 'Show'}
+                <button type="button" onClick={() => setShowSignupPassword((v) => !v)} style={st.eyeBtn}>
+                  {showSignupPassword ? 'Hide' : 'Show'}
+                </button>
+              </div>
+            </div>
+            <div style={st.formGroup}>
+              <label style={st.label}>Confirm Password</label>
+              <div style={{ position: 'relative' }}>
+                <input
+                  style={{ ...st.input, paddingRight: '72px' }}
+                  type={showSignupConfirmPassword ? 'text' : 'password'}
+                  placeholder="Re-enter password"
+                  value={signupConfirmPassword}
+                  onChange={(e) => setSignupConfirmPassword(e.target.value)}
+                />
+                <button type="button" onClick={() => setShowSignupConfirmPassword((v) => !v)} style={st.eyeBtn}>
+                  {showSignupConfirmPassword ? 'Hide' : 'Show'}
                 </button>
               </div>
             </div>
@@ -1385,12 +1454,24 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
             </button>
             <p style={st.footerNote}>
               Already have an account?{' '}
-              <span style={{ ...st.link, color: brandAccent }} onClick={() => { setMode('login'); setError('') }}>Sign in</span>
+              <span
+                style={{ ...st.link, color: brandAccent }}
+                onClick={() => {
+                  setMode('login')
+                  setError('')
+                  setShowPassword(false)
+                  setShowSignupPassword(false)
+                  setShowSignupConfirmPassword(false)
+                  setSignupConfirmPassword('')
+                }}
+              >
+                Sign in
+              </span>
             </p>
           </>
         )}
 
-        <p style={st.version}>Brightpath Travel Scholars v1.0.2 - Secure Hospital Management</p>
+        <p style={st.version}>RemedacareHMS v1.0.0 - Secure Hospital Management</p>
       </div>
     </div>
   )
@@ -1447,7 +1528,7 @@ const st = {
   hospitalBadge: {
     display: 'inline-block',
     background: '#F5F3FF',
-    color: '#5B21B6',
+    color: '#0F6E56',
     padding: '6px 10px',
     borderRadius: 999,
     fontSize: 11,
@@ -1485,7 +1566,7 @@ const st = {
     borderRadius: '10px',
     padding: '10px 14px',
     fontSize: '12px',
-    color: '#5B21B6',
+    color: '#0F6E56',
     marginBottom: '14px',
   },
   warningBox: {
@@ -1512,7 +1593,7 @@ const st = {
     borderRadius: '10px',
     padding: '10px 14px',
     fontSize: '13px',
-    color: '#5B21B6',
+    color: '#0F6E56',
     marginBottom: '14px',
     textAlign: 'center',
   },
@@ -1571,7 +1652,7 @@ const st = {
     transform: 'translateY(-50%)',
     border: 'none',
     background: 'none',
-    color: '#5B21B6',
+    color: '#0F6E56',
     cursor: 'pointer',
     fontSize: '12px',
     padding: '2px 4px',
@@ -1605,7 +1686,7 @@ const st = {
   linkBtn: {
     border: 'none',
     background: 'transparent',
-    color: '#5B21B6',
+    color: '#0F6E56',
     cursor: 'pointer',
     fontSize: 12,
     fontWeight: 700,
@@ -1620,14 +1701,14 @@ const st = {
   strengthBar: {
     height: 7,
     borderRadius: 999,
-    background: '#5B21B6',
+    background: '#0F6E56',
     flexBasis: '70%',
     transition: 'width 180ms ease',
   },
   strengthText: {
     fontSize: 11,
     fontWeight: 700,
-    color: '#5B21B6',
+    color: '#0F6E56',
   },
   footerNote: {
     textAlign: 'center',

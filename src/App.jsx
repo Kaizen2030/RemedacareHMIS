@@ -25,7 +25,7 @@ import { openPrintPreview, printTemplates } from './utils/printSystem'
 import { buildBilingualWhatsAppMessage, generateWhatsAppLink } from './utils/whatsapp'
 import { registerPwaServiceWorker } from './utils/pwa'
 import { applyThemeMode, colors, getStoredThemeMode, THEME_MODES, typography } from './theme'
-import hmsLogo from '../icon.ico'
+import hmsLogo from '../icon.png'
 
 const Patients = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Patients'))
 const Appointments = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Appointments'))
@@ -588,30 +588,30 @@ function AppShell() {
       }
 
       try {
-        let sessionRestored = false
+        if (isRecoveryLink) {
+          if (accessToken && refreshToken) {
+            const { error } = await supabase.auth.setSession({
+              access_token: accessToken,
+              refresh_token: refreshToken,
+            })
 
-        if (accessToken && refreshToken) {
-          const { error } = await supabase.auth.setSession({
-            access_token: accessToken,
-            refresh_token: refreshToken,
-          })
-
-          if (error) {
-            console.error('Session restore failed:', error)
+            if (error) {
+              console.error('Session restore failed:', error)
+            } else {
+              console.log('Auth session restored successfully')
+            }
+          } else if (code) {
+            const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(code)
+            if (exchangeError) {
+              console.error('Code exchange failed:', exchangeError)
+            } else {
+              console.log('Auth session restored from code successfully')
+            }
           } else {
-            console.log('Auth session restored successfully')
-            sessionRestored = true
+            console.warn('Missing auth credentials in deep link URL')
           }
-        } else if (code) {
-          const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(code)
-          if (exchangeError) {
-            console.error('Code exchange failed:', exchangeError)
-          } else {
-            console.log('Auth session restored from code successfully')
-            sessionRestored = true
-          }
-        } else {
-          console.warn('Missing auth credentials in deep link URL')
+        } else if (isActivationLink) {
+          console.log('Activation link detected; skipping session restore.')
         }
 
         if (active) {
@@ -620,16 +620,14 @@ function AppShell() {
             setDeepLinkActivation('')
           } else if (isActivationLink) {
             setDeepLinkActivation(
-              sessionRestored
-                ? 'Your account has been activated. You can sign in to open your Brightpath workspace.'
-                : 'Your account activation link opened in the app. Please sign in to continue.',
+              'Email confirmed. Your email address is ready. Enter your password to sign in.',
             )
             setDeepLinkRecovery(false)
           }
         }
       } catch (e) {
         console.error('Deep link session error:', e)
-        if (code) {
+        if (isRecoveryLink && code) {
           try {
             const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(code)
             if (exchangeError) {
@@ -644,7 +642,7 @@ function AppShell() {
             setDeepLinkRecovery(true)
             setDeepLinkActivation('')
           } else if (isActivationLink) {
-            setDeepLinkActivation('Your account activation link is open. Please sign in to continue.')
+            setDeepLinkActivation('Email confirmed. Your email address is ready. Enter your password to sign in.')
             setDeepLinkRecovery(false)
           }
         }
@@ -683,7 +681,7 @@ function AppShell() {
 
   useEffect(() => {
     if (!effectiveHospitalId) {
-      setHospitalProfile((previous) => ({ ...previous, name: effectiveHospitalName || loginBranding?.hospitalName || 'Brightpath Travel Scholars' }))
+      setHospitalProfile((previous) => ({ ...previous, name: effectiveHospitalName || loginBranding?.hospitalName || 'RemedacareHMS' }))
       return
     }
 
@@ -698,7 +696,7 @@ function AppShell() {
       if (!active) return
       const brandingConfig = data?.branding_config || {}
       setHospitalProfile({
-        name: brandingConfig?.hospital_name || effectiveHospitalName || loginBranding?.hospitalName || 'Brightpath Travel Scholars',
+        name: brandingConfig?.hospital_name || effectiveHospitalName || loginBranding?.hospitalName || 'RemedacareHMS',
         logoBase64: brandingConfig?.logo_data_url || brandingConfig?.logo_base64 || '',
         address: brandingConfig?.physical_address || '',
         phone: brandingConfig?.phone || '',
@@ -1037,7 +1035,7 @@ function AppShell() {
       <div style={styles.fullscreen}>
         <div style={{ width: '220px' }}>
           <SkeletonLoader rows={3} height={14} width={['40%', '100%', '70%']} />
-          <p style={{ color: colors.sub, fontSize: '13px' }}>Loading Brightpath Travel Scholars...</p>
+          <p style={{ color: colors.sub, fontSize: '13px' }}>Loading RemedacareHMS...</p>
         </div>
       </div>
     )
@@ -1076,7 +1074,7 @@ function AppShell() {
       <div style={styles.container}>
         <aside style={styles.sidebar}>
           <div style={styles.logoArea}>
-            <img src={hospitalProfile.logoBase64 || loginBranding?.logoBase64 || HMS_LOGO_SRC} alt="Brightpath Travel Scholars logo" style={styles.brandLogo} />
+            <img src={hospitalProfile.logoBase64 || loginBranding?.logoBase64 || HMS_LOGO_SRC} alt="RemedacareHMS logo" style={styles.brandLogo} />
             <div style={{ minWidth: 0 }}>
               <p style={styles.logoText}>REMEDACARE HMS</p>
               <p style={styles.logoSub}>{effectiveHospitalName || 'Hospital workspace'}</p>
