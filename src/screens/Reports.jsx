@@ -294,10 +294,10 @@ function openPrintWindow(title, bodyHtml) {
           .meta { font-size: 12px; color: #333; text-align: right; }
           .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
           .summary-card { border: 1px solid #D7DED9; border-radius: 8px; padding: 10px 12px; }
-          .summary-value { font-size: 17px; font-weight: 700; color: #0F6E56; }
+          .summary-value { font-size: 17px; font-weight: 700; color: #5B21B6; }
           .summary-label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.4px; margin-top: 2px; }
           .block { border: 1px solid #D7DED9; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
-          .block-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: #0F6E56; margin-bottom: 8px; }
+          .block-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: #5B21B6; margin-bottom: 8px; }
           table { width: 100%; border-collapse: collapse; font-size: 12px; }
           th, td { border: 1px solid #CFD8D3; padding: 6px 8px; text-align: left; vertical-align: top; }
           th { background: #EEF6F2; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
@@ -350,7 +350,7 @@ function buildReportHtml({ hospitalName, title, subtitle, summary = [], columns 
           </tbody>
         </table>
       </div>
-      <div class="footer">Generated from live Supabase hospital data in RemedacareHMIS.</div>
+      <div class="footer">Generated from live Supabase hospital data in Brightpath Travel Scholars.</div>
     </div>
   `
 }
@@ -1874,3 +1874,4 @@ export default function Reports() {
     </div>
   )
 }
+

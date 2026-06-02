@@ -175,7 +175,7 @@ async function notifyAppointmentBooked({ appointment, patient, hospitalId, hospi
 
     const message = buildMessage(setting.template || DEFAULT_TEMPLATES.appointment_reminder, {
       patient_name: patient.full_name || 'Patient',
-      hospital_name: hospitalName || 'RemedacareHMIS',
+      hospital_name: hospitalName || 'Brightpath Travel Scholars',
       date_time: `${formatDate(appointment.appointment_date)} ${formatTimeDisplay(appointment.start_time)}`,
     })
 
@@ -1218,3 +1218,4 @@ export default function Appointments() {
     </div>
   )
 }
+

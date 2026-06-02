@@ -1,9 +1,9 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
 
-const PROTOCOL = 'remedacare';
+const PROTOCOL = 'remedacarehms';
 const DEFAULT_ZOOM_FACTOR = 1;
 const MIN_ZOOM_FACTOR = 0.75;
 const MAX_ZOOM_FACTOR = 1.5;
@@ -208,9 +208,9 @@ function createWindow() {
     height: 800,
     minWidth: 1100,
     minHeight: 650,
-    title: 'RemedacareHMIS',
+    title: 'Brightpath Travel Scholars',
     icon: path.join(__dirname, '..', 'icon.ico'),
-    backgroundColor: '#f7f8f7',
+    backgroundColor: '#ffffff',
     show: false,
     webPreferences: {
       nodeIntegration: false,
@@ -315,6 +315,44 @@ ipcMain.handle('get-command-line', () => {
   return process.argv;
 });
 
+ipcMain.handle('save-file', async (event, payload = {}) => {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    return { canceled: true };
+  }
+
+  const defaultPath = String(payload.defaultPath || 'download.xlsx');
+  const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+    title: String(payload.title || 'Save file'),
+    defaultPath,
+    filters: Array.isArray(payload.filters) && payload.filters.length
+      ? payload.filters
+      : [{ name: 'All Files', extensions: ['*'] }],
+  });
+
+  if (canceled || !filePath) {
+    return { canceled: true };
+  }
+
+  const data = payload.data;
+  let buffer;
+  if (Buffer.isBuffer(data)) {
+    buffer = data;
+  } else if (data instanceof ArrayBuffer) {
+    buffer = Buffer.from(new Uint8Array(data));
+  } else if (ArrayBuffer.isView(data)) {
+    buffer = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  } else if (Array.isArray(data)) {
+    buffer = Buffer.from(data);
+  } else if (typeof data === 'string') {
+    buffer = Buffer.from(data, payload.encoding || 'utf8');
+  } else {
+    throw new Error('Unsupported file data type.');
+  }
+
+  fs.writeFileSync(filePath, buffer);
+  return { canceled: false, filePath };
+});
+
 ipcMain.handle('get-zoom-factor', () => getCurrentZoomFactor());
 ipcMain.handle('set-zoom-factor', (event, factor) => applyZoomFactor(factor));
 ipcMain.handle('zoom-in', () => changeZoom(ZOOM_STEP));
@@ -363,3 +401,4 @@ app.on('activate', () => {
 
 // Export for debugging
 console.log('[app] main.js loaded successfully');
+

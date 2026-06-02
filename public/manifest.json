@@ -1,11 +1,11 @@
 {
-  "name": "RemedacareHMIS",
-  "short_name": "RemedacareHMIS",
+  "name": "Brightpath Travel Scholars",
+  "short_name": "Brightpath Travel Scholars",
   "description": "Hospital management system for Kenyan healthcare operations.",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#F8FAFB",
-  "theme_color": "#0F6E56",
+  "background_color": "#FFFFFF",
+  "theme_color": "#5B21B6",
   "icons": [
     {
       "src": "/pwa-icon.svg",
@@ -21,3 +21,4 @@
     }
   ]
 }
+

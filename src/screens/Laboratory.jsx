@@ -56,7 +56,7 @@ function isCultureSensitivityTest(testType, category) {
 const STATUS_COLORS = {
   Pending: { bg: '#FFF3DC', color: '#C07000', border: '#FAC775' },
   'In Progress': { bg: '#E3F0FB', color: '#1a6fb5', border: '#90C4F0' },
-  Complete: { bg: '#E1F5EE', color: '#0F6E56', border: '#9FE1CB' },
+  Complete: { bg: '#F3E8FF', color: '#5B21B6', border: '#D8B4FE' },
   Critical: { bg: '#FCEBEB', color: '#A32D2D', border: '#F09595' },
 }
 
@@ -76,7 +76,7 @@ const SAMPLE_STATUS_COLORS = {
 
 const LAB_STAGE_PIPELINE = ['Ordered', 'Sample Collected', 'Processing', 'Results Ready', 'Reviewed']
 const AGE_BUCKET_COLORS = {
-  fresh: { bg: '#E1F5EE', color: '#0F6E56', border: '#9FE1CB' },
+  fresh: { bg: '#F3E8FF', color: '#5B21B6', border: '#D8B4FE' },
   watch: { bg: '#FFF3DC', color: '#C07000', border: '#FAC775' },
   late: { bg: '#FFF0E3', color: '#C46600', border: '#FDBA74' },
   critical: { bg: '#FCEBEB', color: '#A32D2D', border: '#F09595' },
@@ -1123,7 +1123,7 @@ export default function Laboratory() {
       <div style={{ fontFamily: 'Arial, sans-serif', padding: 32, color: '#1F2937' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, marginBottom: 24 }}>
           <div>
-            <div style={{ fontSize: 24, fontWeight: 800 }}>{hospitalName || 'RemedacareHMIS'}</div>
+            <div style={{ fontSize: 24, fontWeight: 800 }}>{hospitalName || 'Brightpath Travel Scholars'}</div>
             <div style={{ fontSize: 12, color: '#6B7280' }}>Laboratory Result Report</div>
             <div style={{ fontSize: 12, color: '#6B7280', marginTop: 6 }}>Logo / Letterhead placeholder</div>
           </div>
@@ -1365,7 +1365,7 @@ export default function Laboratory() {
 
         const message = buildMessage(labSetting.template || DEFAULT_TEMPLATES.lab_result, {
           patient_name: selected.patient_name || patientRecord?.full_name || 'Patient',
-          hospital_name: hospitalName || 'RemedacareHMIS',
+          hospital_name: hospitalName || 'Brightpath Travel Scholars',
           test_name: selected.test_type || selected.test_name || 'lab test',
         })
 
@@ -1427,7 +1427,7 @@ export default function Laboratory() {
     const statuses = [
       { name: 'Pending', value: tests.filter(test => test.status === 'Pending').length, color: '#C07000' },
       { name: 'In Progress', value: tests.filter(test => test.status === 'In Progress').length, color: '#1a6fb5' },
-      { name: 'Complete', value: tests.filter(test => test.status === 'Complete').length, color: '#0F6E56' },
+      { name: 'Complete', value: tests.filter(test => test.status === 'Complete').length, color: '#5B21B6' },
       { name: 'Critical', value: tests.filter(test => test.status === 'Critical').length, color: '#A32D2D' },
     ].filter(item => item.value > 0)
 
@@ -1553,7 +1553,7 @@ export default function Laboratory() {
   }).sort((a, b) => b.latestOrderedAt - a.latestOrderedAt), [groupedByPatient, invoices, patients, patientsById])
 
   if (loading) return (
-    <div style={s.loadWrap}><div style={s.spinner} /><p style={{ color: '#0F6E56', marginTop: 12 }}>Loading Lab...</p>
+    <div style={s.loadWrap}><div style={s.spinner} /><p style={{ color: '#5B21B6', marginTop: 12 }}>Loading Lab...</p>
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
     </div>
   )
@@ -1577,11 +1577,11 @@ export default function Laboratory() {
                 {referrals.length} total referrals &nbsp;&bull;&nbsp;
                 <span style={{ color: '#C07000', fontWeight: 600 }}>{pendingReferrals.length} pending</span> &nbsp;&bull;&nbsp;
                 <span style={{ color: '#A32D2D', fontWeight: 600 }}>{overdueReferrals.length} overdue</span> &nbsp;&bull;&nbsp;
-                <span style={{ color: '#0F6E56', fontWeight: 600 }}>{referralResultsThisMonth.length} results this month</span>
+                <span style={{ color: '#5B21B6', fontWeight: 600 }}>{referralResultsThisMonth.length} results this month</span>
               </>
             ) : activeTab === 'dashboard' ? (
               <>
-                <span style={{ color: '#0F6E56', fontWeight: 600 }}>{dashboardMetrics.statuses.reduce((sum, item) => sum + item.value, 0)} tracked tests</span> &nbsp;&bull;&nbsp;
+                <span style={{ color: '#5B21B6', fontWeight: 600 }}>{dashboardMetrics.statuses.reduce((sum, item) => sum + item.value, 0)} tracked tests</span> &nbsp;&bull;&nbsp;
                 <span style={{ color: '#C07000', fontWeight: 600 }}>{dashboardMetrics.unreviewed.length} results ready for doctor review</span> &nbsp;&bull;&nbsp;
                 <span style={{ color: '#A32D2D', fontWeight: 600 }}>{filtered.filter(test => test.aging?.overFourHours && test.status !== 'Complete').length} pending over 4h</span>
               </>
@@ -1590,7 +1590,7 @@ export default function Laboratory() {
                 {counts.All} total &nbsp;&bull;&nbsp;
                 <span style={{ color: '#C07000', fontWeight: 600 }}>{counts.Pending} pending</span> &nbsp;&bull;&nbsp;
                 <span style={{ color: '#1a6fb5', fontWeight: 600 }}>{counts.Processing} processing</span> &nbsp;&bull;&nbsp;
-                <span style={{ color: '#0F6E56', fontWeight: 600 }}>{counts.Completed} completed</span>
+                <span style={{ color: '#5B21B6', fontWeight: 600 }}>{counts.Completed} completed</span>
               </>
             )}
           </p>
@@ -1599,7 +1599,7 @@ export default function Laboratory() {
           <button style={{ ...s.btn, background: activeTab === 'dashboard' ? '#1a6fb5' : '#fff', color: activeTab === 'dashboard' ? '#fff' : '#1a6fb5', border: '1px solid #1a6fb5' }} onClick={() => setActiveTab('dashboard')}>
             Dashboard
           </button>
-          <button style={{ ...s.btn, background: activeTab === 'tests' ? '#0F6E56' : '#fff', color: activeTab === 'tests' ? '#fff' : '#0F6E56', border: '1px solid #0F6E56' }} onClick={() => setActiveTab('tests')}>
+          <button style={{ ...s.btn, background: activeTab === 'tests' ? '#5B21B6' : '#fff', color: activeTab === 'tests' ? '#fff' : '#5B21B6', border: '1px solid #5B21B6' }} onClick={() => setActiveTab('tests')}>
             Tests
           </button>
           <button style={{ ...s.btn, background: activeTab === 'technicians' ? '#7B5EA7' : '#fff', color: activeTab === 'technicians' ? '#fff' : '#7B5EA7', border: '1px solid #7B5EA7' }} onClick={() => setActiveTab('technicians')}>
@@ -1615,7 +1615,7 @@ export default function Laboratory() {
           ) : (
             <button style={s.btn} onClick={() => { resetOrderForm(); setShowOrderModal(true) }}>+ Order Lab Test</button>
           )}
-          <button style={{ ...s.btn, background: '#fff', color: '#0F6E56', border: '1px solid #0F6E56' }} onClick={() => { fetchTests(); fetchReferrals(); fetchInvoices() }}>Refresh</button>
+          <button style={{ ...s.btn, background: '#fff', color: '#5B21B6', border: '1px solid #5B21B6' }} onClick={() => { fetchTests(); fetchReferrals(); fetchInvoices() }}>Refresh</button>
         </div>
       </div>
 
@@ -1677,10 +1677,10 @@ export default function Laboratory() {
                   <div key={item.category}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
                       <span style={{ fontWeight: 600, color: '#1F2937' }}>{item.category}</span>
-                      <span style={{ color: '#0F6E56', fontWeight: 700 }}>{item.avgHours}h</span>
+                      <span style={{ color: '#5B21B6', fontWeight: 700 }}>{item.avgHours}h</span>
                     </div>
                     <div style={{ background: '#E5E7EB', borderRadius: 999, height: 8 }}>
-                      <div style={{ width: `${Math.min(100, item.avgHours * 8)}%`, background: item.avgHours > 8 ? '#A32D2D' : item.avgHours > 4 ? '#C07000' : '#0F6E56', borderRadius: 999, height: '100%' }} />
+                      <div style={{ width: `${Math.min(100, item.avgHours * 8)}%`, background: item.avgHours > 8 ? '#A32D2D' : item.avgHours > 4 ? '#C07000' : '#5B21B6', borderRadius: 999, height: '100%' }} />
                     </div>
                   </div>
                 ))}
@@ -1705,7 +1705,7 @@ export default function Laboratory() {
             <div style={s.dashboardCard}>
               <div style={s.dashboardCardTitle}>Results Not Yet Reviewed By Doctor</div>
               <div style={{ display: 'grid', gap: 10 }}>
-                {dashboardMetrics.unreviewed.length === 0 && <div style={{ color: '#0F6E56', fontSize: 13, fontWeight: 600 }}>All completed results have been reviewed.</div>}
+                {dashboardMetrics.unreviewed.length === 0 && <div style={{ color: '#5B21B6', fontSize: 13, fontWeight: 600 }}>All completed results have been reviewed.</div>}
                 {dashboardMetrics.unreviewed.slice(0, 8).map(test => (
                   <button
                     key={test.id}
@@ -1770,15 +1770,15 @@ export default function Laboratory() {
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
                       <div>
                         <div style={{ fontWeight: 700, fontSize: 14, color: '#111' }}>🔬 {tech}</div>
-                        <div style={{ fontSize: 12, color: active > 0 ? '#C07000' : '#0F6E56', fontWeight: 600, marginTop: 3 }}>{active > 0 ? `${active} active test${active !== 1 ? 's' : ''}` : 'No active tests'}</div>
+                        <div style={{ fontSize: 12, color: active > 0 ? '#C07000' : '#5B21B6', fontWeight: 600, marginTop: 3 }}>{active > 0 ? `${active} active test${active !== 1 ? 's' : ''}` : 'No active tests'}</div>
                       </div>
                       <div style={{ textAlign: 'right' }}>
-                        <div style={{ fontSize: 18, fontWeight: 800, color: active > 3 ? '#A32D2D' : active > 0 ? '#C07000' : '#0F6E56' }}>{active}</div>
+                        <div style={{ fontSize: 18, fontWeight: 800, color: active > 3 ? '#A32D2D' : active > 0 ? '#C07000' : '#5B21B6' }}>{active}</div>
                         <div style={{ fontSize: 10, color: '#aaa', fontWeight: 600 }}>ACTIVE</div>
                       </div>
                     </div>
                     <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-                      {[['#FFF3DC', '#C07000', w.pending.length, 'PENDING'], ['#E3F0FB', '#1a6fb5', w.processing.length, 'PROCESSING'], ['#E1F5EE', '#0F6E56', w.completed.length, 'DONE']].map(([bg, color, count, label]) => (
+                      {[['#FFF3DC', '#C07000', w.pending.length, 'PENDING'], ['#E3F0FB', '#1a6fb5', w.processing.length, 'PROCESSING'], ['#F3E8FF', '#5B21B6', w.completed.length, 'DONE']].map(([bg, color, count, label]) => (
                         <div key={label} style={{ flex: 1, background: bg, borderRadius: 8, padding: '8px 10px', textAlign: 'center' }}>
                           <div style={{ fontSize: 16, fontWeight: 800, color }}>{count}</div>
                           <div style={{ fontSize: 10, color, fontWeight: 600 }}>{label}</div>
@@ -2015,7 +2015,7 @@ export default function Laboratory() {
                 <div style={s.sectionLabel}>Sensitivity Pattern</div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 12, alignItems: 'center' }}>
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                    <span style={{ ...s.pill, background: '#E1F5EE', color: '#0F6E56', border: '1px solid #9FE1CB' }}>{antibiogramProfileSummary.sensitive} Sensitive</span>
+                    <span style={{ ...s.pill, background: '#F3E8FF', color: '#5B21B6', border: '1px solid #D8B4FE' }}>{antibiogramProfileSummary.sensitive} Sensitive</span>
                     <span style={{ ...s.pill, background: '#FFF3DC', color: '#C07000', border: '1px solid #FAC775' }}>{antibiogramProfileSummary.intermediate} Intermediate</span>
                     <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D', border: '1px solid #F09595' }}>{antibiogramProfileSummary.resistant} Resistant</span>
                     <span style={{ ...s.pill, background: '#F3F4F6', color: '#555', border: '1px solid #D1D5DB' }}>{antibiogramProfileSummary.testedCount} Tested</span>
@@ -2046,7 +2046,7 @@ export default function Laboratory() {
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 6 }}>
                         {[
                           ['', 'NT', '#F3F4F6', '#555'],
-                          ['S', 'S', '#E1F5EE', '#0F6E56'],
+                          ['S', 'S', '#F3E8FF', '#5B21B6'],
                           ['I', 'I', '#FFF3DC', '#C07000'],
                           ['R', 'R', '#FCEBEB', '#A32D2D'],
                         ].map(([value, label, bg, color]) => {
@@ -2117,7 +2117,7 @@ export default function Laboratory() {
                 </div>
               </div>
 
-              <div style={{ background: '#E1F5EE', border: '1px solid #9FE1CB', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: '#0F6E56', fontWeight: 600 }}>
+              <div style={{ background: '#F3E8FF', border: '1px solid #D8B4FE', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: '#5B21B6', fontWeight: 600 }}>
                 ✅ After saving:
                 <ul style={{ margin: '4px 0 0', paddingLeft: 16, fontSize: 11, fontWeight: 400 }}>
                   <li>The lab test is marked <strong>Complete</strong></li>
@@ -2159,7 +2159,7 @@ export default function Laboratory() {
                     <div key={tech.id} style={{ padding: '10px 14px', borderRadius: 8, border: `2px solid ${assignTech === tech.full_name ? '#7B5EA7' : '#eee'}`, background: assignTech === tech.full_name ? '#F0EAFC' : '#fafafa', cursor: 'pointer', fontSize: 13, fontWeight: assignTech === tech.full_name ? 700 : 400, color: assignTech === tech.full_name ? '#7B5EA7' : '#333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
                       onClick={() => setAssignTech(tech.full_name)}>
                       <span>{tech.full_name}{tech.role ? ` — ${tech.role}` : ''}</span>
-                      <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 99, background: workload === 0 ? '#E1F5EE' : workload < 3 ? '#FFF3DC' : '#FCEBEB', color: workload === 0 ? '#0F6E56' : workload < 3 ? '#C07000' : '#A32D2D' }}>{workload} active</span>
+                      <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 99, background: workload === 0 ? '#F3E8FF' : workload < 3 ? '#FFF3DC' : '#FCEBEB', color: workload === 0 ? '#5B21B6' : workload < 3 ? '#C07000' : '#A32D2D' }}>{workload} active</span>
                     </div>
                   )
                 })}
@@ -2204,9 +2204,9 @@ export default function Laboratory() {
                       ...s.actionBtn,
                       flex: 1,
                       padding: '10px 12px',
-                      background: referralForm.linked_mode === option.key ? '#0F6E56' : '#fff',
-                      color: referralForm.linked_mode === option.key ? '#fff' : '#0F6E56',
-                      border: '1px solid #0F6E56',
+                      background: referralForm.linked_mode === option.key ? '#5B21B6' : '#fff',
+                      color: referralForm.linked_mode === option.key ? '#fff' : '#5B21B6',
+                      border: '1px solid #5B21B6',
                     }}
                     onClick={() => setReferralForm(prev => ({ ...prev, linked_mode: option.key, lab_test_id: '', standalone_patient_id: '', standalone_test_name: '' }))}
                   >
@@ -2233,8 +2233,8 @@ export default function Laboratory() {
                         style={{
                           padding: '10px 12px',
                           borderRadius: 10,
-                          border: `1px solid ${referralForm.lab_test_id === test.id ? '#0F6E56' : '#E6ECE8'}`,
-                          background: referralForm.lab_test_id === test.id ? '#F3FBF8' : '#fff',
+                          border: `1px solid ${referralForm.lab_test_id === test.id ? '#5B21B6' : '#E6ECE8'}`,
+                          background: referralForm.lab_test_id === test.id ? '#FAF5FF' : '#fff',
                           cursor: 'pointer',
                         }}
                         onClick={() => setReferralForm(prev => ({
@@ -2272,8 +2272,8 @@ export default function Laboratory() {
                         style={{
                           padding: '10px 12px',
                           borderRadius: 10,
-                          border: `1px solid ${referralForm.standalone_patient_id === patient.id ? '#0F6E56' : '#E6ECE8'}`,
-                          background: referralForm.standalone_patient_id === patient.id ? '#F3FBF8' : '#fff',
+                          border: `1px solid ${referralForm.standalone_patient_id === patient.id ? '#5B21B6' : '#E6ECE8'}`,
+                          background: referralForm.standalone_patient_id === patient.id ? '#FAF5FF' : '#fff',
                           cursor: 'pointer',
                         }}
                         onClick={() => setReferralForm(prev => ({ ...prev, standalone_patient_id: patient.id, lab_test_id: '' }))}
@@ -2581,25 +2581,25 @@ export default function Laboratory() {
 const s = {
   page: { padding: '20px 24px', flex: 1, overflowY: 'auto', background: '#f7f8f7', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', minHeight: '100vh', boxSizing: 'border-box' },
   loadWrap: { height: '80vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
-  spinner: { width: 36, height: 36, border: '3px solid #e8ebe8', borderTop: '3px solid #0F6E56', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
+  spinner: { width: 36, height: 36, border: '3px solid #e8ebe8', borderTop: '3px solid #5B21B6', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
   header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 },
   title: { fontSize: 24, fontWeight: 800, margin: 0, color: '#111' },
   subtitle: { color: '#777', margin: '4px 0 0', fontSize: 13 },
-  btn: { background: '#0F6E56', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 8, fontWeight: 600, cursor: 'pointer', fontSize: 13 },
+  btn: { background: '#5B21B6', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 8, fontWeight: 600, cursor: 'pointer', fontSize: 13 },
   tabRow: { display: 'flex', gap: 4, marginBottom: 14, background: '#fff', padding: '6px 8px', borderRadius: 10, border: '1px solid #eee', flexWrap: 'wrap' },
   tabBtn: { padding: '8px 14px', border: 'none', background: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#888', borderRadius: 7, display: 'flex', alignItems: 'center', gap: 6 },
-  tabBtnActive: { background: '#0F6E56', color: '#fff' },
+  tabBtnActive: { background: '#5B21B6', color: '#fff' },
   tabCount: { fontSize: 11, padding: '2px 7px', borderRadius: 99, background: '#f0f0f0', color: '#666', fontWeight: 700 },
   tabCountActive: { background: 'rgba(255,255,255,0.25)', color: '#fff' },
-  patientCardActive: { border: '2px solid #0F6E56', background: '#F3FBF8', borderRadius: 12 },
+  patientCardActive: { border: '2px solid #5B21B6', background: '#FAF5FF', borderRadius: 12 },
   testCard: { borderRadius: 12, padding: '14px 16px', cursor: 'pointer', display: 'flex', alignItems: 'flex-start', gap: 12, boxShadow: '0 2px 6px rgba(0,0,0,0.04)', flexWrap: 'wrap', transition: 'box-shadow 0.15s' },
   detailPanel: { width: 300, flexShrink: 0, background: '#fff', borderRadius: 12, border: '1px solid #eee', padding: 18, overflowY: 'auto', maxHeight: 'calc(100vh - 140px)' },
-  sectionLabel: { fontSize: 11, fontWeight: 700, color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 10, marginTop: 4, paddingBottom: 5, borderBottom: '1px solid #E1F5EE' },
+  sectionLabel: { fontSize: 11, fontWeight: 700, color: '#5B21B6', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 10, marginTop: 4, paddingBottom: 5, borderBottom: '1px solid #F3E8FF' },
   pill: { fontSize: 11, fontWeight: 600, padding: '3px 9px', borderRadius: 99, display: 'inline-block' },
   chip: { fontSize: 11, padding: '5px 12px', borderRadius: 99, border: '1px solid #e0e0e0', background: '#fff', cursor: 'pointer', fontWeight: 500, color: '#555' },
-  chipActive: { background: '#0F6E56', color: '#fff', border: '1px solid #0F6E56' },
+  chipActive: { background: '#5B21B6', color: '#fff', border: '1px solid #5B21B6' },
   actionBtn: { fontSize: 12, padding: '6px 12px', borderRadius: 6, cursor: 'pointer', fontWeight: 600, whiteSpace: 'nowrap', border: 'none' },
-  btnPri: { background: '#0F6E56', color: '#fff' },
+  btnPri: { background: '#5B21B6', color: '#fff' },
   btnGhost: { background: '#F3F4F6', color: '#9CA3AF', border: '1px solid #E5E7EB' },
   empty: { textAlign: 'center', padding: '80px 20px', color: '#999' },
   metricCard: { background: '#fff', border: '1px solid #E5E7EB', borderRadius: 14, padding: 16, boxShadow: '0 2px 10px rgba(15,110,86,0.04)' },
@@ -2625,6 +2625,7 @@ const s = {
   label: { fontSize: 12, color: '#666', display: 'block', marginBottom: 5, fontWeight: 500 },
   input: { width: '100%', padding: '10px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 13, outline: 'none', boxSizing: 'border-box', background: '#fff', color: '#111', fontFamily: 'inherit' },
   cancelBtn: { padding: '10px 20px', border: '1px solid #ddd', borderRadius: 8, background: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#555' },
-  submitBtn: { padding: '10px 24px', border: 'none', borderRadius: 8, background: '#0F6E56', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
+  submitBtn: { padding: '10px 24px', border: 'none', borderRadius: 8, background: '#5B21B6', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
 }
+
 

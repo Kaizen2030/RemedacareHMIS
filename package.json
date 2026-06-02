@@ -1,9 +1,14 @@
 {
-  "name": "remedacare-os",
+  "name": "brightpath-travel-scholars",
   "private": true,
-  "version": "1.0.1",
-  "description": "RemedacareHMIS Hospital Management System",
-  "author": "RemedacareHMIS",
+  "version": "1.0.2",
+  "description": "Brightpath Travel Scholars Hospital Management System",
+  "author": "Brightpath Travel Scholars",
+  "homepage": "https://brightpathtravelscholars.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kaizen2030/brightpathtravelscholars.git"
+  },
   "main": "electron/main.js",
   "scripts": {
     "dev": "vite",
@@ -20,13 +25,13 @@
     "test:e2e:headed": "playwright test --headed"
   },
   "build": {
-    "appId": "com.remedacarehmis.app",
-    "productName": "RemedacareHMIS",
+    "appId": "com.brightpathtravelscholars.app",
+    "productName": "Brightpath Travel Scholars",
     "protocols": [
       {
-        "name": "RemedaCare",
+        "name": "Brightpath Travel Scholars",
         "schemes": [
-          "remedacare"
+          "remedacarehms"
         ]
       }
     ],
@@ -54,7 +59,7 @@
       "license": "license.txt",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "RemedacareHMIS",
+      "shortcutName": "Brightpath Travel Scholars",
       "runAfterFinish": true,
       "perMachine": false,
       "deleteAppDataOnUninstall": false
@@ -63,6 +68,7 @@
   "dependencies": {
     "@google/generative-ai": "^0.2.1",
     "@supabase/supabase-js": "^2.39.0",
+    "exceljs": "^4.4.0",
     "pdfjs-dist": "^3.11.122",
     "qrcode.react": "^4.2.0",
     "react": "^18.2.0",

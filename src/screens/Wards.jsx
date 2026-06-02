@@ -11,7 +11,7 @@ import WardBedPanel from './wards/WardBedPanel'
 const WARD_TYPES = ['General', 'ICU', 'Maternity', 'Paediatrics', 'Surgical', 'Cardiac', 'Orthopaedic', 'Oncology', 'Emergency', 'Psychiatric', 'Private', 'Radiology', 'Dental', 'Cardiology', 'Eye', 'Mental Health', 'Physiotherapy', 'Nutrition', 'Community Health']
 const WARD_ICONS = { ICU: 'ICU', Maternity: 'MAT', General: 'GEN', Paediatrics: 'PEDS', Surgical: 'SURG', Cardiac: 'CARD', Orthopaedic: 'ORTHO', Oncology: 'ONC', Emergency: 'ER', Psychiatric: 'MH', Private: 'PVT', Radiology: 'RAD', Dental: 'DENT', Cardiology: 'CARD', Eye: 'EYE', 'Mental Health': 'MH', Physiotherapy: 'PT', Nutrition: 'NUT', 'Community Health': 'CH' }
 const BED_COLORS = {
- Free: { bg: '#E1F5EE', border: '#9FE1CB', color: '#0F6E56' },
+ Free: { bg: '#F3E8FF', border: '#D8B4FE', color: '#5B21B6' },
  Occupied: { bg: '#FDEAEA', border: '#F3A6A6', color: '#A32D2D' },
  Critical: { bg: '#FAD6D6', border: '#E07272', color: '#7F1D1D' },
  Reserved: { bg: '#FFF3DC', border: '#FAC775', color: '#C07000' },
@@ -563,10 +563,10 @@ async function printDischargeSummary() {
       .print-sheet { max-width: 210mm; margin: 0 auto; padding: 10mm 8mm; }
       .header { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 18px; }
       .logo-box { width: 74px; height: 74px; border: 1.5px dashed #8AAE9F; border-radius: 12px; display: flex; align-items: center; justify-content: center; color: #6B7F76; font-size: 11px; text-align: center; }
-      .title { font-size: 26px; font-weight: 800; color: #0F6E56; margin: 0; }
+      .title { font-size: 26px; font-weight: 800; color: #5B21B6; margin: 0; }
       .subtitle { margin-top: 4px; color: #555; font-size: 12px; }
       .section { border: 1px solid #DDE7E1; border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; }
-      .section-title { font-size: 12px; font-weight: 800; color: #0F6E56; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 10px; }
+      .section-title { font-size: 12px; font-weight: 800; color: #5B21B6; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 10px; }
       .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 18px; }
       .row-label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 2px; }
       .row-value { font-size: 13px; color: #111; font-weight: 600; }
@@ -642,7 +642,7 @@ async function printDischargeSummary() {
         <div class="summary-box">${escapeHtml(instructionText || 'No discharge instructions entered yet.')}</div>
       </div>
 
-      <div class="muted">Generated from the ward admission record, consultations, lab tests and prescriptions in RemedacareHMIS.</div>
+      <div class="muted">Generated from the ward admission record, consultations, lab tests and prescriptions in Brightpath Travel Scholars.</div>
     </div>
     <script>setTimeout(() => window.print(), 300)</script>
    </body>
@@ -1172,7 +1172,7 @@ async function setBedStatus(bed, status) {
  }, [admissions])
 
  if (loading) return (
- <div style={s.loadWrap}><div style={s.spinner}></div><p style={{ color: '#0F6E56', marginTop: 12 }}>Loading Wards...</p></div>
+ <div style={s.loadWrap}><div style={s.spinner}></div><p style={{ color: '#5B21B6', marginTop: 12 }}>Loading Wards...</p></div>
  )
 
  return (
@@ -1206,7 +1206,7 @@ async function setBedStatus(bed, status) {
  {view === 'ward' && (
  <>
  <button
-  style={{ ...s.btn, background: '#fff', color: '#0F6E56', border: '1px solid #0F6E56', ...(canManageWards ? {} : s.btnDisabled) }}
+  style={{ ...s.btn, background: '#fff', color: '#5B21B6', border: '1px solid #5B21B6', ...(canManageWards ? {} : s.btnDisabled) }}
   onClick={() => setShowAddBeds(true)}
   disabled={!canManageWards}
   title="Only admins can add beds to wards">+ Add Beds</button>
@@ -1267,7 +1267,7 @@ async function setBedStatus(bed, status) {
             {request.request_source || 'OPD'} • {request.admission_type || 'Elective'} • Requested {formatDateTime(request.created_at)}
            </div>
            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
-            <span style={{ ...s.pill, background: request.priority === 'Emergency' ? '#FCEBEB' : request.priority === 'Urgent' ? '#FFF3DC' : '#EAF6F1', color: request.priority === 'Emergency' ? '#A32D2D' : request.priority === 'Urgent' ? '#C07000' : '#0F6E56' }}>{request.priority || 'Routine'}</span>
+            <span style={{ ...s.pill, background: request.priority === 'Emergency' ? '#FCEBEB' : request.priority === 'Urgent' ? '#FFF3DC' : '#EAF6F1', color: request.priority === 'Emergency' ? '#A32D2D' : request.priority === 'Urgent' ? '#C07000' : '#5B21B6' }}>{request.priority || 'Routine'}</span>
             {request.requested_ward_id && <span style={{ ...s.pill, background: '#EFF6FF', color: '#1D4ED8' }}>Preferred ward set</span>}
             {request.isolation_required && <span style={{ ...s.pill, background: '#F3E8FF', color: '#7C3AED' }}>Isolation required</span>}
            </div>
@@ -1322,7 +1322,7 @@ async function setBedStatus(bed, status) {
     <div style={s.statsRow}>
      {[
       { label: 'Current Occupancy %', value: `${totalBeds ? Math.round(((totalOccupied + totalReserved) / totalBeds) * 100) : 0}%`, color: '#111', bg: '#F3F4F6' },
-      { label: 'Avg LOS This Month', value: `${occupancyAnalytics.length ? Number((occupancyAnalytics.reduce((sum, row) => sum + row.avgLos, 0) / occupancyAnalytics.length).toFixed(1)) : 0}d`, color: '#0F6E56', bg: '#E1F5EE' },
+      { label: 'Avg LOS This Month', value: `${occupancyAnalytics.length ? Number((occupancyAnalytics.reduce((sum, row) => sum + row.avgLos, 0) / occupancyAnalytics.length).toFixed(1)) : 0}d`, color: '#5B21B6', bg: '#F3E8FF' },
       { label: 'Bed Turnover', value: occupancyAnalytics.length ? Number((occupancyAnalytics.reduce((sum, row) => sum + row.turnover, 0) / occupancyAnalytics.length).toFixed(1)) : 0, color: '#1D4ED8', bg: '#EAF2FF' },
       { label: '30d Readmissions', value: admissions.filter(item => readmissionWithin30Days(item, admissions)).length, color: '#A32D2D', bg: '#FCEBEB' },
      ].map(stat => (
@@ -1344,7 +1344,7 @@ async function setBedStatus(bed, status) {
          <YAxis stroke="#6B7280" />
          <Tooltip />
          <Legend />
-         <Line type="monotone" dataKey="admissions" stroke="#0F6E56" strokeWidth={3} name="Admissions" />
+         <Line type="monotone" dataKey="admissions" stroke="#5B21B6" strokeWidth={3} name="Admissions" />
          <Line type="monotone" dataKey="discharges" stroke="#C07000" strokeWidth={3} name="Discharges" />
         </LineChart>
        </ResponsiveContainer>
@@ -1378,7 +1378,7 @@ async function setBedStatus(bed, status) {
          <YAxis stroke="#6B7280" />
          <Tooltip formatter={(value) => [`${value}%`, 'Occupancy']} />
          <Bar dataKey="occupancy" radius={[8, 8, 0, 0]}>
-          {occupancyAnalytics.map(item => <Cell key={item.ward} fill={item.occupancy > 90 ? '#A32D2D' : item.occupancy >= 75 ? '#C07000' : '#0F6E56'} />)}
+          {occupancyAnalytics.map(item => <Cell key={item.ward} fill={item.occupancy > 90 ? '#A32D2D' : item.occupancy >= 75 ? '#C07000' : '#5B21B6'} />)}
          </Bar>
         </BarChart>
        </ResponsiveContainer>
@@ -1540,7 +1540,7 @@ async function setBedStatus(bed, status) {
     <button style={s.closeBtn} onClick={() => setShowAdmitModal(false)}></button>
    </div>
    <div style={s.modalBody}>
-    <div style={{ background: '#F8FBF9', border: '1px solid #E1F5EE', borderRadius: 12, padding: 12, marginBottom: 16 }}>
+    <div style={{ background: '#F8FBF9', border: '1px solid #F3E8FF', borderRadius: 12, padding: 12, marginBottom: 16 }}>
      <div style={{ fontWeight: 700, color: '#111' }}>{admitForm.patient_name || 'Select patient from waiting list'}</div>
      <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>Visit ID: {admitForm.visit_id || '—'} • SHA No: {admitForm.sha_number || 'Not recorded'}</div>
     </div>
@@ -1621,8 +1621,8 @@ async function setBedStatus(bed, status) {
       <input style={s.input} type="datetime-local" value={roundForm.note_date} onChange={e => setRoundForm({ ...roundForm, note_date: e.target.value })} />
      </div>
     </div>
-    <div style={{ background: '#F8FBF9', borderRadius: 10, padding: 12, border: '1px solid #E1F5EE', marginBottom: 14 }}>
-     <div style={{ fontWeight: 700, color: '#0F6E56', marginBottom: 6 }}>Latest Vitals Snapshot</div>
+    <div style={{ background: '#F8FBF9', borderRadius: 10, padding: 12, border: '1px solid #F3E8FF', marginBottom: 14 }}>
+     <div style={{ fontWeight: 700, color: '#5B21B6', marginBottom: 6 }}>Latest Vitals Snapshot</div>
      <div style={{ fontSize: 12, color: '#444' }}>
       BP {bedVitals?.bp_systolic ? `${bedVitals.bp_systolic}/${bedVitals.bp_diastolic || ''}` : '—'} • Pulse {bedVitals?.pulse_bpm || '—'} • Temp {bedVitals?.temperature_c || '—'} • SpO2 {bedVitals?.oxygen_sat || '—'}
      </div>
@@ -1786,7 +1786,7 @@ async function setBedStatus(bed, status) {
  <div style={{ background: '#FCEBEB', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#A32D2D', marginBottom: 14 }}>
  This will discharge <strong>{bedPatient?.full_name}</strong> from Bed <strong>{selectedBed?.bed_number}</strong> and mark the visit as Completed.
  </div>
- <div style={{ background: dischargeChecklist.canDischarge ? '#E1F5EE' : '#FFF3DC', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: dischargeChecklist.canDischarge ? '#0F6E56' : '#C07000', marginBottom: 14, border: `1px solid ${dischargeChecklist.canDischarge ? '#9FE1CB' : '#FAC775'}` }}>
+ <div style={{ background: dischargeChecklist.canDischarge ? '#F3E8FF' : '#FFF3DC', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: dischargeChecklist.canDischarge ? '#5B21B6' : '#C07000', marginBottom: 14, border: `1px solid ${dischargeChecklist.canDischarge ? '#D8B4FE' : '#FAC775'}` }}>
  {dischargeChecklist.canDischarge
  ? 'The discharge checklist is complete. You can complete discharge.'
  : `Discharge is blocked: ${dischargeChecklist.openInvoices.length} open invoice(s), ${dischargeChecklist.unbilledLabs.length} unbilled lab test(s), or pending checklist items still need action.`}
@@ -1856,27 +1856,27 @@ async function setBedStatus(bed, status) {
 const s = {
  page: { padding: '20px 24px', flex: 1, overflowY: 'auto', background: '#f7f8f7', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', minHeight: '100vh', boxSizing: 'border-box' },
  loadWrap: { height: '80vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
- spinner: { width: 36, height: 36, border: '3px solid #e8ebe8', borderTop: '3px solid #0F6E56', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
+ spinner: { width: 36, height: 36, border: '3px solid #e8ebe8', borderTop: '3px solid #5B21B6', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 10 },
  title: { fontSize: 24, fontWeight: 800, margin: 0, color: '#111' },
  subtitle: { color: '#777', margin: '4px 0 0', fontSize: 13 },
  backBtn: { background: '#fff', border: '1px solid #ddd', borderRadius: 8, padding: '8px 14px', cursor: 'pointer', fontSize: 13, fontWeight: 600, color: '#555' },
- btn: { background: '#0F6E56', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 8, fontWeight: 600, cursor: 'pointer', fontSize: 13 },
+ btn: { background: '#5B21B6', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 8, fontWeight: 600, cursor: 'pointer', fontSize: 13 },
  btnDisabled: { opacity: 0.5, cursor: 'not-allowed' },
  statsRow: { display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' },
  statChip: { borderRadius: 12, padding: '12px 20px', minWidth: 100, textAlign: 'center' },
  chartCard: { background: '#fff', borderRadius: 14, border: '1px solid #E6ECE8', padding: 18, minHeight: 340 },
  wardGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 14 },
  wardCard: { background: '#fff', borderRadius: 14, padding: 18, cursor: 'pointer', transition: 'box-shadow 0.2s', boxShadow: '0 2px 8px rgba(0,0,0,0.04)' },
- sectionLabel: { fontSize: 11, fontWeight: 700, color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 12, paddingBottom: 6, borderBottom: '1px solid #E1F5EE' },
+ sectionLabel: { fontSize: 11, fontWeight: 700, color: '#5B21B6', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 12, paddingBottom: 6, borderBottom: '1px solid #F3E8FF' },
  bedGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(72px, 1fr))', gap: 8 },
  bedCard: { borderRadius: 8, padding: '8px 4px', cursor: 'pointer', textAlign: 'center', transition: 'all 0.15s', minHeight: 52, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', userSelect: 'none' },
  bedOverlay: { position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.42)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 950, padding: 24 },
  sidePanel: { width: 'min(880px, calc(100vw - 48px))', flexShrink: 0, background: '#fff', borderRadius: 18, border: '1px solid #E6ECE8', padding: 22, overflowY: 'auto', maxHeight: 'calc(100vh - 56px)', boxShadow: '0 24px 80px rgba(15,23,42,0.22)', animation: 'fadeIn 0.2s ease' },
- sideSectionLabel: { fontSize: 10, fontWeight: 700, color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 8, marginTop: 2, paddingBottom: 4, borderBottom: '1px solid #E1F5EE' },
+ sideSectionLabel: { fontSize: 10, fontWeight: 700, color: '#5B21B6', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 8, marginTop: 2, paddingBottom: 4, borderBottom: '1px solid #F3E8FF' },
  pill: { fontSize: 11, fontWeight: 600, padding: '3px 9px', borderRadius: 99 },
  chip: { fontSize: 12, padding: '6px 12px', borderRadius: 99, border: '1px solid #e0e0e0', background: '#fff', cursor: 'pointer', fontWeight: 500, color: '#555', whiteSpace: 'nowrap' },
- chipActive: { background: '#0F6E56', color: '#fff', border: '1px solid #0F6E56' },
+ chipActive: { background: '#5B21B6', color: '#fff', border: '1px solid #5B21B6' },
  pageBtn: { padding: '4px 10px', border: '1px solid #ddd', borderRadius: 6, background: '#fff', cursor: 'pointer', fontSize: 12, color: '#555' },
  empty: { textAlign: 'center', padding: '60px 20px', color: '#999' },
  th: { fontSize: 11, color: '#888', fontWeight: 600, textAlign: 'left', padding: '10px 14px', borderBottom: '2px solid #f0f0f0', textTransform: 'uppercase' },
@@ -1894,5 +1894,6 @@ const s = {
  inlineHint: { fontSize: 11, color: '#777', marginTop: 4 },
  input: { width: '100%', padding: '10px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 13, outline: 'none', boxSizing: 'border-box', background: '#fff', color: '#111', fontFamily: 'inherit' },
  cancelBtn: { padding: '10px 20px', border: '1px solid #ddd', borderRadius: 8, background: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#555' },
- submitBtn: { padding: '10px 24px', border: 'none', borderRadius: 8, background: '#0F6E56', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
+ submitBtn: { padding: '10px 24px', border: 'none', borderRadius: 8, background: '#5B21B6', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
 }
+

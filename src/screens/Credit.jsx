@@ -46,7 +46,7 @@ const PAYMENT_METHODS = ['Cash', 'M-Pesa', 'EFT', 'Bank Transfer', 'Cheque', 'Wa
 const FOLLOW_UP_STATUSES = ['No Contact', 'Promised Payment', 'Dispute', 'Legal', 'Written Off']
 const RECORD_TYPES = ['Debt', 'Credit']
 const CATEGORIES = ['Consultation', 'Lab', 'Pharmacy', 'Radiology', 'Procedures', 'Accommodation', 'Deposit', 'Overpayment', 'Other']
-const CHART_COLORS = ['#0F6E56', '#EAB308', '#F97316', '#D32F2F']
+const CHART_COLORS = ['#5B21B6', '#EAB308', '#F97316', '#D32F2F']
 const LOCAL_ACCOUNT_KEY_PREFIX = 'remedacare:credit_accounts:'
 const LOCAL_PAYMENT_KEY_PREFIX = 'remedacare:credit_payments:'
 const LOCAL_FOLLOWUP_KEY_PREFIX = 'remedacare:credit_followups:'
@@ -305,7 +305,7 @@ function buildPaymentReceiptHtml({ hospitalName, payment, account, allocations, 
     </tr>`
   }).join('')
   return `
-    <h1>${hospitalName || 'RemedacareHMIS'}</h1>
+    <h1>${hospitalName || 'Brightpath Travel Scholars'}</h1>
     <div class="muted">Computer-generated credit payment receipt</div>
     <div class="section">
       <table>
@@ -338,7 +338,7 @@ function buildCorporateStatementHtml({ hospitalName, account, rows, month }) {
     </tr>
   `).join('')
   return `
-    <h1>${hospitalName || 'RemedacareHMIS'}</h1>
+    <h1>${hospitalName || 'Brightpath Travel Scholars'}</h1>
     <div class="muted">Corporate credit statement for ${account.account_name}</div>
     <div class="section">
       <table>
@@ -1887,7 +1887,7 @@ export default function CreditDebts() {
                     <XAxis dataKey="month" tick={{ fontSize: 11 }} />
                     <YAxis tickFormatter={(value) => `${Math.round(Number(value || 0) / 1000)}k`} tick={{ fontSize: 11 }} />
                     <RechartsTooltip formatter={(value) => formatKES(value)} />
-                    <Line type="monotone" dataKey="invoiced" stroke="#0F6E56" strokeWidth={3} dot={false} name="Invoiced" />
+                    <Line type="monotone" dataKey="invoiced" stroke="#5B21B6" strokeWidth={3} dot={false} name="Invoiced" />
                     <Line type="monotone" dataKey="collected" stroke="#1D4ED8" strokeWidth={3} dot={false} name="Collected" />
                     <Line type="monotone" dataKey="writtenOff" stroke="#D32F2F" strokeWidth={3} dot={false} name="Written Off" />
                   </LineChart>
@@ -2897,3 +2897,4 @@ const styles = {
     marginBottom: 12,
   },
 }
+

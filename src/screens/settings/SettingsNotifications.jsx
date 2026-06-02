@@ -5,8 +5,11 @@ import {
   DEFAULT_TEMPLATES,
   buildMessage,
   fetchNotificationConfig,
+  isAutoIsolateTelegramEnabled,
+  isAutoThresholdTelegramEnabled,
   normalizeNotificationConfig,
   saveNotificationConfig,
+  sendAntibiogramTelegramNotification,
   sendPatientNotification,
 } from '../../utils/notifications'
 
@@ -23,7 +26,7 @@ const NOTIFICATION_ROWS = [
 
 function StatusBadge({ status, styles }) {
   const palette = status === 'Sent'
-    ? { bg: '#E1F5EE', color: '#0F6E56' }
+    ? { bg: '#F3E8FF', color: '#5B21B6' }
     : status === 'Skipped'
       ? { bg: '#FFF3DC', color: '#C07000' }
       : { bg: '#FCEBEB', color: '#A32D2D' }
@@ -45,6 +48,8 @@ export default function SettingsNotifications({ hospitalId, hospitalName, styles
   const [testSending, setTestSending] = useState(false)
   const [logRows, setLogRows] = useState([])
   const [logLoading, setLogLoading] = useState(false)
+  const [telegramTestSending, setTelegramTestSending] = useState(false)
+  const [telegramTestResult, setTelegramTestResult] = useState(null)
 
   const patientIds = useMemo(
     () => [...new Set(logRows.map((row) => row.patient_id).filter(Boolean))],
@@ -159,7 +164,7 @@ export default function SettingsNotifications({ hospitalId, hospitalName, styles
     const activeTemplate = notificationConfig.lab_result?.template || DEFAULT_TEMPLATES.lab_result
     const message = buildMessage(activeTemplate, {
       patient_name: 'Test Patient',
-      hospital_name: hospitalName || 'RemedacareHMIS',
+      hospital_name: hospitalName || 'Brightpath Travel Scholars',
       test_name: 'Full Blood Count',
     })
 
@@ -177,12 +182,30 @@ export default function SettingsNotifications({ hospitalId, hospitalName, styles
     await loadLogs()
   }
 
+  async function handleSendTelegramTest() {
+    const chatId = String(notificationConfig.telegram?.chat_id || '').trim()
+    if (!chatId) {
+      window.notifyFromLegacyAlert('Enter a Telegram chat ID first.')
+      return
+    }
+
+    setTelegramTestSending(true)
+    const result = await sendAntibiogramTelegramNotification({
+      hospitalId,
+      hospitalName,
+      notificationType: 'telegram_test',
+      message: `Test Telegram alert from ${hospitalName || 'Brightpath Travel Scholars'}. If you received this, Telegram notifications are configured correctly.`,
+    })
+    setTelegramTestResult(result)
+    setTelegramTestSending(false)
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
       <div style={styles.card}>
         <div style={styles.cardHeader}>📡 Notifications</div>
         <div style={styles.cardBody}>
-          <div style={{ ...styles.infoCard, borderColor: connectionStatus.configured ? '#9FE1CB' : '#F6D28B', background: connectionStatus.configured ? '#F0FDF4' : '#FFF8E7' }}>
+          <div style={{ ...styles.infoCard, borderColor: connectionStatus.configured ? '#D8B4FE' : '#F6D28B', background: connectionStatus.configured ? '#F0FDF4' : '#FFF8E7' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
               <div>
                 <div style={styles.infoTitle}>Connection Status</div>
@@ -197,7 +220,7 @@ export default function SettingsNotifications({ hospitalId, hospitalName, styles
                   <div style={{ fontSize: 12, color: '#A32D2D', marginTop: 6 }}>{connectionStatus.error}</div>
                 )}
               </div>
-              <div style={{ ...styles.pill, background: connectionStatus.configured ? '#E1F5EE' : '#FFF3DC', color: connectionStatus.configured ? '#0F6E56' : '#C07000', padding: '6px 10px' }}>
+              <div style={{ ...styles.pill, background: connectionStatus.configured ? '#F3E8FF' : '#FFF3DC', color: connectionStatus.configured ? '#5B21B6' : '#C07000', padding: '6px 10px' }}>
                 {connectionStatus.loading ? 'Checking...' : connectionStatus.configured ? 'Connected' : 'Not configured'}
               </div>
             </div>
@@ -241,6 +264,80 @@ export default function SettingsNotifications({ hospitalId, hospitalName, styles
       </div>
 
       <div style={styles.card}>
+        <div style={styles.cardHeader}>Telegram Alerts</div>
+        <div style={styles.cardBody}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 14 }}>
+            <div>
+              <label style={{ fontSize: 12, color: '#666', display: 'block', marginBottom: 5, fontWeight: 500 }}>Telegram Chat ID</label>
+              <input
+                style={styles.input}
+                value={notificationConfig.telegram?.chat_id || ''}
+                onChange={(event) => setNotificationConfig((prev) => ({
+                  ...prev,
+                  telegram: { ...(prev.telegram || {}), chat_id: event.target.value },
+                }))}
+                placeholder="-1001234567890"
+              />
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap', padding: '10px 12px', border: '1px solid #EEE', borderRadius: 12, background: '#FAFAFA' }}>
+              <div style={{ minWidth: 220 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: '#111' }}>Auto threshold Telegram alerts</div>
+                <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>Send a Telegram alert automatically when a new upload creates a threshold breach.</div>
+              </div>
+              <div
+                style={{ width: 46, height: 26, borderRadius: 99, cursor: 'pointer', transition: 'background .2s', background: isAutoThresholdTelegramEnabled(notificationConfig) ? '#5B21B6' : '#ddd', position: 'relative', flexShrink: 0 }}
+                onClick={() => setNotificationConfig((prev) => ({
+                  ...prev,
+                  telegram: {
+                    ...(prev.telegram || {}),
+                    auto_threshold_alerts: !isAutoThresholdTelegramEnabled(prev),
+                  },
+                }))}
+              >
+                <div style={{ position: 'absolute', top: 3, left: isAutoThresholdTelegramEnabled(notificationConfig) ? 23 : 3, width: 20, height: 20, borderRadius: '50%', background: '#fff', transition: 'left .2s', boxShadow: '0 1px 4px rgba(0,0,0,.2)' }} />
+              </div>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'center', flexWrap: 'wrap', padding: '10px 12px', border: '1px solid #EEE', borderRadius: 12, background: '#FAFAFA' }}>
+              <div style={{ minWidth: 220 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: '#111' }}>Auto isolate Telegram alerts</div>
+                <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>Send a Telegram alert for every new isolate saved from a VITEK/PDF upload.</div>
+              </div>
+              <div
+                style={{ width: 46, height: 26, borderRadius: 99, cursor: 'pointer', transition: 'background .2s', background: isAutoIsolateTelegramEnabled(notificationConfig) ? '#5B21B6' : '#ddd', position: 'relative', flexShrink: 0 }}
+                onClick={() => setNotificationConfig((prev) => ({
+                  ...prev,
+                  telegram: {
+                    ...(prev.telegram || {}),
+                    auto_isolate_upload_alerts: !isAutoIsolateTelegramEnabled(prev),
+                  },
+                }))}
+              >
+                <div style={{ position: 'absolute', top: 3, left: isAutoIsolateTelegramEnabled(notificationConfig) ? 23 : 3, width: 20, height: 20, borderRadius: '50%', background: '#fff', transition: 'left .2s', boxShadow: '0 1px 4px rgba(0,0,0,.2)' }} />
+              </div>
+            </div>
+            <div style={{ fontSize: 12, color: '#666', lineHeight: 1.6 }}>
+              Save the chat ID here. Keep the bot token as a Supabase Edge Function secret named <strong>TELEGRAM_BOT_TOKEN</strong>.
+              You can find the chat ID from Telegram or by calling <code>/getUpdates</code> on your bot API.
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <button style={styles.addBtn} onClick={() => void persistConfig(notificationConfig, 'Telegram settings saved.')}>
+                Save Telegram Settings
+              </button>
+              <button style={styles.editBtn} onClick={() => void handleSendTelegramTest()} disabled={telegramTestSending || !String(notificationConfig.telegram?.chat_id || '').trim()}>
+                {telegramTestSending ? 'Sending...' : 'Send Telegram Test'}
+              </button>
+            </div>
+            {telegramTestResult && (
+              <div style={{ marginTop: 4, fontSize: 12, color: telegramTestResult.success ? '#5B21B6' : telegramTestResult.skipped ? '#C07000' : '#A32D2D', fontWeight: 700 }}>
+                {telegramTestResult.success ? 'Sent ✓' : telegramTestResult.skipped ? 'Skipped' : 'Failed ✕'}
+                {telegramTestResult.error ? ` — ${telegramTestResult.error}` : ''}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div style={styles.card}>
         <div style={styles.cardHeader}>🔔 Notification Toggles</div>
         <div style={styles.cardBody}>
           {NOTIFICATION_ROWS.map((row, index) => {
@@ -264,13 +361,13 @@ export default function SettingsNotifications({ hospitalId, hospitalName, styles
                     <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>{row.description}</div>
                     <button
                       type="button"
-                      style={{ border: 'none', background: 'none', color: '#0F6E56', cursor: 'pointer', fontSize: 12, fontWeight: 700, padding: 0, marginTop: 8 }}
+                      style={{ border: 'none', background: 'none', color: '#5B21B6', cursor: 'pointer', fontSize: 12, fontWeight: 700, padding: 0, marginTop: 8 }}
                       onClick={() => setExpandedKey(expanded ? '' : row.key)}
                     >
                       {expanded ? 'Hide template' : 'Edit template'}
                     </button>
                   </div>
-                  <div style={{ width: 46, height: 26, borderRadius: 99, cursor: busy ? 'wait' : 'pointer', transition: 'background .2s', background: current.enabled ? '#0F6E56' : '#ddd', position: 'relative', flexShrink: 0 }} onClick={() => !busy && handleToggle(row.key)}>
+                  <div style={{ width: 46, height: 26, borderRadius: 99, cursor: busy ? 'wait' : 'pointer', transition: 'background .2s', background: current.enabled ? '#5B21B6' : '#ddd', position: 'relative', flexShrink: 0 }} onClick={() => !busy && handleToggle(row.key)}>
                     <div style={{ position: 'absolute', top: 3, left: current.enabled ? 23 : 3, width: 20, height: 20, borderRadius: '50%', background: '#fff', transition: 'left .2s', boxShadow: '0 1px 4px rgba(0,0,0,.2)' }} />
                   </div>
                 </div>
@@ -321,7 +418,7 @@ export default function SettingsNotifications({ hospitalId, hospitalName, styles
             </button>
           </div>
           {testResult && (
-            <div style={{ marginTop: 12, fontSize: 12, color: testResult.success ? '#0F6E56' : testResult.skipped ? '#C07000' : '#A32D2D', fontWeight: 700 }}>
+            <div style={{ marginTop: 12, fontSize: 12, color: testResult.success ? '#5B21B6' : testResult.skipped ? '#C07000' : '#A32D2D', fontWeight: 700 }}>
               {testResult.success ? 'Sent ✓' : testResult.skipped ? 'Skipped' : 'Failed ✗'}
               {testResult.error ? ` — ${testResult.error}` : ''}
             </div>
@@ -370,3 +467,4 @@ export default function SettingsNotifications({ hospitalId, hospitalName, styles
     </div>
   )
 }
+

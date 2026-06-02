@@ -2378,7 +2378,7 @@ export default function Pharmacy() {
 
         const message = buildMessage(rxSetting.template || DEFAULT_TEMPLATES.prescription_ready, {
           patient_name: patientName,
-          hospital_name: hospitalName || 'RemedacareHMIS',
+          hospital_name: hospitalName || 'Brightpath Travel Scholars',
           drug_name: drugLabel,
         })
 
@@ -2577,3 +2577,4 @@ export default function Pharmacy() {
   </div>
   )
 }
+

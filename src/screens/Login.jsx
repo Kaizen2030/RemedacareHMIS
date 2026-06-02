@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import supabase from '../supabase'
 import { sendPatientNotification } from '../utils/notifications'
-import hmsLogo from '../../icon.png'
+import { getAuthConfirmRedirectUrl, getAuthResetRedirectUrl } from '../utils/authUrls'
+import hmsLogo from '../../icon.ico'
 
 const AUTH_GATE_KEY = 'remedacare:auth:gate'
 const KNOWN_USERS_KEY = 'remedacare:auth:known_users'
@@ -11,17 +12,17 @@ const REMEMBER_PREF_KEY = 'remedacare:auth:remember_device'
 const LOGIN_ATTEMPTS_KEY = 'remedacare:auth:login_attempts'
 const BRANDING_CACHE_KEY = 'remedacare:auth:branding'
 const DEFAULT_BRANDING = {
-  hospitalName: 'RemedacareHMS',
+  hospitalName: 'Brightpath Travel Scholars',
   logoBase64: hmsLogo,
   level: 'Kenya',
-  primaryColor: '#0F6E56',
+  primaryColor: '#5B21B6',
 }
 const MFA_WINDOW_MS = 5 * 60 * 1000
 const DEVICE_TRUST_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 const LOGIN_LOCK_WINDOW_MS = 15 * 60 * 1000
 const MAX_LOGIN_ATTEMPTS = 5
-const PASSWORD_RESET_REDIRECT_URL = 'remedacarehms://reset'
-const ACCOUNT_CONFIRM_REDIRECT_URL = 'https://www.pharmacourse.co.ke/activate/remedacarehmis'
+const PASSWORD_RESET_REDIRECT_URL = getAuthResetRedirectUrl()
+const ACCOUNT_CONFIRM_REDIRECT_URL = getAuthConfirmRedirectUrl()
 
 function isRlsError(error) {
   const message = error?.message?.toLowerCase() || ''
@@ -215,6 +216,39 @@ function getErrorMessage(err) {
   return 'Something went wrong. Please try again.'
 }
 
+function getAuthEmailErrorMessage(err, contextLabel) {
+  const message = getErrorMessage(err)
+  const lower = message.toLowerCase()
+  const status = Number(err?.status || err?.statusCode || 0)
+  const label = contextLabel || 'email'
+
+  if (status === 500) {
+    return `We could not send the ${label} email because Supabase returned a server error. Supabase said: ${message}. Check SMTP delivery, sender verification, and the redirect URL allowlist in Auth > URL Configuration.`
+  }
+
+  if (status === 400 && lower.includes('invalid refresh token')) {
+    return 'Your previous session is stale. Please sign out, reload the app, and sign in again.'
+  }
+
+  if (lower.includes('rate limit') || lower.includes('too many requests')) {
+    return `We could not send the ${label} email because Supabase is rate-limiting messages. Please wait a few minutes and try again.`
+  }
+
+  if (lower.includes('redirect') || lower.includes('allow list') || lower.includes('allowed')) {
+    return `We could not send the ${label} email because the redirect URL is not allowed in Supabase Auth. Add the Pharmcourse redirect URL in Auth > URL Configuration.`
+  }
+
+  if (lower.includes('smtp') || lower.includes('resend') || lower.includes('email provider') || lower.includes('mailer')) {
+    return `We could not send the ${label} email because the Supabase SMTP provider is not ready. Check the Resend SMTP settings and sender verification.`
+  }
+
+  if (lower.includes('confirmation') || lower.includes('recover') || lower.includes('reset')) {
+    return `We could not send the ${label} email. Check Supabase Auth email templates, SMTP, and redirect URLs.`
+  }
+
+  return message
+}
+
 async function getFriendlyLoginError(err, email) {
   const message = getErrorMessage(err)
   const lower = message.toLowerCase()
@@ -263,7 +297,7 @@ function getPasswordStrength(password = '') {
   if (!password) return { label: 'Enter a password', color: '#9CA3AF', score: 0 }
   if (score <= 2) return { label: 'Weak', color: '#DC2626', score }
   if (score === 3) return { label: 'Fair', color: '#D97706', score }
-  if (score === 4) return { label: 'Strong', color: '#0F6E56', score }
+  if (score === 4) return { label: 'Strong', color: '#5B21B6', score }
   return { label: 'Very strong', color: '#0B5F4B', score }
 }
 
@@ -435,7 +469,7 @@ async function logAuthAudit(action, details = {}, hospitalId = null) {
   }
 }
 
-export default function Login({ onLogin, isPasswordRecovery, onResetDone, branding }) {
+export default function Login({ onLogin, isPasswordRecovery, onResetDone, branding, activationMessage: activationNotice = '' }) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
@@ -476,6 +510,13 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
   }, [branding])
 
   useEffect(() => {
+    setActivationMessage(activationNotice || '')
+    if (activationNotice) {
+      setMode((current) => (current === 'reset' ? current : 'login'))
+    }
+  }, [activationNotice])
+
+  useEffect(() => {
     if (isPasswordRecovery) {
       setMode('reset')
       setNewPassword('')
@@ -513,25 +554,64 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
   useEffect(() => {
     if (typeof window === 'undefined') return
 
+    const isActivationLink = (urlObj) => {
+      const type = String(
+        urlObj.searchParams.get('type') ||
+        new URLSearchParams(urlObj.hash.replace(/^#/, '')).get('type') ||
+        '',
+      ).toLowerCase()
+      const host = String(urlObj.host || '').toLowerCase()
+      const pathname = String(urlObj.pathname || '').toLowerCase()
+      return (
+        type === 'signup' ||
+        type === 'invite' ||
+        type === 'confirmation' ||
+        host === 'activate' ||
+        pathname.includes('/activate')
+      )
+    }
+
+    const isRecoveryLink = (urlObj) => {
+      const type = String(
+        urlObj.searchParams.get('type') ||
+        new URLSearchParams(urlObj.hash.replace(/^#/, '')).get('type') ||
+        '',
+      ).toLowerCase()
+      const host = String(urlObj.host || '').toLowerCase()
+      const pathname = String(urlObj.pathname || '').toLowerCase()
+      return (
+        type === 'recovery' ||
+        host === 'reset' ||
+        pathname.includes('/reset')
+      )
+    }
+
     const checkDeepLink = async () => {
       if (window.electronAPI) {
         return window.electronAPI.onDeepLink(async (url) => {
           const urlObj = new URL(url)
-          const token = urlObj.searchParams.get('token')
-          const hash = urlObj.hash.replace(/^#/, '')
-          if (token || hash) {
+          if (isRecoveryLink(urlObj)) {
             setMode('reset')
             setError('')
+            return
+          }
+
+          if (isActivationLink(urlObj)) {
+            setMode('login')
+            setError('')
+            setActivationMessage('Your account has been activated. Sign in to open your Brightpath workspace.')
           }
         })
       }
 
-      const searchParams = new URLSearchParams(window.location.search)
-      const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''))
-      const hasToken = searchParams.has('token') || hashParams.has('access_token') || hashParams.has('token')
-      if (hasToken) {
+      const urlObj = new URL(window.location.href)
+      if (isRecoveryLink(urlObj)) {
         setMode('reset')
         setError('')
+      } else if (isActivationLink(urlObj)) {
+        setMode('login')
+        setError('')
+        setActivationMessage('Your account has been activated. Sign in to open your Brightpath workspace.')
       }
       return undefined
     }
@@ -918,9 +998,9 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
       if (err) throw err
 
       setResetSent(true)
-      window.notifyFromLegacyAlert('Password reset link sent to your email!')
+      window.notifyFromLegacyAlert('Password reset link sent to your Pharmcourse email!')
     } catch (e) {
-      setError(getErrorMessage(e))
+      setError(getAuthEmailErrorMessage(e, 'password reset'))
     }
     setLoading(false)
   }
@@ -947,7 +1027,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
 
       if (err) throw err
 
-      window.notifyFromLegacyAlert('Account created. Check your email to confirm, then sign in.')
+      window.notifyFromLegacyAlert('Account created. Check your Pharmcourse email to activate the app, then sign in.')
       setMode('login')
       setName('')
       setEmail('')
@@ -955,12 +1035,12 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
       setNewHospitalName('')
       setNewHospitalLocation('Kenya')
     } catch (e) {
-      setError(getErrorMessage(e))
+      setError(getAuthEmailErrorMessage(e, 'signup confirmation'))
     }
     setLoading(false)
   }
 
-  const brandAccent = displayBranding.primaryColor || '#0F6E56'
+  const brandAccent = displayBranding.primaryColor || '#5B21B6'
   const strengthForDisplay = mode === 'signup' ? getPasswordStrength(password) : getPasswordStrength(newPassword)
   const lockExpiresAt = getActiveLock(email)
 
@@ -975,7 +1055,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
             <div style={{ ...st.logoIcon, color: brandAccent }}>Hospital</div>
           )}
           <div style={st.hospitalBadge}>Kenya {displayBranding.level || 'Level Facility'}</div>
-          <h1 style={{ ...st.logoText, color: brandAccent }}>{displayBranding.hospitalName || 'RemedacareHMS'}</h1>
+          <h1 style={{ ...st.logoText, color: brandAccent }}>{displayBranding.hospitalName || 'Brightpath Travel Scholars'}</h1>
           <p style={st.logoSub}>Secure clinical sign-in and hospital workspace access</p>
         </div>
 
@@ -1095,6 +1175,12 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
 
         {mode === 'reset' && (
           <>
+            <div style={st.firstLoginBadge}>
+              Password reset session active
+            </div>
+            <p style={st.firstLoginNote}>
+              Set a new password below. If this screen looks blank or got skipped, close the app and open the latest reset email again so the recovery session stays active.
+            </p>
             <h3 style={st.sectionTitle}>Set New Password</h3>
             <div style={st.formGroup}>
               <label style={st.label}>New Password</label>
@@ -1135,12 +1221,38 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
             <button style={{ ...st.btnPrimary, background: brandAccent }} onClick={handleResetPassword} disabled={loading}>
               {loading ? 'Updating...' : 'Update Password'}
             </button>
+            <div style={st.secondaryActions}>
+              <button
+                type="button"
+                style={st.linkBtn}
+                onClick={() => {
+                  setNewPassword('')
+                  setConfirmPassword('')
+                  setShowResetPassword(false)
+                  setShowConfirmPassword(false)
+                  setError('')
+                }}
+              >
+                Clear Fields
+              </button>
+              <button
+                type="button"
+                style={st.linkBtn}
+                onClick={() => {
+                  setMode('login')
+                  setError('')
+                  onResetDone?.()
+                }}
+              >
+                Back to Login
+              </button>
+            </div>
           </>
         )}
 
         {mode === 'forgot' && (
           <>
-            <p style={st.note}>Enter your email address to receive a secure Supabase password reset link.</p>
+            <p style={st.note}>Enter your email address to receive a secure Pharmcourse password reset link.</p>
             <div style={st.formGroup}>
               <label style={st.label}>Email Address</label>
               <input
@@ -1153,7 +1265,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
               />
             </div>
             {resetSent ? (
-              <div style={st.successBox}>Reset link sent. Check your email for the secure magic link.</div>
+              <div style={st.successBox}>Reset link sent. Check your Pharmcourse inbox for the secure password reset email.</div>
             ) : (
               <button style={{ ...st.btnPrimary, background: brandAccent }} onClick={handleForgotPassword} disabled={loading}>
                 {loading ? 'Sending...' : 'Send Reset Link'}
@@ -1278,7 +1390,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
           </>
         )}
 
-        <p style={st.version}>RemedacareHMS v1.0 • Secure Hospital Management</p>
+        <p style={st.version}>Brightpath Travel Scholars v1.0.2 - Secure Hospital Management</p>
       </div>
     </div>
   )
@@ -1287,7 +1399,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
 const st = {
   page: {
     minHeight: '100vh',
-    background: 'linear-gradient(180deg, #F5FBF8 0%, #EEF3F1 100%)',
+    background: 'linear-gradient(180deg, #FFFFFF 0%, #FAF5FF 100%)',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -1313,8 +1425,8 @@ const st = {
     padding: '38px',
     width: '100%',
     maxWidth: '460px',
-    boxShadow: '0 24px 60px rgba(15,110,86,0.12)',
-    border: '1px solid #E6ECE8',
+    boxShadow: '0 24px 60px rgba(91,33,182,0.12)',
+    border: '1px solid #E9DDF7',
     position: 'relative',
     zIndex: 1,
   },
@@ -1325,7 +1437,7 @@ const st = {
     height: 76,
     borderRadius: 18,
     margin: '0 auto 10px',
-    background: '#EFF6F2',
+    background: '#F5F3FF',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -1334,8 +1446,8 @@ const st = {
   },
   hospitalBadge: {
     display: 'inline-block',
-    background: '#EFF6F2',
-    color: '#0F6E56',
+    background: '#F5F3FF',
+    color: '#5B21B6',
     padding: '6px 10px',
     borderRadius: 999,
     fontSize: 11,
@@ -1365,15 +1477,15 @@ const st = {
   tabActive: (accent) => ({
     background: '#fff',
     color: accent,
-    boxShadow: '0 2px 6px rgba(0,0,0,0.08)',
+    boxShadow: '0 2px 6px rgba(91,33,182,0.10)',
   }),
   infoBox: {
-    background: '#E6F8EE',
-    border: '1px solid #A0D9B8',
+    background: '#F3E8FF',
+    border: '1px solid #D8B4FE',
     borderRadius: '10px',
     padding: '10px 14px',
     fontSize: '12px',
-    color: '#0F6E56',
+    color: '#5B21B6',
     marginBottom: '14px',
   },
   warningBox: {
@@ -1395,12 +1507,12 @@ const st = {
     marginBottom: '14px',
   },
   successBox: {
-    background: '#E6F8EE',
-    border: '1px solid #A0D9B8',
+    background: '#F3E8FF',
+    border: '1px solid #D8B4FE',
     borderRadius: '10px',
     padding: '10px 14px',
     fontSize: '13px',
-    color: '#0F6E56',
+    color: '#5B21B6',
     marginBottom: '14px',
     textAlign: 'center',
   },
@@ -1459,7 +1571,7 @@ const st = {
     transform: 'translateY(-50%)',
     border: 'none',
     background: 'none',
-    color: '#0F6E56',
+    color: '#5B21B6',
     cursor: 'pointer',
     fontSize: '12px',
     padding: '2px 4px',
@@ -1493,7 +1605,7 @@ const st = {
   linkBtn: {
     border: 'none',
     background: 'transparent',
-    color: '#0F6E56',
+    color: '#5B21B6',
     cursor: 'pointer',
     fontSize: 12,
     fontWeight: 700,
@@ -1508,14 +1620,14 @@ const st = {
   strengthBar: {
     height: 7,
     borderRadius: 999,
-    background: '#0F6E56',
+    background: '#5B21B6',
     flexBasis: '70%',
     transition: 'width 180ms ease',
   },
   strengthText: {
     fontSize: 11,
     fontWeight: 700,
-    color: '#0F6E56',
+    color: '#5B21B6',
   },
   footerNote: {
     textAlign: 'center',

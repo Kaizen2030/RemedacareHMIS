@@ -1409,12 +1409,12 @@ async function handleSave() {
   if (!interp) return null
   const lower = interp.toLowerCase()
   if (lower.includes('abnormal') || lower.includes('positive')) return { bg: '#FCEBEB', color: '#A32D2D' }
-  if (lower.includes('normal') || lower.includes('negative')) return { bg: '#E1F5EE', color: '#0F6E56' }
+  if (lower.includes('normal') || lower.includes('negative')) return { bg: '#F3E8FF', color: '#5B21B6' }
   return { bg: '#FFF3DC', color: '#C07000' }
  }
 
  if (queueLoading && !selected) return (
-  <div style={s.loadWrap}><div style={s.spinner}></div><p style={{ color: '#0F6E56', marginTop: '12px' }}>Loading...</p></div>
+  <div style={s.loadWrap}><div style={s.spinner}></div><p style={{ color: '#5B21B6', marginTop: '12px' }}>Loading...</p></div>
  )
 
  return (
@@ -1462,7 +1462,7 @@ async function handleSave() {
            { label: selected.status || 'Doctor', bg: '#F0EAFC', color: '#7B5EA7' },
            ...(selected.priority === 'Emergency' ? [{ label: 'Emergency', bg: '#FCEBEB', color: '#A32D2D' }] : []),
           ]}
-         accentColor="#0F6E56"
+         accentColor="#5B21B6"
          background="#EAF6F1"
          >
           {lastLocalDraftAt && (
@@ -1534,7 +1534,7 @@ async function handleSave() {
              borderRadius: 10,
              border: '1px solid #CDE5DD',
              background: '#FFFFFF',
-             color: '#0F6E56',
+             color: '#5B21B6',
              fontSize: 12,
              fontWeight: 700,
              cursor: 'pointer',
@@ -1550,18 +1550,18 @@ async function handleSave() {
 
        {/* Lab results alert banner */}
        {hasLabResults && (
-        <div style={{ margin: '0 20px', marginTop: 12, background: 'linear-gradient(135deg, #E1F5EE, #D4EEE6)', border: '1.5px solid #9FE1CB', borderRadius: 10, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' }}
+        <div style={{ margin: '0 20px', marginTop: 12, background: 'linear-gradient(135deg, #F3E8FF, #D4EEE6)', border: '1.5px solid #D8B4FE', borderRadius: 10, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' }}
          onClick={() => setTab('labs')}>
          <span style={{ fontSize: 20 }}>🔬</span>
          <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 700, fontSize: 13, color: '#0F6E56' }}>
+          <div style={{ fontWeight: 700, fontSize: 13, color: '#5B21B6' }}>
            Lab Results Ready — {completedLabsThisVisit.length} test(s) completed
           </div>
           <div style={{ fontSize: 11, color: '#555', marginTop: 2 }}>
            {completedLabsThisVisit.map(l => l.test_type).join(', ')}
           </div>
          </div>
-         <span style={{ fontSize: 12, color: '#0F6E56', fontWeight: 600 }}>View →</span>
+         <span style={{ fontSize: 12, color: '#5B21B6', fontWeight: 600 }}>View →</span>
         </div>
        )}
 
@@ -1579,8 +1579,8 @@ async function handleSave() {
        {billingStatus && (
         <div style={{
          margin: '8px 20px 0',
-         background: billingStatus.ok ? '#E1F5EE' : '#FCEBEB',
-         border: `1px solid ${billingStatus.ok ? '#9FE1CB' : '#F09595'}`,
+         background: billingStatus.ok ? '#F3E8FF' : '#FCEBEB',
+         border: `1px solid ${billingStatus.ok ? '#D8B4FE' : '#F09595'}`,
          borderRadius: 10,
          padding: '8px 14px',
          display: 'flex',
@@ -1588,7 +1588,7 @@ async function handleSave() {
          gap: 10,
         }}>
          <span style={{ fontSize: 16 }}>{billingStatus.ok ? '🧾' : '⚠️'}</span>
-         <div style={{ fontSize: 12, color: billingStatus.ok ? '#0F6E56' : '#A32D2D', fontWeight: 600 }}>
+         <div style={{ fontSize: 12, color: billingStatus.ok ? '#5B21B6' : '#A32D2D', fontWeight: 600 }}>
           {billingStatus.ok ? 'Invoice created: ' : ''}{billingStatus.message}
          </div>
         </div>
@@ -1608,7 +1608,7 @@ async function handleSave() {
            <span style={{ ...s.pill, background: '#F0EAFC', color: '#7B5EA7', marginLeft: '6px', fontSize: '10px' }}>{prevConsultations.length}</span>
           )}
           {key === 'labs' && completedLabsThisVisit.length > 0 && (
-           <span style={{ ...s.pill, background: '#E1F5EE', color: '#0F6E56', marginLeft: '4px', fontSize: '10px' }}> {completedLabsThisVisit.length}</span>
+           <span style={{ ...s.pill, background: '#F3E8FF', color: '#5B21B6', marginLeft: '4px', fontSize: '10px' }}> {completedLabsThisVisit.length}</span>
           )}
          </button>
         ))}
@@ -1678,7 +1678,7 @@ async function handleSave() {
                <div style={{ fontWeight: '700', color: '#111', fontSize: '14px' }}>
                 {c.diagnosis || 'No diagnosis'}
                 {(c.icd10_code || c.icd_code) && (
-                  <span style={{ marginLeft: 8, color: '#0F6E56', fontSize: 12 }}>
+                  <span style={{ marginLeft: 8, color: '#5B21B6', fontSize: 12 }}>
                     {c.icd10_code || c.icd_code}
                   </span>
                 )}
@@ -1687,7 +1687,7 @@ async function handleSave() {
                 Dr. {c.doctor_name || '—'} • {c.speciality || '—'} • {c.created_at ? new Date(c.created_at).toLocaleDateString('en-KE') : '—'}
                </div>
               </div>
-              <span style={{ ...s.pill, background: '#E1F5EE', color: '#0F6E56', fontSize: '11px' }}>{c.disposition || '—'}</span>
+              <span style={{ ...s.pill, background: '#F3E8FF', color: '#5B21B6', fontSize: '11px' }}>{c.disposition || '—'}</span>
              </div>
              {c.presenting_complaint && <div style={s.historyRow}><span style={s.historyLabel}>Complaint</span><span>{c.presenting_complaint}</span></div>}
              {c.examination_findings && <div style={s.historyRow}><span style={s.historyLabel}>Findings</span><span>{c.examination_findings}</span></div>}
@@ -1740,7 +1740,7 @@ async function handleSave() {
            setRadiologyOrders={setRadiologyOrders}
            recentRadiologyReports={recentRadiologyReports}
            previousConsultations={prevConsultations.slice(0, 3)}
-           hospitalName={hospitalName || 'RemedacareHMIS'}
+           hospitalName={hospitalName || 'Brightpath Travel Scholars'}
            onOpenCarePathway={openCarePathwayFromConsultation}
            onOpenReferral={openReferralFromConsultation}
            getLabTestsForCategory={getLabTestsForCategory}
@@ -1773,27 +1773,27 @@ async function handleSave() {
  )
 }
 
-const AVATAR_COLORS = ['#E1F5EE', '#E3F0FB', '#F0EAFC', '#FFF3DC', '#FCEBEB', '#EAF3DE']
+const AVATAR_COLORS = ['#F3E8FF', '#E3F0FB', '#F0EAFC', '#FFF3DC', '#FCEBEB', '#EAF3DE']
 
 const s = {
  page: { padding: '20px 24px', flex: 1, overflowY: 'auto', background: '#f7f8f7', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', height: '100%', boxSizing: 'border-box' },
  loadWrap: { height: '80vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
- spinner: { width: '36px', height: '36px', border: '3px solid #e8ebe8', borderTop: '3px solid #0F6E56', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
+ spinner: { width: '36px', height: '36px', border: '3px solid #e8ebe8', borderTop: '3px solid #5B21B6', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
  layout: { display: 'flex', gap: '16px', height: 'calc(100vh - 80px)', minHeight: 0 },
  leftPanel: { width: '280px', flexShrink: 0, background: '#fff', borderRadius: '12px', border: '1px solid #eee', padding: '16px', overflowY: 'auto', display: 'flex', flexDirection: 'column' },
  panelHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' },
  panelTitle: { fontSize: '15px', fontWeight: '700', color: '#111' },
  panelSub: { fontSize: '12px', color: '#888', marginTop: '2px' },
- refreshBtn: { background: '#f0f2f0', border: 'none', borderRadius: '6px', padding: '6px 10px', cursor: 'pointer', fontSize: '14px', color: '#0F6E56', fontWeight: '700' },
+ refreshBtn: { background: '#f0f2f0', border: 'none', borderRadius: '6px', padding: '6px 10px', cursor: 'pointer', fontSize: '14px', color: '#5B21B6', fontWeight: '700' },
  rightPanel: { flex: 1, background: '#fff', borderRadius: '12px', border: '1px solid #eee', overflowY: 'auto', display: 'flex', flexDirection: 'column', minWidth: 0 },
  noSelection: { flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#bbb' },
  patHeader: { padding: '16px 20px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'flex-start', gap: '12px', background: '#fafafa', borderRadius: '12px 12px 0 0' },
  closePatBtn: { background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: '#aaa', padding: '4px', flexShrink: 0 },
  tabRow: { display: 'flex', gap: '0', borderBottom: '2px solid #f0f0f0', padding: '0 20px' },
  tabBtn: { padding: '12px 16px', border: 'none', background: 'none', cursor: 'pointer', fontSize: '13px', fontWeight: '500', color: '#888', borderBottom: '2px solid transparent', marginBottom: '-2px', display: 'flex', alignItems: 'center' },
- tabBtnActive: { color: '#0F6E56', fontWeight: '700', borderBottom: '2px solid #0F6E56' },
+ tabBtnActive: { color: '#5B21B6', fontWeight: '700', borderBottom: '2px solid #5B21B6' },
  consultBody: { padding: '20px', flex: 1, overflowY: 'auto' },
- sectionLabel: { fontSize: '11px', fontWeight: '700', color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: '12px', marginTop: '4px', paddingBottom: '6px', borderBottom: '1px solid #E1F5EE' },
+ sectionLabel: { fontSize: '11px', fontWeight: '700', color: '#5B21B6', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: '12px', marginTop: '4px', paddingBottom: '6px', borderBottom: '1px solid #F3E8FF' },
  formGrid2: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px' },
  formGroup: { marginBottom: '14px' },
  label: { fontSize: '12px', color: '#666', display: 'block', marginBottom: '5px', fontWeight: '500' },
@@ -1801,27 +1801,28 @@ const s = {
  vitalsGrid: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' },
  vitalCard: { background: '#f9fafb', borderRadius: '10px', padding: '14px', border: '1px solid #eee', textAlign: 'center' },
  vitalLabel: { fontSize: '12px', color: '#888', marginBottom: '6px' },
- vitalVal: { fontSize: '20px', fontWeight: '800', color: '#0F6E56' },
+ vitalVal: { fontSize: '20px', fontWeight: '800', color: '#5B21B6' },
  historyCard: { background: '#f9fafb', borderRadius: '10px', padding: '16px', border: '1px solid #eee', marginBottom: '12px' },
  historyRow: { fontSize: '13px', color: '#444', marginTop: '6px', display: 'flex', gap: '8px' },
  historyLabel: { fontWeight: '600', color: '#888', fontSize: '11px', textTransform: 'uppercase', minWidth: '70px', marginTop: '1px' },
  dispositionGrid: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', marginBottom: '16px' },
  dispOption: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', padding: '12px 8px', borderRadius: '10px', border: '2px solid #eee', cursor: 'pointer', textAlign: 'center', background: '#fafafa', transition: 'all 0.15s' },
- dispOptionActive: { border: '2px solid #0F6E56', background: '#E1F5EE' },
+ dispOptionActive: { border: '2px solid #5B21B6', background: '#F3E8FF' },
  rxRow: { background: '#f9fafb', borderRadius: '8px', padding: '14px', marginBottom: '10px', border: '1px solid #eee' },
- toggleBtn: { fontSize: '12px', padding: '4px 10px', border: '1px solid #0F6E56', borderRadius: '6px', background: '#fff', color: '#0F6E56', cursor: 'pointer', fontWeight: '600' },
- addRowBtn: { fontSize: '13px', padding: '8px 16px', border: '1px dashed #9FE1CB', borderRadius: '8px', background: '#f9fafb', color: '#0F6E56', cursor: 'pointer', fontWeight: '600', width: '100%', marginBottom: '8px' },
+ toggleBtn: { fontSize: '12px', padding: '4px 10px', border: '1px solid #5B21B6', borderRadius: '6px', background: '#fff', color: '#5B21B6', cursor: 'pointer', fontWeight: '600' },
+ addRowBtn: { fontSize: '13px', padding: '8px 16px', border: '1px dashed #D8B4FE', borderRadius: '8px', background: '#f9fafb', color: '#5B21B6', cursor: 'pointer', fontWeight: '600', width: '100%', marginBottom: '8px' },
  removeBtn: { fontSize: '12px', padding: '4px 10px', border: '1px solid #F09595', borderRadius: '6px', background: '#fff', color: '#A32D2D', cursor: 'pointer' },
  queueItem: { padding: '12px', borderRadius: '10px', border: '1px solid #f0f0f0', marginBottom: '8px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', transition: 'all 0.15s' },
- queueItemActive: { border: '2px solid #0F6E56', background: '#f0faf7' },
- avatar: { width: '36px', height: '36px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: '700', color: '#0F6E56' },
+ queueItemActive: { border: '2px solid #5B21B6', background: '#f0faf7' },
+ avatar: { width: '36px', height: '36px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: '700', color: '#5B21B6' },
  chip: { fontSize: '11px', padding: '4px 10px', borderRadius: '99px', border: '1px solid #e0e0e0', background: '#fff', cursor: 'pointer', fontWeight: '500', color: '#555' },
- chipActive: { background: '#0F6E56', color: '#fff', border: '1px solid #0F6E56' },
+ chipActive: { background: '#5B21B6', color: '#fff', border: '1px solid #5B21B6' },
  pill: { fontSize: '11px', fontWeight: '600', padding: '3px 8px', borderRadius: '99px' },
  viewLabel: { fontSize: '11px', color: '#667085', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 },
  viewVal: { fontSize: '13px', color: '#111827', fontWeight: 600 },
  emptyQueue: { textAlign: 'center', padding: '40px 0', color: '#ccc' },
  cancelBtn: { padding: '10px 20px', border: '1px solid #ddd', borderRadius: '8px', background: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '500', color: '#555' },
- submitBtn: { padding: '10px 24px', border: 'none', borderRadius: '8px', background: '#0F6E56', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' },
+ submitBtn: { padding: '10px 24px', border: 'none', borderRadius: '8px', background: '#5B21B6', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' },
 }
+
 

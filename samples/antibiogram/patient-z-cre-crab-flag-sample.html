@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CRE / CRAB Flag Test</title>
+  <style>
+    :root { --ink:#0f172a; --muted:#64748b; --line:#e5e7eb; --green:#16a34a; --amber:#d97706; --red:#dc2626; --blue:#2563eb; --bg:#f8fafc; --card:#fff; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial, Helvetica, sans-serif; }
+    .page { max-width:940px; margin:24px auto; background:var(--card); border:1px solid var(--line); border-radius:18px; overflow:hidden; }
+    .header { padding:26px 30px; background:linear-gradient(135deg, #0f6e56, #0b3b65); color:#fff; }
+    .eyebrow { font-size:12px; text-transform:uppercase; letter-spacing:1.6px; color:#c7f9e6; font-weight:700; margin-bottom:8px; }
+    h1 { margin:0 0 8px; font-size:30px; line-height:1.1; }
+    .header p { margin:0; font-size:13px; color:rgba(255,255,255,.8); }
+    .body { padding:26px 30px 32px; }
+    .summary { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; margin-bottom:20px; }
+    .chip { padding:12px 14px; border:1px solid var(--line); border-radius:14px; background:#fff; }
+    .label { font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:1px; margin-bottom:4px; }
+    .value { font-size:14px; font-weight:800; color:var(--ink); }
+    .block { border:1px solid var(--line); border-radius:16px; padding:18px; margin-bottom:16px; break-inside:avoid; page-break-inside:avoid; }
+    .block h2 { margin:0 0 6px; font-size:20px; color:#0f6e56; }
+    .meta { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:12px; margin-bottom:12px; }
+    .badges { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
+    .badge { padding:6px 10px; border-radius:999px; font-size:12px; font-weight:800; color:#fff; }
+    .badge.blue { background:var(--blue); }
+    .badge.amber { background:var(--amber); }
+    .badge.red { background:var(--red); }
+    .badge.green { background:var(--green); }
+    .note { border-left:4px solid var(--red); background:#fef2f2; padding:12px 14px; border-radius:10px; margin:10px 0 16px; color:#7f1d1d; font-weight:700; line-height:1.45; }
+    .note.small { border-left-color:var(--amber); background:#fffbeb; color:#92400e; }
+    .note small { display:block; font-weight:600; color:inherit; opacity:.9; margin-top:6px; }
+    table { width:100%; border-collapse:collapse; table-layout:fixed; }
+    th, td { border-top:1px solid var(--line); padding:10px 8px; font-size:13px; text-align:left; vertical-align:middle; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.9px; }
+    td.result { font-weight:800; text-align:center; width:140px; border-radius:999px; }
+    td.result.s { color:#166534; background:#dcfce7; }
+    td.result.i { color:#b45309; background:#fef3c7; }
+    td.result.r { color:#b91c1c; background:#fee2e2; }
+    td.result.review { color:#334155; background:#e2e8f0; }
+    .footer { margin-top:16px; font-size:11px; color:var(--muted); }
+    @media print { body { background:#fff; } .page { margin:0; border:none; border-radius:0; } .block { break-inside:avoid; page-break-inside:avoid; } }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div class="eyebrow">AntibiogramNet Sample</div>
+      <h1>CRE / CRAB Flag Test</h1>
+      <p>Fresh single-patient PDF for testing resistance flags, notes, and Telegram alert formatting.</p>
+    </div>
+    <div class="body">
+      <div class="summary">
+        <div class="chip"><div class="label">Hospital</div><div class="value">Aga Khan University Hospital (AKUH)</div></div>
+        <div class="chip"><div class="label">Patient</div><div class="value">IP:AKUH-2026-022118</div></div>
+        <div class="chip"><div class="label">Organism</div><div class="value">Acinetobacter baumannii</div></div>
+        <div class="chip"><div class="label">Confidence</div><div class="value">High</div></div>
+      </div>
+      <div class="block">
+        <h2>Patient Z - Acinetobacter baumannii</h2>
+        <div class="meta"><span>Tracheal Aspirate</span><span>30 March 2026</span><span>Respiratory ICU</span><span>Heavy</span><span>Gram negative bacilli</span></div>
+        <div class="badges"><span class="badge amber">CRE / CRAB</span><span class="badge blue">Carbapenem non-susceptible</span></div>
+        <div class="note small">Carbapenem resistance detected. Possible CRE/CRAB/CRPA. Escalate immediately. Contact infection control.<small>Lab comment: carbapenem non-susceptibility plus broad beta-lactam resistance suggests a high-risk resistant isolate.</small></div>
+        <table>
+          <thead><tr><th>Antibiotic</th><th>Result</th><th>Comment</th></tr></thead>
+          <tbody>
+            <tr><td>Amikacin</td><td class="result r">R 24%</td><td>Aminoglycoside resistant</td></tr>
+            <tr><td>Aztreonam</td><td class="result review">REVIEW</td><td>Confirm susceptibility</td></tr>
+            <tr><td>Cefepime</td><td class="result r">R >32</td><td>Beta-lactam resistant</td></tr>
+            <tr><td>Ceftazidime</td><td class="result r">R >32</td><td>Beta-lactam resistant</td></tr>
+            <tr><td>Ciprofloxacin</td><td class="result r">R >4</td><td>Fluoroquinolone resistant</td></tr>
+            <tr><td>Colistin</td><td class="result s">S 1%</td><td>Last-line option</td></tr>
+            <tr><td>Fosfomycin</td><td class="result review">REVIEW</td><td>Interpret with caution</td></tr>
+            <tr><td>Gentamicin</td><td class="result r">R >16</td><td>Aminoglycoside resistant</td></tr>
+            <tr><td>Imipenem</td><td class="result r">R >8</td><td>Carbapenem resistant</td></tr>
+            <tr><td>Meropenem</td><td class="result r">R >8</td><td>Carbapenem resistant</td></tr>
+            <tr><td>Tigecycline</td><td class="result r">R >8</td><td>Not preferred</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="footer">Generated sample for Brightpath Travel Scholars testing only. Upload the PDF to test VITEK parsing, flag detection, notes, and Telegram notifications.</div>
+    </div>
+  </div>
+</body>
+</html>

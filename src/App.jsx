@@ -25,6 +25,7 @@ import { openPrintPreview, printTemplates } from './utils/printSystem'
 import { buildBilingualWhatsAppMessage, generateWhatsAppLink } from './utils/whatsapp'
 import { registerPwaServiceWorker } from './utils/pwa'
 import { applyThemeMode, colors, getStoredThemeMode, THEME_MODES, typography } from './theme'
+import hmsLogo from '../icon.ico'
 
 const Patients = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Patients'))
 const Appointments = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Appointments'))
@@ -130,6 +131,7 @@ const SCREEN_PATHS = {
   reports: '/reports',
   settings: '/settings',
 }
+const HMS_LOGO_SRC = hmsLogo
 
 const OFFLINE_RESTRICTED_PATHS = ['/billing', '/credit', '/mpesa', '/sha-claims', '/insurance', '/etims']
 const SEARCH_CATEGORY_ICONS = {
@@ -350,6 +352,7 @@ function AppShell() {
   } = useAuth({ onSignedOut: handleSignedOut })
 
   const [deepLinkRecovery, setDeepLinkRecovery] = useState(false)
+  const [deepLinkActivation, setDeepLinkActivation] = useState('')
   const [idleWarning, setIdleWarning] = useState(null)
   const [themeMode, setThemeMode] = useState(() => getStoredThemeMode())
   const [zoomFactor, setZoomFactor] = useState(DEFAULT_ZOOM_FACTOR)
@@ -379,10 +382,13 @@ function AppShell() {
   const zoomPercentLabel = `${Math.round((zoomFactor || DEFAULT_ZOOM_FACTOR) * 100)}%`
   const canZoomOut = zoomFactor > MIN_ZOOM_FACTOR + 0.001
   const canZoomIn = zoomFactor < MAX_ZOOM_FACTOR - 0.001
+  const recoveryMode = isPasswordRecovery || deepLinkRecovery
+  const activationMode = Boolean(deepLinkActivation)
 
   const handleResetDone = useCallback(() => {
     resetPasswordRecovery()
     setDeepLinkRecovery(false)
+    setDeepLinkActivation('')
   }, [resetPasswordRecovery])
 
   const runZoomAction = useCallback(async (actionName) => {
@@ -560,73 +566,86 @@ function AppShell() {
 
       console.log('Deep link received:', url)
 
-      const hash = url.includes('#') ? url.split('#')[1] || '' : ''
-      const query = url.includes('?') ? url.split('?')[1]?.split('#')[0] || '' : ''
-      const params = new URLSearchParams(hash || query)
-      const type = params.get('type')
+      const urlObj = new URL(url)
+      const hashParams = new URLSearchParams(urlObj.hash.replace(/^#/, ''))
+      const queryParams = new URLSearchParams(urlObj.search.replace(/^\?/, ''))
+      const params = new URLSearchParams()
+      hashParams.forEach((value, key) => params.set(key, value))
+      queryParams.forEach((value, key) => params.set(key, value))
+
+      const type = String(params.get('type') || '').toLowerCase()
+      const host = String(urlObj.host || '').toLowerCase()
+      const pathname = String(urlObj.pathname || '').toLowerCase()
       const accessToken = params.get('access_token')
       const refreshToken = params.get('refresh_token')
       const code = params.get('code')
 
-      if (type === 'recovery') {
-        try {
-          let sessionRestored = false
+      const isRecoveryLink = type === 'recovery' || host === 'reset' || pathname.includes('/reset')
+      const isActivationLink = type === 'signup' || type === 'invite' || type === 'confirmation' || host === 'activate' || pathname.includes('/activate')
 
-          if (accessToken && refreshToken) {
-            const { error } = await supabase.auth.setSession({
-              access_token: accessToken,
-              refresh_token: refreshToken,
-            })
+      if (!isRecoveryLink && !isActivationLink) {
+        return
+      }
 
-            if (error) {
-              console.error('Session restore failed:', error)
-            } else {
-              console.log('Recovery session restored successfully')
-              sessionRestored = true
-            }
-          } else if (code) {
+      try {
+        let sessionRestored = false
+
+        if (accessToken && refreshToken) {
+          const { error } = await supabase.auth.setSession({
+            access_token: accessToken,
+            refresh_token: refreshToken,
+          })
+
+          if (error) {
+            console.error('Session restore failed:', error)
+          } else {
+            console.log('Auth session restored successfully')
+            sessionRestored = true
+          }
+        } else if (code) {
+          const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(code)
+          if (exchangeError) {
+            console.error('Code exchange failed:', exchangeError)
+          } else {
+            console.log('Auth session restored from code successfully')
+            sessionRestored = true
+          }
+        } else {
+          console.warn('Missing auth credentials in deep link URL')
+        }
+
+        if (active) {
+          if (isRecoveryLink) {
+            setDeepLinkRecovery(true)
+            setDeepLinkActivation('')
+          } else if (isActivationLink) {
+            setDeepLinkActivation(
+              sessionRestored
+                ? 'Your account has been activated. You can sign in to open your Brightpath workspace.'
+                : 'Your account activation link opened in the app. Please sign in to continue.',
+            )
+            setDeepLinkRecovery(false)
+          }
+        }
+      } catch (e) {
+        console.error('Deep link session error:', e)
+        if (code) {
+          try {
             const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(code)
             if (exchangeError) {
-              console.error('Code exchange failed:', exchangeError)
-            } else {
-              console.log('Recovery session restored from code successfully')
-              sessionRestored = true
+              console.error('Fallback code exchange failed:', exchangeError)
             }
-          } else {
-            console.warn('Missing recovery credentials in deep link URL')
+          } catch (exchangeError) {
+            console.error('Fallback code exchange threw:', exchangeError)
           }
-
-          if (active) {
+        }
+        if (active) {
+          if (isRecoveryLink) {
             setDeepLinkRecovery(true)
-          }
-
-          if (sessionRestored) {
-            setTimeout(() => {
-              if (active) {
-                window.location.reload()
-              }
-            }, 100)
-          }
-        } catch (e) {
-          console.error('Deep link session error:', e)
-          if (code) {
-            try {
-              const { error: exchangeError } = await supabase.auth.exchangeCodeForSession(code)
-              if (exchangeError) {
-                console.error('Fallback code exchange failed:', exchangeError)
-              } else if (active) {
-                setTimeout(() => {
-                  if (active) {
-                    window.location.reload()
-                  }
-                }, 100)
-              }
-            } catch (exchangeError) {
-              console.error('Fallback code exchange threw:', exchangeError)
-            }
-          }
-          if (active) {
-            setDeepLinkRecovery(true)
+            setDeepLinkActivation('')
+          } else if (isActivationLink) {
+            setDeepLinkActivation('Your account activation link is open. Please sign in to continue.')
+            setDeepLinkRecovery(false)
           }
         }
       }
@@ -664,7 +683,7 @@ function AppShell() {
 
   useEffect(() => {
     if (!effectiveHospitalId) {
-      setHospitalProfile((previous) => ({ ...previous, name: effectiveHospitalName || loginBranding?.hospitalName || 'RemedacareHMIS' }))
+      setHospitalProfile((previous) => ({ ...previous, name: effectiveHospitalName || loginBranding?.hospitalName || 'Brightpath Travel Scholars' }))
       return
     }
 
@@ -679,7 +698,7 @@ function AppShell() {
       if (!active) return
       const brandingConfig = data?.branding_config || {}
       setHospitalProfile({
-        name: brandingConfig?.hospital_name || effectiveHospitalName || loginBranding?.hospitalName || 'RemedacareHMIS',
+        name: brandingConfig?.hospital_name || effectiveHospitalName || loginBranding?.hospitalName || 'Brightpath Travel Scholars',
         logoBase64: brandingConfig?.logo_data_url || brandingConfig?.logo_base64 || '',
         address: brandingConfig?.physical_address || '',
         phone: brandingConfig?.phone || '',
@@ -1002,11 +1021,23 @@ function AppShell() {
   ])
 
   if (checkingAuth) {
+    if (recoveryMode || activationMode) {
+      return (
+        <Login
+          onLogin={handleLogin}
+          isPasswordRecovery={recoveryMode}
+          activationMessage={deepLinkActivation}
+          onResetDone={handleResetDone}
+          branding={loginBranding}
+        />
+      )
+    }
+
     return (
       <div style={styles.fullscreen}>
         <div style={{ width: '220px' }}>
           <SkeletonLoader rows={3} height={14} width={['40%', '100%', '70%']} />
-          <p style={{ color: colors.sub, fontSize: '13px' }}>Loading RemedacareHMIS...</p>
+          <p style={{ color: colors.sub, fontSize: '13px' }}>Loading Brightpath Travel Scholars...</p>
         </div>
       </div>
     )
@@ -1016,7 +1047,8 @@ function AppShell() {
     return (
       <Login
         onLogin={handleLogin}
-        isPasswordRecovery={isPasswordRecovery || deepLinkRecovery}
+        isPasswordRecovery={recoveryMode}
+        activationMessage={deepLinkActivation}
         onResetDone={handleResetDone}
         branding={loginBranding}
       />
@@ -1044,7 +1076,7 @@ function AppShell() {
       <div style={styles.container}>
         <aside style={styles.sidebar}>
           <div style={styles.logoArea}>
-            <div style={styles.avatar}>RC</div>
+            <img src={hospitalProfile.logoBase64 || loginBranding?.logoBase64 || HMS_LOGO_SRC} alt="Brightpath Travel Scholars logo" style={styles.brandLogo} />
             <div style={{ minWidth: 0 }}>
               <p style={styles.logoText}>REMEDACARE HMS</p>
               <p style={styles.logoSub}>{effectiveHospitalName || 'Hospital workspace'}</p>
@@ -1461,6 +1493,12 @@ const styles = {
     display: 'flex',
     alignItems: 'center',
     gap: '10px',
+  },
+  brandLogo: {
+    width: '34px',
+    height: '34px',
+    objectFit: 'contain',
+    flexShrink: 0,
   },
   logoText: { fontSize: '14px', fontWeight: '700', margin: 0, letterSpacing: '0.3px' },
   logoSub: {
@@ -2008,3 +2046,4 @@ const styles = {
     fontSize: '13px',
   },
 }
+

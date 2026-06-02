@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import SkeletonLoader from '../components/SkeletonLoader'
 import supabase from '../supabase'
 import { useHospital } from '../context'
@@ -6,6 +6,7 @@ import { executeWithFallback, omitKeys } from '../utils/dbCompat'
 import { extractGeminiText, generateGeminiContent } from '../utils/geminiProxy'
 import { broadcastWorkflowChanged } from '../utils/workflowEvents'
 import { colors as C, typography } from '../theme'
+import { Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip, XAxis, YAxis } from 'recharts'
 
 /* ═══════════════════════════════════════════════════════════════════════════
  DESIGN TOKENS — matches MPesa / SHAClaims design system exactly
@@ -66,6 +67,14 @@ const css = {
   aiBox: { background:'#F5F3FF', border:`1px solid #DDD6FE`, borderRadius:'8px', padding:'12px', marginBottom:'12px' },
   aiLabel: { fontSize:'10px', fontWeight:700, color:C.purple, textTransform:'uppercase', letterSpacing:'.6px', marginBottom:'6px' },
   infoRow: { display:'flex', justifyContent:'space-between', padding:'9px 0', borderBottom:`1px solid ${C.border}`, fontSize:'13px' },
+  cardPad: { background:C.surface, border:`1px solid ${C.border}`, borderRadius:'12px', padding:'16px 18px', marginBottom:'16px' },
+  kpiGrid: { display:'grid', gridTemplateColumns:'repeat(3,minmax(0,1fr))', gap:'12px', marginBottom:'16px' },
+  chartWrap: { height:'280px' },
+  split: { display:'grid', gridTemplateColumns:'1.05fr .95fr', gap:'16px', marginBottom:'16px' },
+  uploadList: { display:'grid', gap:'8px', marginTop:'8px' },
+  uploadItem: { display:'flex', justifyContent:'space-between', alignItems:'center', gap:'10px', padding:'8px 10px', border:`1px solid ${C.border}`, borderRadius:'8px', background:'#FAFBFD', fontSize:'12px' },
+  checklistRow: { display:'flex', alignItems:'flex-start', gap:'10px', padding:'10px 12px', border:`1px solid ${C.border}`, borderRadius:'8px', background:'#FAFBFD' },
+  mono: { fontFamily:'monospace', fontSize:'12px' },
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -120,6 +129,35 @@ const INSURER_RULES = {
   'ICEA LION': { requiresICD10:true, requiresAuth:true, authWindowDays:30, outpatientCap:8000, note:'Strict ICD-10 and auth. Rejections common for wrong codes.' },
   'Other': { requiresICD10:false, requiresAuth:false, authWindowDays:null, outpatientCap:null, note:'Verify requirements directly with insurer.' },
 }
+
+const DEFAULT_DOCUMENT_REQUIREMENTS = {
+  'Jubilee Health Insurance': ['Claim form', 'Original receipts', 'Discharge summary'],
+  'AAR Insurance': ['Pre-auth letter', 'Itemized bill', 'Clinical notes'],
+  'CIC Insurance': ['Claim form', 'Itemized invoice'],
+  'Britam Health': ['Pre-auth letter', 'Clinical notes', 'Discharge summary'],
+}
+
+const DEFAULT_TARIFF_GUIDE = {
+  'AAR Insurance': {
+    'Outpatient Consultation': { rate: 1800, covered: true, plan: 'Corporate' },
+    'Laboratory Tests': { rate: 3500, covered: true, plan: 'Corporate' },
+    'Radiology / Imaging': { rate: 5000, covered: true, plan: 'Corporate' },
+    'Annual Check-up': { rate: 0, covered: false, plan: 'Corporate' },
+  },
+  'Jubilee Health Insurance': {
+    'Outpatient Consultation': { rate: 2000, covered: true, plan: 'Premier' },
+    'Inpatient Admission': { rate: 12000, covered: true, plan: 'Premier' },
+    'Maternity / Delivery': { rate: 40000, covered: true, plan: 'Premier' },
+  },
+}
+
+const DEFAULT_DRG_MAP = {
+  maternity: ['Maternity / Delivery', 'Laboratory Tests', 'Pharmacy / Drugs', 'Accommodation'],
+  surgery: ['Surgical Procedure', 'Laboratory Tests', 'Radiology / Imaging', 'Pharmacy / Drugs', 'Accommodation'],
+  medical: ['Inpatient Admission', 'Laboratory Tests', 'Pharmacy / Drugs', 'Accommodation'],
+}
+
+const CHART_COLORS = ['#2563EB', '#16A34A', '#D97706', '#DC2626', '#7C3AED', '#475569', '#0F766E']
 
 /* ═══════════════════════════════════════════════════════════════════════════
  HELPERS
@@ -186,19 +224,79 @@ function parseClaimNotes(notes) {
   }
 }
 
-function buildClaimNotes(meta = {}) {
-  return JSON.stringify({
+function normalizeClaimMeta(meta = {}) {
+  return {
     source: meta.source || 'Manual',
     invoice_ref: meta.invoice_ref || '',
     invoice_id: meta.invoice_id || null,
     patient_id: meta.patient_id || null,
     visit_id: meta.visit_id || null,
     notes: meta.notes || '',
-  })
+    plan_name: meta.plan_name || '',
+    preauth_status: meta.preauth_status || '',
+    preauth_expiry_date: meta.preauth_expiry_date || '',
+    required_documents: Array.isArray(meta.required_documents) ? meta.required_documents : [],
+    submitted_documents: Array.isArray(meta.submitted_documents) ? meta.submitted_documents : [],
+    tariff_rate: Number(meta.tariff_rate || 0),
+    tariff_covered: meta.tariff_covered !== false,
+    tariff_plan: meta.tariff_plan || '',
+    bundled_invoice_ids: Array.isArray(meta.bundled_invoice_ids) ? meta.bundled_invoice_ids : [],
+    bundled_line_items: Array.isArray(meta.bundled_line_items) ? meta.bundled_line_items : [],
+    drg_group: meta.drg_group || '',
+    payment_received_at: meta.payment_received_at || '',
+    remittance_ref: meta.remittance_ref || '',
+    remittance_status: meta.remittance_status || '',
+    paid_amount: Number(meta.paid_amount || 0),
+  }
+}
+
+function buildClaimNotes(meta = {}) {
+  return JSON.stringify(normalizeClaimMeta(meta))
 }
 
 function genClaimNo() {
   return 'CLM-' + Date.now().toString(36).toUpperCase().slice(-6)
+}
+
+function normalizeInsuranceConfig(raw = {}) {
+  return {
+    preauthRules: raw.preauthRules && typeof raw.preauthRules === 'object' ? raw.preauthRules : {},
+    tariffGuide: raw.tariffGuide && typeof raw.tariffGuide === 'object' ? raw.tariffGuide : DEFAULT_TARIFF_GUIDE,
+    documentRequirements: raw.documentRequirements && typeof raw.documentRequirements === 'object' ? raw.documentRequirements : DEFAULT_DOCUMENT_REQUIREMENTS,
+    drgGrouping: raw.drgGrouping && typeof raw.drgGrouping === 'object' ? raw.drgGrouping : DEFAULT_DRG_MAP,
+  }
+}
+
+function safeDate(value) {
+  const date = new Date(value || 0)
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+function diffDays(from, to = new Date()) {
+  const left = safeDate(from)
+  const right = safeDate(to)
+  if (!left || !right) return null
+  return Math.max(0, Math.floor((right.getTime() - left.getTime()) / 86400000))
+}
+
+function getRateColor(rate) {
+  if (rate > 80) return C.primary
+  if (rate >= 60) return C.warn
+  return C.danger
+}
+
+function getRateBadge(rate) {
+  return {
+    bg: rate > 80 ? C.primaryL : rate >= 60 ? C.warnL : C.dangerL,
+    color: getRateColor(rate),
+  }
+}
+
+function getAgingBucket(days) {
+  if (days <= 30) return '0-30 days'
+  if (days <= 60) return '31-60 days'
+  if (days <= 90) return '61-90 days'
+  return '>90 days'
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -272,7 +370,7 @@ function exportInsurerPDF(rows, insurer) {
       </tr>`).join('')}</tbody>
     </table>
     <div class="total">TOTAL CLAIMED: KES ${total.toLocaleString()}</div>
-    <div class="footer">This statement was generated by CliniqBot · Remedacare Hospital System</div>
+    <div class="footer">This statement was generated by CliniqBot · Brightpath Travel Scholars</div>
   </body></html>`
   const w = window.open('','_blank')
   w.document.write(html)
@@ -332,6 +430,16 @@ export default function InsuranceClaims() {
   const [showDetail, setShowDetail] = useState(null)
   const [showPatientLedger, setShowPatientLedger] = useState(null)
   const [showPreAuthTracker, setShowPreAuthTracker] = useState(false)
+  const [showChecklistModal, setShowChecklistModal] = useState(null)
+  const [showConfigModal, setShowConfigModal] = useState(false)
+  const [showCollectionsModal, setShowCollectionsModal] = useState(null)
+  const [reconciliationReport, setReconciliationReport] = useState(null)
+  const [insuranceConfig, setInsuranceConfig] = useState(normalizeInsuranceConfig())
+  const [configSaving, setConfigSaving] = useState(false)
+  const [tariffUploadInsurer, setTariffUploadInsurer] = useState(INSURERS[0])
+  const [remittanceImporting, setRemittanceImporting] = useState(false)
+  const remittanceInputRef = useRef(null)
+  const tariffInputRef = useRef(null)
 
   // Form
   const [form, setForm] = useState(emptyForm)
@@ -350,18 +458,20 @@ export default function InsuranceClaims() {
     setLoading(true)
     const start = (claimPage - 1) * claimPageSize
     const end = claimPage * claimPageSize - 1
-    const [claimsRes, invRes] = await Promise.all([
+    const [claimsRes, invRes, settingsRes] = await Promise.all([
       supabase.from('insurance_claims').select('*', { count: 'exact' })
         .eq('hospital_id', hospitalId)
         .order('submitted_at', { ascending:false })
         .range(start, end),
       supabase.from('invoices').select('*').eq('hospital_id', hospitalId)
         .not('insurer', 'is', null).neq('insurer', '')
-        .order('created_at', { ascending:false })
+        .order('created_at', { ascending:false }),
+      supabase.from('hospital_settings').select('insurance_config').eq('hospital_id', hospitalId).maybeSingle(),
     ])
     setRecords(claimsRes.data || [])
     setClaimTotalCount(claimsRes.count || 0)
     setInvoices(invRes.data || [])
+    setInsuranceConfig(normalizeInsuranceConfig(settingsRes.data?.insurance_config || {}))
     setLoading(false)
   }
 
@@ -373,6 +483,7 @@ export default function InsuranceClaims() {
     }
     setSaving(true)
     const rule = INSURER_RULES[f.insurer] || {}
+    const tariffEntry = getTariffEntry(f.insurer, f.service)
     if (rule.requiresICD10 && !f.icd10_code) {
       if (!await window.openConfirmDialog(`${f.insurer} requires an ICD-10 code. Save anyway?`)) {
         setSaving(false); return
@@ -395,7 +506,7 @@ export default function InsuranceClaims() {
       service: f.service,
       icd10_code: f.icd10_code.trim().toUpperCase(),
       auth_code: f.auth_code.trim().toUpperCase(),
-      amount_kes: parseFloat(f.amount_kes),
+      amount_kes: tariffEntry?.rate || parseFloat(f.amount_kes),
       status: finalStatus,
       submitted_at: new Date().toISOString(),
       notes: buildClaimNotes({
@@ -405,6 +516,11 @@ export default function InsuranceClaims() {
         patient_id: f.patient_id || null,
         visit_id: f.visit_id || null,
         notes: f.notes,
+        tariff_rate: tariffEntry?.rate || 0,
+        tariff_plan: tariffEntry?.plan || '',
+        tariff_covered: tariffEntry?.covered !== false,
+        required_documents: getRequiredDocuments(f.insurer),
+        plan_name: tariffEntry?.plan || '',
       }),
     }
 
@@ -426,6 +542,8 @@ export default function InsuranceClaims() {
     setSaving(true)
     const existing = records.find(r => getInvoiceId(r) === inv.id || getInvoiceRef(r) === inv.invoice_no)
     if (existing) { window.notifyFromLegacyAlert('This invoice is already imported.'); setSaving(false); return }
+    const serviceText = parseServicesField(inv.services) || 'Pharmacy / Drugs'
+    const tariffEntry = getTariffEntry(inv.insurer, serviceText)
     const payload = {
       hospital_id: hospitalId,
       claim_no: genClaimNo(),
@@ -435,10 +553,10 @@ export default function InsuranceClaims() {
       invoice_id: inv.id || null,
       insurer: inv.insurer,
       member_no: inv.sha_member_no || '',
-      service: parseServicesField(inv.services) || 'Pharmacy / Drugs',
+      service: serviceText,
       icd10_code: '',
       auth_code: '',
-      amount_kes: parseFloat(inv.amount_kes || 0),
+      amount_kes: tariffEntry?.rate || parseFloat(inv.amount_kes || 0),
       status: 'Pending',
       submitted_at: new Date().toISOString(),
       notes: buildClaimNotes({
@@ -448,6 +566,10 @@ export default function InsuranceClaims() {
         patient_id: inv.patient_id || null,
         visit_id: inv.visit_id || null,
         notes: inv.notes || '',
+        tariff_rate: tariffEntry?.rate || 0,
+        tariff_plan: tariffEntry?.plan || '',
+        tariff_covered: tariffEntry?.covered !== false,
+        required_documents: getRequiredDocuments(inv.insurer),
       }),
     }
     const { error } = await executeWithFallback(
@@ -467,7 +589,10 @@ export default function InsuranceClaims() {
       return
     }
     setSaving(true)
-    const inserts = unimported.map(inv => ({
+    const inserts = unimported.map(inv => {
+      const serviceText = parseServicesField(inv.services) || 'Pharmacy / Drugs'
+      const tariffEntry = getTariffEntry(inv.insurer, serviceText)
+      return ({
       hospital_id: hospitalId,
       claim_no: genClaimNo(),
       patient_name: inv.patient_name,
@@ -476,10 +601,10 @@ export default function InsuranceClaims() {
       invoice_id: inv.id || null,
       insurer: inv.insurer,
       member_no: inv.sha_member_no || '',
-      service: parseServicesField(inv.services) || 'Pharmacy / Drugs',
+      service: serviceText,
       icd10_code: '',
       auth_code: '',
-      amount_kes: parseFloat(inv.amount_kes || 0),
+      amount_kes: tariffEntry?.rate || parseFloat(inv.amount_kes || 0),
       status: 'Pending',
       submitted_at: new Date().toISOString(),
       notes: buildClaimNotes({
@@ -488,8 +613,12 @@ export default function InsuranceClaims() {
         invoice_id: inv.id || null,
         patient_id: inv.patient_id || null,
         visit_id: inv.visit_id || null,
+        tariff_rate: tariffEntry?.rate || 0,
+        tariff_plan: tariffEntry?.plan || '',
+        tariff_covered: tariffEntry?.covered !== false,
+        required_documents: getRequiredDocuments(inv.insurer),
       }),
-    }))
+    })})
     const fallbackInserts = inserts.map(payload => omitKeys(payload, ['patient_id', 'visit_id', 'invoice_id']))
     const { error } = await executeWithFallback(
       () => supabase.from('insurance_claims').insert(inserts),
@@ -507,14 +636,25 @@ export default function InsuranceClaims() {
       window.notifyFromLegacyAlert('Only Admin users can approve, pay, or reject insurance claims.')
       return
     }
+    const claim = records.find(r => r.id === id) || showDetail
+    if (claim && status === 'Submitted') {
+      await openSubmissionChecklist(claim)
+      return
+    }
     setSaving(true)
-    const { error } = await supabase.from('insurance_claims').update({ status }).eq('id', id)
+    const meta = claim ? getClaimMeta(claim) : normalizeClaimMeta()
+    const { error } = await supabase.from('insurance_claims').update({
+      status,
+      notes: buildClaimNotes({
+        ...meta,
+        payment_received_at: status === 'Paid' ? new Date().toISOString() : meta.payment_received_at,
+      }),
+    }).eq('id', id)
     if (error) {
       window.notifyFromLegacyAlert('Error updating claim: ' + error.message)
       setSaving(false)
       return
     }
-    const claim = records.find(r => r.id === id) || showDetail
     if (claim && status === 'Paid') {
       const invoiceId = getInvoiceId(claim)
       const invoiceRef = getInvoiceRef(claim)
@@ -557,22 +697,220 @@ export default function InsuranceClaims() {
 
   /* ── Source helper ─────────────────────────────────────────────────────── */
   function getSource(r) {
-    const meta = parseClaimNotes(r.notes)
+    const meta = normalizeClaimMeta(parseClaimNotes(r.notes))
     if (meta.source) return meta.source
     return String(r.notes || '').includes('Imported from Billing') ? 'Billing' : 'Manual'
   }
+  function getClaimMeta(r) {
+    return normalizeClaimMeta(parseClaimNotes(r?.notes))
+  }
   function getInvoiceRef(r) {
-    const meta = parseClaimNotes(r.notes)
+    const meta = getClaimMeta(r)
     return meta.invoice_ref || r.invoice_ref || String(r.notes || '').match(/Invoice (INV-\d+)/)?.[1] || ''
   }
   function getInvoiceId(r) {
-    return r.invoice_id || parseClaimNotes(r.notes).invoice_id || ''
+    return r.invoice_id || getClaimMeta(r).invoice_id || ''
   }
   function getPatientId(r) {
-    return r.patient_id || parseClaimNotes(r.notes).patient_id || ''
+    return r.patient_id || getClaimMeta(r).patient_id || ''
   }
   function getVisitId(r) {
-    return r.visit_id || parseClaimNotes(r.notes).visit_id || ''
+    return r.visit_id || getClaimMeta(r).visit_id || ''
+  }
+
+  function getPreauthRule(insurer) {
+    return insuranceConfig.preauthRules[insurer] || INSURER_RULES[insurer] || INSURER_RULES.Other
+  }
+
+  function getTariffEntry(insurer, service) {
+    return insuranceConfig.tariffGuide?.[insurer]?.[service] || null
+  }
+
+  function getRequiredDocuments(insurer) {
+    return insuranceConfig.documentRequirements?.[insurer] || DEFAULT_DOCUMENT_REQUIREMENTS[insurer] || ['Claim form', 'Itemized bill']
+  }
+
+  async function saveInsuranceConfig(nextConfig) {
+    setConfigSaving(true)
+    const payload = normalizeInsuranceConfig(nextConfig)
+    const { error } = await supabase.from('hospital_settings').upsert({
+      hospital_id: hospitalId,
+      insurance_config: payload,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'hospital_id' })
+    if (error) {
+      window.notifyFromLegacyAlert('Error saving insurance configuration: ' + error.message)
+      setConfigSaving(false)
+      return false
+    }
+    setInsuranceConfig(payload)
+    setConfigSaving(false)
+    window.notifyFromLegacyAlert('Insurance configuration saved.')
+    return true
+  }
+
+  async function openSubmissionChecklist(record) {
+    const meta = getClaimMeta(record)
+    const documents = getRequiredDocuments(record.insurer).map(label => ({
+      label,
+      checked: (meta.submitted_documents || []).includes(label),
+    }))
+    setShowChecklistModal({ record, documents })
+  }
+
+  async function confirmSubmissionChecklist() {
+    if (!showChecklistModal?.record) return
+    const allChecked = showChecklistModal.documents.every(item => item.checked)
+    if (!allChecked) {
+      window.notifyFromLegacyAlert('Tick every required document before submitting this claim.')
+      return
+    }
+    const record = showChecklistModal.record
+    const meta = getClaimMeta(record)
+    const { error } = await supabase.from('insurance_claims').update({
+      status: 'Submitted',
+      notes: buildClaimNotes({
+        ...meta,
+        submitted_documents: showChecklistModal.documents.filter(item => item.checked).map(item => item.label),
+      }),
+    }).eq('id', record.id)
+    if (error) {
+      window.notifyFromLegacyAlert('Error submitting claim: ' + error.message)
+      return
+    }
+    setShowChecklistModal(null)
+    await fetchAll()
+  }
+
+  function buildInpatientBundle(invoiceRecord) {
+    const related = invoices.filter(item =>
+      item.insurer === invoiceRecord.insurer &&
+      ((invoiceRecord.visit_id && item.visit_id === invoiceRecord.visit_id) || (!invoiceRecord.visit_id && item.patient_id === invoiceRecord.patient_id))
+    )
+    const seen = new Set()
+    const lineItems = []
+    related.forEach(item => {
+      const raw = parseServicesField(item.services)
+      raw.split(';').map(part => part.trim()).filter(Boolean).forEach(service => {
+        const key = service.toLowerCase()
+        if (seen.has(key)) return
+        seen.add(key)
+        lineItems.push(service)
+      })
+    })
+    const drgGroup = Object.entries(insuranceConfig.drgGrouping || DEFAULT_DRG_MAP).find(([, services]) =>
+      services.some(service => lineItems.join(' ').toLowerCase().includes(service.toLowerCase()))
+    )?.[0] || 'general'
+    return {
+      related,
+      lineItems,
+      total: related.reduce((sum, item) => sum + Number(item.amount_kes || 0), 0),
+      drgGroup,
+    }
+  }
+
+  async function importBundledInpatientClaim(invoiceRecord) {
+    const bundle = buildInpatientBundle(invoiceRecord)
+    if (!bundle.related.length) {
+      window.notifyFromLegacyAlert('No related inpatient invoices found to bundle.')
+      return
+    }
+    const tariffEntry = getTariffEntry(invoiceRecord.insurer, 'Inpatient Admission')
+    const payload = {
+      hospital_id: hospitalId,
+      claim_no: genClaimNo(),
+      patient_name: invoiceRecord.patient_name,
+      patient_id: invoiceRecord.patient_id || null,
+      visit_id: invoiceRecord.visit_id || null,
+      invoice_id: invoiceRecord.id || null,
+      insurer: invoiceRecord.insurer,
+      member_no: invoiceRecord.sha_member_no || '',
+      service: bundle.lineItems.join('; '),
+      icd10_code: '',
+      auth_code: '',
+      amount_kes: tariffEntry?.rate || bundle.total,
+      status: 'Draft',
+      submitted_at: new Date().toISOString(),
+      notes: buildClaimNotes({
+        source: 'Billing',
+        invoice_ref: invoiceRecord.invoice_no,
+        invoice_id: invoiceRecord.id || null,
+        patient_id: invoiceRecord.patient_id || null,
+        visit_id: invoiceRecord.visit_id || null,
+        bundled_invoice_ids: bundle.related.map(item => item.id),
+        bundled_line_items: bundle.lineItems,
+        drg_group: bundle.drgGroup,
+        tariff_rate: tariffEntry?.rate || 0,
+        tariff_plan: tariffEntry?.plan || '',
+        tariff_covered: tariffEntry?.covered !== false,
+      }),
+    }
+    const { error } = await executeWithFallback(
+      () => supabase.from('insurance_claims').insert(payload),
+      async () => supabase.from('insurance_claims').insert(omitKeys(payload, ['patient_id', 'visit_id', 'invoice_id'])),
+    )
+    if (error) {
+      window.notifyFromLegacyAlert('Error creating bundled claim: ' + error.message)
+      return
+    }
+    await fetchAll()
+    window.notifyFromLegacyAlert(`Bundled ${bundle.related.length} inpatient invoice(s) into one claim.`)
+  }
+
+  async function importRemittanceCsv(event) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    setRemittanceImporting(true)
+    try {
+      const text = await file.text()
+      const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+      const headers = lines[0].split(',').map(item => item.trim().toLowerCase())
+      const rows = lines.slice(1).map(line => {
+        const values = line.split(',').map(item => item.trim())
+        return headers.reduce((acc, key, index) => ({ ...acc, [key]: values[index] || '' }), {})
+      })
+      const report = { matched: [], unmatched: [], overpaid: [], underpaid: [], disputed: [] }
+
+      for (const row of rows) {
+        const claim = records.find(item =>
+          item.claim_no === row.claim_no ||
+          getInvoiceRef(item) === row.invoice_ref ||
+          String(item.member_no || '').toLowerCase() === String(row.member_no || '').toLowerCase()
+        )
+        if (!claim) {
+          report.unmatched.push(row)
+          continue
+        }
+        const paid = Number(row.paid_amount || row.amount_paid || 0)
+        const expected = Number(claim.amount_kes || 0)
+        const meta = getClaimMeta(claim)
+        const discrepancy = paid - expected
+        if (discrepancy > 0) report.overpaid.push({ claim, paid, expected })
+        else if (discrepancy < 0) report.underpaid.push({ claim, paid, expected })
+        if (String(row.status || '').toLowerCase().includes('dispute')) report.disputed.push({ claim, row })
+
+        await supabase.from('insurance_claims').update({
+          status: paid >= expected ? 'Paid' : claim.status,
+          notes: buildClaimNotes({
+            ...meta,
+            payment_received_at: row.payment_received_at || row.payment_date || new Date().toISOString(),
+            remittance_ref: row.remittance_ref || row.eft_ref || row.payment_reference || '',
+            remittance_status: row.status || '',
+            paid_amount: paid,
+          }),
+        }).eq('id', claim.id)
+        report.matched.push({ claim, paid, expected })
+      }
+
+      setReconciliationReport(report)
+      await fetchAll()
+      window.notifyFromLegacyAlert('Insurance remittance import complete.')
+    } catch (error) {
+      window.notifyFromLegacyAlert(error instanceof Error ? error.message : 'Remittance import failed.')
+    } finally {
+      event.target.value = ''
+      setRemittanceImporting(false)
+    }
   }
 
   /* ── Filtering ─────────────────────────────────────────────────────────── */
@@ -591,6 +929,7 @@ export default function InsuranceClaims() {
   })
 
   const insurerOptions = [...new Set([...INSURERS, ...records.map(r => r.insurer).filter(Boolean)])]
+  const importedRefs = new Set(records.map(r => getInvoiceRef(r)).filter(Boolean))
 
   /* ── Stats ─────────────────────────────────────────────────────────────── */
   const totalAmt = records.reduce((s,r) => s+parseFloat(r.amount_kes||0), 0)
@@ -622,6 +961,92 @@ export default function InsuranceClaims() {
   const insurerBreakdown = Object.entries(insurerMap)
     .map(([name,v]) => ({ name, ...v }))
     .sort((a,b) => b.total - a.total)
+  const insurerPerformance = insurerBreakdown.map(item => {
+    const insurerClaims = records.filter(record => record.insurer === item.name)
+    const paidClaims = insurerClaims.filter(record => getClaimMeta(record).payment_received_at)
+    const avgDaysToPay = paidClaims.length
+      ? Math.round((paidClaims.reduce((sum, record) => sum + (diffDays(record.submitted_at, getClaimMeta(record).payment_received_at) || 0), 0) / paidClaims.length) * 10) / 10
+      : 0
+    const approvalRate = item.count > 0 ? Math.round((((item.approved || 0) + (item.paid || 0)) / item.count) * 100) : 0
+    const outstandingOver45 = insurerClaims.filter(record => !['Paid', 'Rejected'].includes(record.status) && (diffDays(record.submitted_at) || 0) > 45).length
+    return {
+      ...item,
+      totalClaimed: item.total,
+      totalPaid: insurerClaims.reduce((sum, record) => sum + Number(getClaimMeta(record).paid_amount || (record.status === 'Paid' ? record.amount_kes : 0) || 0), 0),
+      approvalRate,
+      avgDaysToPay,
+      outstandingOver45,
+    }
+  })
+  const agingBuckets = ['0-30 days', '31-60 days', '61-90 days', '>90 days'].map(name => ({ name, value: 0 }))
+  records.filter(record => !['Paid', 'Rejected'].includes(record.status)).forEach(record => {
+    const bucket = getAgingBucket(diffDays(record.submitted_at) || 0)
+    const entry = agingBuckets.find(item => item.name === bucket)
+    if (entry) entry.value += Number(record.amount_kes || 0)
+  })
+  const claimStatusData = [
+    { name: 'Draft', value: records.filter(record => record.status === 'Draft').length },
+    { name: 'Pending', value: records.filter(record => ['Pending', 'Submitted', 'Under Review', 'Pre-auth'].includes(record.status)).length },
+    { name: 'Approved', value: records.filter(record => ['Approved', 'Paid'].includes(record.status)).length },
+    { name: 'Rejected', value: records.filter(record => record.status === 'Rejected').length },
+  ].filter(item => item.value > 0)
+  const preauthExpiringClaims = records
+    .map(record => {
+      const meta = getClaimMeta(record)
+      const expiryDays = diffDays(new Date(), meta.preauth_expiry_date)
+      const insurerRule = getPreauthRule(record.insurer)
+      const ageDays = diffDays(record.submitted_at) || 0
+      const insurerWindowRemaining = insurerRule?.authWindowDays ? insurerRule.authWindowDays - ageDays : null
+      return {
+        ...record,
+        meta,
+        expiryDays,
+        insurerWindowRemaining,
+      }
+    })
+    .filter(record =>
+      record.meta.preauth_status ||
+      record.auth_code ||
+      (record.insurerWindowRemaining !== null && record.insurerWindowRemaining <= 7)
+    )
+    .sort((a, b) => {
+      const left = a.expiryDays ?? a.insurerWindowRemaining ?? 999
+      const right = b.expiryDays ?? b.insurerWindowRemaining ?? 999
+      return left - right
+    })
+  const overduePayments = records.filter(record =>
+    ['Approved', 'Submitted', 'Under Review'].includes(record.status) &&
+    (diffDays(record.submitted_at) || 0) > 45
+  )
+  const reconciliationSummary = reconciliationReport || {
+    matched: records.filter(record => getClaimMeta(record).paid_amount > 0).map(record => ({
+      claim: record,
+      paid: Number(getClaimMeta(record).paid_amount || 0),
+      expected: Number(record.amount_kes || 0),
+    })),
+    unmatched: [],
+    overpaid: records.filter(record => Number(getClaimMeta(record).paid_amount || 0) > Number(record.amount_kes || 0)).map(record => ({
+      claim: record,
+      paid: Number(getClaimMeta(record).paid_amount || 0),
+      expected: Number(record.amount_kes || 0),
+    })),
+    underpaid: records.filter(record => {
+      const paid = Number(getClaimMeta(record).paid_amount || 0)
+      return paid > 0 && paid < Number(record.amount_kes || 0)
+    }).map(record => ({
+      claim: record,
+      paid: Number(getClaimMeta(record).paid_amount || 0),
+      expected: Number(record.amount_kes || 0),
+    })),
+    disputed: records.filter(record => String(getClaimMeta(record).remittance_status || '').toLowerCase().includes('dispute')).map(record => ({
+      claim: record,
+      row: { status: getClaimMeta(record).remittance_status },
+    })),
+  }
+  const collectionsLetters = insurerPerformance.filter(item => item.outstandingOver45 > 0).map(item => ({
+    insurer: item.name,
+    text: `Subject: Outstanding insurance claims follow-up\n\nDear ${item.name} claims team,\n\nWe are following up on claims outstanding beyond 45 days. Current exposure is KES ${fmt(item.totalClaimed - item.totalPaid)} across ${item.outstandingOver45} claim(s).\n\nPlease share remittance status, disputed lines, and expected payment dates.\n\nRegards,\nAccounts Receivable Team`,
+  }))
 
   /* ── Patient ledger ─────────────────────────────────────────────────────── */
   function buildPatientLedger(name) {
@@ -672,9 +1097,37 @@ export default function InsuranceClaims() {
             <h1 style={css.h1}>Insurance Claims</h1>
           </div>
           <div style={{display:'flex',gap:'8px',flexWrap:'wrap'}}>
+            <input ref={remittanceInputRef} type="file" accept=".csv,text/csv" style={{display:'none'}} onChange={importRemittanceCsv} />
+            <input ref={tariffInputRef} type="file" accept=".csv,text/csv" style={{display:'none'}} onChange={async event => {
+              const file = event.target.files?.[0]
+              if (!file) return
+              try {
+                const text = await file.text()
+                const lines = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+                const headers = lines[0].split(',').map(item => item.trim().toLowerCase())
+                const nextGuide = { ...insuranceConfig.tariffGuide, [tariffUploadInsurer]: { ...(insuranceConfig.tariffGuide?.[tariffUploadInsurer] || {}) } }
+                lines.slice(1).forEach(line => {
+                  const values = line.split(',').map(item => item.trim())
+                  const entry = headers.reduce((acc, key, index) => ({ ...acc, [key]: values[index] || '' }), {})
+                  if (!entry.service) return
+                  nextGuide[tariffUploadInsurer][entry.service] = {
+                    rate: Number(entry.rate || entry.amount || 0),
+                    covered: String(entry.covered || 'true').toLowerCase() !== 'false',
+                    plan: entry.plan || '',
+                  }
+                })
+                await saveInsuranceConfig({ ...insuranceConfig, tariffGuide: nextGuide })
+              } catch (error) {
+                window.notifyFromLegacyAlert(error instanceof Error ? error.message : 'Tariff upload failed.')
+              } finally {
+                event.target.value = ''
+              }
+            }} />
             <button style={{...css.btn,...css.btnPurple}} onClick={() => setShowPreAuthTracker(true)}>
               🔐 Pre-Auth Tracker {preAuths.length > 0 && <span style={{background:C.purple,color:'#fff',borderRadius:'10px',padding:'1px 6px',fontSize:'10px',marginLeft:'4px'}}>{preAuths.length}</span>}
             </button>
+            <button style={{...css.btn,...css.btnGhost}} onClick={() => setShowConfigModal(true)}>Payer Setup</button>
+            <button style={{...css.btn,...css.btnGhost}} onClick={() => remittanceInputRef.current?.click()} disabled={remittanceImporting}>{remittanceImporting ? 'Importing...' : 'Import Remittance'}</button>
             <button style={{...css.btn,...css.btnGhost}} onClick={() => exportCSV(filtered, `insurance_claims_${insurerFilter!=='all'?insurerFilter.replace(/ /g,'_'):'all'}_${new Date().toISOString().slice(0,10)}.csv`)} disabled={!isAdmin} title={!isAdmin ? 'Admin only' : ''}>
               ↓ Export CSV
             </button>
@@ -706,13 +1159,37 @@ export default function InsuranceClaims() {
         </div>
 
         {/* ── TABS ───────────────────────────────────────────────────────── */}
+        <div style={css.kpiGrid}>
+          {insurerPerformance.slice(0, 3).map(item => {
+            const rateStyle = getRateBadge(item.approvalRate)
+            return (
+              <div key={item.name} style={css.cardPad}>
+                <div style={{display:'flex',justifyContent:'space-between',gap:'10px',alignItems:'flex-start',marginBottom:'10px'}}>
+                  <div>
+                    <div style={{fontWeight:800,fontSize:'14px'}}>{item.name}</div>
+                    <div style={{fontSize:'11px',color:C.sub}}>Avg days to pay: {item.avgDaysToPay || '—'}</div>
+                  </div>
+                  <span style={{...css.badge,background:rateStyle.bg,color:rateStyle.color}}>{item.approvalRate}% approved</span>
+                </div>
+                <div style={{display:'grid',gap:'6px',fontSize:'12px'}}>
+                  <div style={{display:'flex',justifyContent:'space-between'}}><span>Total claimed</span><strong>KES {fmt(item.totalClaimed)}</strong></div>
+                  <div style={{display:'flex',justifyContent:'space-between'}}><span>Total paid</span><strong style={{color:C.primary}}>KES {fmt(item.totalPaid)}</strong></div>
+                  <div style={{display:'flex',justifyContent:'space-between'}}><span>Outstanding {'>'}45d</span><strong style={{color:item.outstandingOver45 > 0 ? C.danger : C.sub}}>{item.outstandingOver45}</strong></div>
+                </div>
+              </div>
+            )
+          })}
+        </div>
         <div style={css.tabRow}>
           {[
+            { key:'dashboard', label:'Dashboard' },
             { key:'claims', label:'All Claims' },
             { key:'billing', label:`From Billing${unimportedInvoices.length>0?` (${unimportedInvoices.length} new)`:''}` },
             { key:'pending', label:`Pending${pending.length>0?` (${pending.length})`:''}` },
             { key:'rejected', label:`Rejected${rejected.length>0?` (${rejected.length})`:''}` },
             { key:'insurers', label:'By Insurer' },
+            { key:'reconciliation', label:'Reconciliation' },
+            { key:'aging', label:'Aging Report' },
             { key:'ledger', label:'Patient Ledger' },
           ].map(t => (
             <button key={t.key}
@@ -722,6 +1199,133 @@ export default function InsuranceClaims() {
             </button>
           ))}
         </div>
+
+        {activeTab === 'dashboard' && (
+          <>
+            <div style={css.split}>
+              <div style={css.cardPad}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'12px'}}>
+                  <div>
+                    <div style={{fontWeight:800,fontSize:'14px'}}>Insurer Performance Dashboard</div>
+                    <div style={{fontSize:'12px',color:C.sub}}>Claimed, paid, approval rate, and average days to pay by insurer.</div>
+                  </div>
+                </div>
+                <div style={css.chartWrap}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={insurerPerformance.slice(0, 8)}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                      <XAxis dataKey="name" tick={{ fontSize: 11 }} interval={0} angle={-12} height={56} />
+                      <YAxis tick={{ fontSize: 11 }} />
+                      <RechartsTooltip formatter={value => [`KES ${fmt(value)}`, '']} />
+                      <Bar dataKey="totalClaimed" name="Claimed" fill={C.blue} radius={[6, 6, 0, 0]} />
+                      <Bar dataKey="totalPaid" name="Paid" fill={C.primary} radius={[6, 6, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+              <div style={css.cardPad}>
+                <div style={{fontWeight:800,fontSize:'14px',marginBottom:'4px'}}>Claims Outcome Mix</div>
+                <div style={{fontSize:'12px',color:C.sub,marginBottom:'12px'}}>Live distribution of insurance claim statuses.</div>
+                <div style={css.chartWrap}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie data={claimStatusData} dataKey="value" nameKey="name" innerRadius={60} outerRadius={95} paddingAngle={3}>
+                        {claimStatusData.map((entry, index) => <Cell key={entry.name} fill={CHART_COLORS[index % CHART_COLORS.length]} />)}
+                      </Pie>
+                      <RechartsTooltip formatter={value => [`${value}`, 'Claims']} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+                <div style={{display:'grid',gap:'8px'}}>
+                  {claimStatusData.map((entry, index) => (
+                    <div key={entry.name} style={{display:'flex',justifyContent:'space-between',fontSize:'12px'}}>
+                      <span style={{display:'inline-flex',alignItems:'center',gap:'8px'}}>
+                        <span style={{width:'10px',height:'10px',borderRadius:'999px',background:CHART_COLORS[index % CHART_COLORS.length]}} />
+                        {entry.name}
+                      </span>
+                      <strong>{entry.value}</strong>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            <div style={css.cardPad}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'12px'}}>
+                <div>
+                  <div style={{fontWeight:800,fontSize:'14px'}}>Insurer Scorecards</div>
+                  <div style={{fontSize:'12px',color:C.sub}}>Color-coded approval rates and outstanding follow-up risk.</div>
+                </div>
+                <div style={{fontSize:'12px',color:C.sub}}>{insurerPerformance.length} insurer{insurerPerformance.length !== 1 ? 's' : ''}</div>
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(220px,1fr))',gap:'12px'}}>
+                {insurerPerformance.map(item => {
+                  const rateStyle = getRateBadge(item.approvalRate)
+                  const outstandingKes = Math.max(0, item.totalClaimed - item.totalPaid)
+                  return (
+                    <div key={item.name} style={{border:`1px solid ${C.border}`,borderRadius:'10px',padding:'14px',background:'#FAFBFD'}}>
+                      <div style={{display:'flex',justifyContent:'space-between',gap:'8px',marginBottom:'10px'}}>
+                        <strong style={{fontSize:'13px'}}>{item.name}</strong>
+                        <span style={{...css.badge,background:rateStyle.bg,color:rateStyle.color}}>{item.approvalRate}%</span>
+                      </div>
+                      <div style={{display:'grid',gap:'6px',fontSize:'12px'}}>
+                        <div style={{display:'flex',justifyContent:'space-between'}}><span>Claimed</span><strong>KES {fmt(item.totalClaimed)}</strong></div>
+                        <div style={{display:'flex',justifyContent:'space-between'}}><span>Paid</span><strong style={{color:C.primary}}>KES {fmt(item.totalPaid)}</strong></div>
+                        <div style={{display:'flex',justifyContent:'space-between'}}><span>Avg days to pay</span><strong>{item.avgDaysToPay || '—'}</strong></div>
+                        <div style={{display:'flex',justifyContent:'space-between'}}><span>Outstanding</span><strong style={{color:outstandingKes > 0 ? C.warn : C.sub}}>KES {fmt(outstandingKes)}</strong></div>
+                        {item.outstandingOver45 > 0 && <div style={{fontSize:'11px',color:C.danger,fontWeight:700}}>Payment follow-up needed: {item.outstandingOver45} claim(s) over 45 days</div>}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div style={css.split}>
+              <div style={css.cardPad}>
+                <div style={{fontWeight:800,fontSize:'14px',marginBottom:'4px'}}>Pre-Auth Expiry Tracker</div>
+                <div style={{fontSize:'12px',color:C.sub,marginBottom:'12px'}}>Claims whose authorization window is about to lapse or has missing pre-auth tracking.</div>
+                <div style={{display:'grid',gap:'8px'}}>
+                  {preauthExpiringClaims.slice(0, 6).map(record => {
+                    const expiryText = record.meta.preauth_expiry_date
+                      ? `${record.expiryDays} day${record.expiryDays === 1 ? '' : 's'} to expiry`
+                      : record.insurerWindowRemaining !== null
+                        ? `${record.insurerWindowRemaining} day${record.insurerWindowRemaining === 1 ? '' : 's'} left in insurer auth window`
+                        : 'No expiry tracked'
+                    const color = (record.expiryDays !== null && record.expiryDays <= 7) || (record.insurerWindowRemaining !== null && record.insurerWindowRemaining <= 7) ? C.danger : C.warn
+                    return (
+                      <button key={record.id} style={{...css.uploadItem,cursor:'pointer',textAlign:'left',background:'#fff'}} onClick={() => setShowDetail(record)}>
+                        <div>
+                          <div style={{fontWeight:700}}>{record.patient_name}</div>
+                          <div style={{fontSize:'11px',color:C.sub}}>{record.insurer} · {parseServicesField(record.service) || 'Service pending'}</div>
+                        </div>
+                        <div style={{fontSize:'11px',fontWeight:700,color}}>{expiryText}</div>
+                      </button>
+                    )
+                  })}
+                  {preauthExpiringClaims.length === 0 && <div style={{fontSize:'12px',color:C.sub}}>No expiring pre-auth requests right now.</div>}
+                </div>
+              </div>
+              <div style={css.cardPad}>
+                <div style={{fontWeight:800,fontSize:'14px',marginBottom:'4px'}}>Aging Exposure</div>
+                <div style={{fontSize:'12px',color:C.sub,marginBottom:'12px'}}>Open claims bucketed by age for collections follow-up.</div>
+                <div style={css.chartWrap}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={agingBuckets}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                      <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+                      <YAxis tick={{ fontSize: 11 }} />
+                      <RechartsTooltip formatter={value => [`KES ${fmt(value)}`, 'Open exposure']} />
+                      <Bar dataKey="value" radius={[6, 6, 0, 0]}>
+                        {agingBuckets.map((entry, index) => <Cell key={entry.name} fill={CHART_COLORS[index % CHART_COLORS.length]} />)}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
 
         {/* ══════════════════════════════════════════════════════════════════
             TAB: ALL CLAIMS
@@ -871,24 +1475,46 @@ export default function InsuranceClaims() {
               <tbody>
                 {invoices.map(inv => {
                   const imported = importedRefs.has(inv.invoice_no)
+                  const serviceLabel = parseServicesField(inv.services) || 'Pharmacy / Drugs'
+                  const tariffEntry = getTariffEntry(inv.insurer, serviceLabel)
+                  const uncovered = tariffEntry?.covered === false
                   return (
                     <tr key={inv.id} style={{opacity: imported ? 0.5 : 1}}>
                       <td style={{...css.td,fontFamily:'monospace',fontSize:'12px',color:C.sub}}>{inv.invoice_no||'—'}</td>
                       <td style={css.td}><strong>{inv.patient_name}</strong></td>
                       <td style={{...css.td,fontWeight:600,fontSize:'12px'}}>{inv.insurer||'—'}</td>
-                      <td style={{...css.td,fontSize:'12px',maxWidth:'160px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{parseServicesField(inv.services) || '—'}</td>
-                      <td style={{...css.td,fontWeight:700}}>KES {fmt(inv.amount_kes)}</td>
+                      <td style={{...css.td,fontSize:'12px',maxWidth:'160px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+                        {serviceLabel}
+                        {tariffEntry?.plan && <div style={{fontSize:'10px',color:C.sub,marginTop:'2px'}}>Plan: {tariffEntry.plan}</div>}
+                        {uncovered && <div style={{fontSize:'10px',color:C.danger,marginTop:'2px'}}>Not covered by tariff</div>}
+                      </td>
+                      <td style={{...css.td,fontWeight:700}}>
+                        KES {fmt(inv.amount_kes)}
+                        {tariffEntry?.rate > 0 && <div style={{fontSize:'10px',color:C.primary,marginTop:'2px'}}>Tariff: KES {fmt(tariffEntry.rate)}</div>}
+                      </td>
                       <td style={{...css.td,color:parseFloat(inv.balance_kes||0)>0?C.warn:C.primary,fontWeight:600}}>KES {fmt(inv.balance_kes)}</td>
                       <td style={{...css.td,fontSize:'12px',color:C.sub}}>{inv.created_at ? new Date(inv.created_at).toLocaleDateString('en-KE') : '—'}</td>
                       <td style={css.td}><Badge status={inv.status}/></td>
                       <td style={css.td}>
-                        {imported
-                          ? <span style={{...css.badge,background:C.primaryL,color:C.primary}}> Imported</span>
-                          : <button style={{...css.btn,...css.btnBlue,padding:'5px 10px',fontSize:'11px'}}
+                        {imported ? (
+                          <span style={{...css.badge,background:C.primaryL,color:C.primary}}> Imported</span>
+                        ) : (
+                          <div style={{display:'flex',gap:'6px',flexWrap:'wrap'}}>
+                            <button style={{...css.btn,...css.btnBlue,padding:'5px 10px',fontSize:'11px'}}
                               onClick={() => importFromBilling(inv)} disabled={saving}>
                               Import
                             </button>
-                        }
+                            {String(serviceLabel).toLowerCase().includes('admission') && (
+                              <button
+                                style={{...css.btn,background:'#F5F3FF',color:C.purple,border:'none',padding:'5px 10px',fontSize:'11px'}}
+                                onClick={() => importBundledInpatientClaim(inv)}
+                                disabled={saving}
+                              >
+                                Bundle Stay
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </td>
                     </tr>
                   )
@@ -1098,6 +1724,152 @@ export default function InsuranceClaims() {
         {/* ══════════════════════════════════════════════════════════════════
             TAB: PATIENT LEDGER
         ══════════════════════════════════════════════════════════════════ */}
+        {activeTab === 'reconciliation' && (
+          <>
+            <div style={css.statsRow}>
+              {[
+                { label:'Matched Payments', value: reconciliationSummary.matched.length, sub:'Claims matched from remittance', color:C.primary },
+                { label:'Underpaid', value: reconciliationSummary.underpaid.length, sub:'Requires follow-up', color:C.warn },
+                { label:'Overpaid', value: reconciliationSummary.overpaid.length, sub:'Check remittance advice', color:C.blue },
+                { label:'Disputed', value: reconciliationSummary.disputed.length, sub:'Needs clarification', color:C.danger },
+                { label:'Unmatched', value: reconciliationSummary.unmatched.length, sub:'Rows not linked to claim', color:C.sub },
+              ].map(item => (
+                <div key={item.label} style={css.stat}>
+                  <div style={css.statLbl}>{item.label}</div>
+                  <div style={{...css.statVal,color:item.color}}>{item.value}</div>
+                  <div style={css.statSub}>{item.sub}</div>
+                </div>
+              ))}
+            </div>
+            <div style={css.split}>
+              <div style={css.cardPad}>
+                <div style={{fontWeight:800,fontSize:'14px',marginBottom:'4px'}}>Reconciliation Exceptions</div>
+                <div style={{fontSize:'12px',color:C.sub,marginBottom:'12px'}}>Imported insurer remittance advice matched against claim values.</div>
+                <div style={{display:'grid',gap:'8px'}}>
+                  {[...reconciliationSummary.underpaid, ...reconciliationSummary.overpaid].slice(0, 8).map(entry => (
+                    <div key={entry.claim.id} style={css.uploadItem}>
+                      <div>
+                        <div style={{fontWeight:700}}>{entry.claim.claim_no || entry.claim.patient_name}</div>
+                        <div style={{fontSize:'11px',color:C.sub}}>{entry.claim.insurer} · {entry.claim.patient_name}</div>
+                      </div>
+                      <div style={{textAlign:'right'}}>
+                        <div style={{fontSize:'11px'}}>Expected: KES {fmt(entry.expected)}</div>
+                        <div style={{fontSize:'11px',fontWeight:700,color:entry.paid >= entry.expected ? C.blue : C.warn}}>Paid: KES {fmt(entry.paid)}</div>
+                      </div>
+                    </div>
+                  ))}
+                  {reconciliationSummary.matched.length === 0 && reconciliationSummary.underpaid.length === 0 && reconciliationSummary.overpaid.length === 0 && (
+                    <div style={{fontSize:'12px',color:C.sub}}>No remittance data imported yet. Use “Import Remittance” to start reconciliation.</div>
+                  )}
+                </div>
+              </div>
+              <div style={css.cardPad}>
+                <div style={{fontWeight:800,fontSize:'14px',marginBottom:'4px'}}>Reconciliation Summary</div>
+                <div style={{fontSize:'12px',color:C.sub,marginBottom:'12px'}}>A clean accounts-receivable snapshot after EFT import.</div>
+                <div style={{display:'grid',gap:'10px',fontSize:'12px'}}>
+                  <div style={css.uploadItem}><span>Total matched value</span><strong>KES {fmt(reconciliationSummary.matched.reduce((sum, item) => sum + Number(item.paid || 0), 0))}</strong></div>
+                  <div style={css.uploadItem}><span>Underpaid exposure</span><strong style={{color:C.warn}}>KES {fmt(reconciliationSummary.underpaid.reduce((sum, item) => sum + Math.max(0, Number(item.expected || 0) - Number(item.paid || 0)), 0))}</strong></div>
+                  <div style={css.uploadItem}><span>Overpaid value</span><strong style={{color:C.blue}}>KES {fmt(reconciliationSummary.overpaid.reduce((sum, item) => sum + Math.max(0, Number(item.paid || 0) - Number(item.expected || 0)), 0))}</strong></div>
+                  <div style={css.uploadItem}><span>Disputed claims</span><strong style={{color:C.danger}}>{reconciliationSummary.disputed.length}</strong></div>
+                  <button
+                    style={{...css.btn,...css.btnGhost,justifySelf:'start'}}
+                    onClick={() => exportCSV(
+                      reconciliationSummary.matched.map(item => ({
+                        claim_no: item.claim.claim_no,
+                        patient_name: item.claim.patient_name,
+                        insurer: item.claim.insurer,
+                        amount_kes: item.expected,
+                        paid_amount: item.paid,
+                        status: item.claim.status,
+                        remittance_ref: getClaimMeta(item.claim).remittance_ref,
+                      })),
+                      `insurance_reconciliation_${new Date().toISOString().slice(0, 10)}.csv`
+                    )}
+                    disabled={!isAdmin}
+                    title={!isAdmin ? 'Admin only' : ''}
+                  >
+                    Export Reconciliation CSV
+                  </button>
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+
+        {activeTab === 'aging' && (
+          <>
+            <div style={css.split}>
+              <div style={css.cardPad}>
+                <div style={{fontWeight:800,fontSize:'14px',marginBottom:'4px'}}>Outstanding Aging</div>
+                <div style={{fontSize:'12px',color:C.sub,marginBottom:'12px'}}>KES exposure by claims age bucket.</div>
+                <div style={css.chartWrap}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={agingBuckets}>
+                      <CartesianGrid strokeDasharray="3 3" stroke={C.border} />
+                      <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+                      <YAxis tick={{ fontSize: 11 }} />
+                      <RechartsTooltip formatter={value => [`KES ${fmt(value)}`, 'Exposure']} />
+                      <Bar dataKey="value" radius={[6, 6, 0, 0]}>
+                        {agingBuckets.map((entry, index) => <Cell key={entry.name} fill={CHART_COLORS[index % CHART_COLORS.length]} />)}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+              <div style={css.cardPad}>
+                <div style={{fontWeight:800,fontSize:'14px',marginBottom:'4px'}}>Collections Queue</div>
+                <div style={{fontSize:'12px',color:C.sub,marginBottom:'12px'}}>Approved or submitted claims older than 45 days.</div>
+                <div style={{display:'grid',gap:'8px'}}>
+                  {overduePayments.slice(0, 8).map(record => (
+                    <div key={record.id} style={css.uploadItem}>
+                      <div>
+                        <div style={{fontWeight:700}}>{record.patient_name}</div>
+                        <div style={{fontSize:'11px',color:C.sub}}>{record.insurer} · {record.claim_no || 'No claim no.'}</div>
+                      </div>
+                      <div style={{textAlign:'right'}}>
+                        <div style={{fontSize:'11px',color:C.danger,fontWeight:700}}>{diffDays(record.submitted_at)} days outstanding</div>
+                        <div style={{fontSize:'11px'}}>KES {fmt(record.amount_kes)}</div>
+                      </div>
+                    </div>
+                  ))}
+                  {overduePayments.length === 0 && <div style={{fontSize:'12px',color:C.sub}}>No overdue approved claims at the moment.</div>}
+                </div>
+              </div>
+            </div>
+            <div style={css.card}>
+              <div style={css.cardHead}>
+                <span>Collections Letter Templates</span>
+                <span style={{fontSize:'12px',color:C.sub}}>{collectionsLetters.length} overdue insurer{collectionsLetters.length !== 1 ? 's' : ''}</span>
+              </div>
+              <table style={css.table}>
+                <thead>
+                  <tr>
+                    {['Insurer','Outstanding Claims > 45d','Estimated Exposure','Action'].map(label => <th key={label} style={css.th}>{label}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {collectionsLetters.length === 0 && (
+                    <tr><td colSpan={4} style={{...css.td,textAlign:'center',color:C.sub,padding:'32px'}}>No overdue collections letters needed right now.</td></tr>
+                  )}
+                  {collectionsLetters.map(letter => {
+                    const item = insurerPerformance.find(entry => entry.name === letter.insurer)
+                    return (
+                      <tr key={letter.insurer}>
+                        <td style={{...css.td,fontWeight:700}}>{letter.insurer}</td>
+                        <td style={{...css.td,color:C.danger,fontWeight:700}}>{item?.outstandingOver45 || 0}</td>
+                        <td style={{...css.td}}>KES {fmt(Math.max(0, (item?.totalClaimed || 0) - (item?.totalPaid || 0)))}</td>
+                        <td style={css.td}>
+                          <button style={{...css.btn,...css.btnGhost,padding:'6px 10px'}} onClick={() => setShowCollectionsModal(letter)}>Open Letter</button>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+
         {activeTab === 'ledger' && (() => {
           const patientMap = {}
           records.forEach(r => {
@@ -1165,7 +1937,7 @@ export default function InsuranceClaims() {
           <div style={css.modalWide} onClick={e => e.stopPropagation()}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'16px'}}>
               <div style={css.modalH}>New Insurance Claim</div>
-              <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowAdd(false)}></button>
+              <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowAdd(false)}>Close</button>
             </div>
 
             {/* Insurer rules alert */}
@@ -1210,6 +1982,30 @@ export default function InsuranceClaims() {
                 <input style={css.input} type="number" placeholder="0" value={f.amount_kes} onChange={e => sf({amount_kes:e.target.value})}/>
               </div>
             </div>
+            {(() => {
+              const tariffEntry = getTariffEntry(f.insurer, f.service)
+              const requiredDocs = getRequiredDocuments(f.insurer)
+              return (
+                <div style={{display:'grid',gap:'8px',marginBottom:'12px'}}>
+                  <div style={css.uploadItem}>
+                    <span>Tariff guide</span>
+                    <strong style={{color:tariffEntry?.covered === false ? C.danger : C.primary}}>
+                      {tariffEntry ? `KES ${fmt(tariffEntry.rate)}${tariffEntry.plan ? ` · ${tariffEntry.plan}` : ''}` : 'No tariff configured'}
+                    </strong>
+                  </div>
+                  <div style={css.uploadItem}>
+                    <span>Coverage</span>
+                    <strong style={{color:tariffEntry?.covered === false ? C.danger : C.text}}>
+                      {tariffEntry?.covered === false ? 'Flagged as not covered' : 'Covered / not restricted'}
+                    </strong>
+                  </div>
+                  <div style={css.uploadItem}>
+                    <span>Required documents</span>
+                    <strong>{requiredDocs.join(', ')}</strong>
+                  </div>
+                </div>
+              )
+            })()}
 
             {/* ICD-10 Section */}
             <hr style={css.divider}/>
@@ -1305,7 +2101,7 @@ export default function InsuranceClaims() {
           <div style={css.modal} onClick={e => e.stopPropagation()}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'16px'}}>
               <div style={css.modalH}>Claim Detail</div>
-              <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowDetail(null)}></button>
+              <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowDetail(null)}>Close</button>
             </div>
 
             {/* Status badge + source */}
@@ -1313,6 +2109,21 @@ export default function InsuranceClaims() {
               <Badge status={showDetail.status}/>
               <SourceBadge source={getSource(showDetail)}/>
               {showDetail.claim_no && <span style={{fontFamily:'monospace',fontSize:'12px',color:C.sub}}>#{showDetail.claim_no}</span>}
+            </div>
+
+            <div style={{display:'grid',gap:'8px',marginBottom:'12px'}}>
+              {(() => {
+                const meta = getClaimMeta(showDetail)
+                const requiredDocs = getRequiredDocuments(showDetail.insurer)
+                return (
+                  <>
+                    {meta.preauth_status && <div style={css.uploadItem}><span>Pre-auth status</span><strong>{meta.preauth_status}</strong></div>}
+                    {meta.preauth_expiry_date && <div style={css.uploadItem}><span>Pre-auth expiry</span><strong>{new Date(meta.preauth_expiry_date).toLocaleDateString('en-KE')}</strong></div>}
+                    <div style={css.uploadItem}><span>Documents checked</span><strong>{meta.submitted_documents?.length || 0}/{requiredDocs.length}</strong></div>
+                    {meta.remittance_ref && <div style={css.uploadItem}><span>Remittance ref</span><strong style={css.mono}>{meta.remittance_ref}</strong></div>}
+                  </>
+                )
+              })()}
             </div>
 
             {/* Insurer rules reminder */}
@@ -1365,6 +2176,7 @@ export default function InsuranceClaims() {
                 <button style={{...css.btn,background:'#FFF7ED',color:'#EA580C',border:'none',flex:1,padding:'10px'}}
                   onClick={() => { updateStatus(showDetail.id,'Appealed'); setShowDetail(null) }}>Lodge Appeal</button>
               )}
+              <button style={{...css.btn,...css.btnGhost,flex:1,padding:'10px'}} onClick={() => openSubmissionChecklist(showDetail)}>Documents Checklist</button>
               <button style={{...css.btn,...css.btnGhost,flex:1,padding:'10px'}} onClick={() => setShowDetail(null)}>Close</button>
             </div>
           </div>
@@ -1385,7 +2197,7 @@ export default function InsuranceClaims() {
                   disabled={!isAdmin} title={!isAdmin ? 'Admin only' : ''}>
                   ↓ Export
                 </button>
-                <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowPatientLedger(null)}></button>
+                <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowPatientLedger(null)}>Close</button>
               </div>
             </div>
             <div style={{fontSize:'12px',color:C.sub,marginBottom:'16px'}}>
@@ -1446,7 +2258,7 @@ export default function InsuranceClaims() {
           <div style={css.modalWide} onClick={e => e.stopPropagation()}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'4px'}}>
               <div style={css.modalH}>🔐 Pre-Auth Tracker</div>
-              <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowPreAuthTracker(false)}></button>
+              <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowPreAuthTracker(false)}>Close</button>
             </div>
             <div style={{fontSize:'12px',color:C.sub,marginBottom:'16px'}}>
               Tracks all claims with auth codes and their expiry risk based on insurer windows.
@@ -1487,6 +2299,184 @@ export default function InsuranceClaims() {
                 </tbody>
               </table>
             )}
+          </div>
+        </div>
+      )}
+
+      {showChecklistModal && (
+        <div style={css.overlay} onClick={() => setShowChecklistModal(null)}>
+          <div style={css.modal} onClick={e => e.stopPropagation()}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'12px'}}>
+              <div style={css.modalH}>Claim Document Checklist</div>
+              <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowChecklistModal(null)}>Close</button>
+            </div>
+            <div style={{fontSize:'12px',color:C.sub,marginBottom:'14px'}}>
+              {showChecklistModal.record.insurer} requires every checked document before claim submission.
+            </div>
+            <div style={{display:'grid',gap:'10px'}}>
+              {showChecklistModal.documents.map((item, index) => (
+                <label key={item.label} style={css.checklistRow}>
+                  <input
+                    type="checkbox"
+                    checked={item.checked}
+                    onChange={event => setShowChecklistModal(current => ({
+                      ...current,
+                      documents: current.documents.map((doc, docIndex) =>
+                        docIndex === index ? { ...doc, checked: event.target.checked } : doc
+                      ),
+                    }))}
+                  />
+                  <div>
+                    <div style={{fontWeight:700,fontSize:'12px'}}>{item.label}</div>
+                    <div style={{fontSize:'11px',color:C.sub}}>Required for insurer submission.</div>
+                  </div>
+                </label>
+              ))}
+            </div>
+            <div style={{display:'flex',gap:'8px',marginTop:'16px'}}>
+              <button style={{...css.btn,...css.btnGhost,flex:1}} onClick={() => setShowChecklistModal(null)}>Cancel</button>
+              <button style={{...css.btn,...css.btnPri,flex:2}} onClick={confirmSubmissionChecklist}>Confirm & Submit</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showConfigModal && (
+        <div style={css.overlay} onClick={() => setShowConfigModal(false)}>
+          <div style={css.modalWide} onClick={e => e.stopPropagation()}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'12px'}}>
+              <div style={css.modalH}>Payer Setup</div>
+              <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowConfigModal(false)}>Close</button>
+            </div>
+            <div style={css.grid2}>
+              <div>
+                <label style={css.lbl}>Insurer</label>
+                <select style={{...css.input,cursor:'pointer'}} value={tariffUploadInsurer} onChange={e => setTariffUploadInsurer(e.target.value)}>
+                  {insurerOptions.map(item => <option key={item} value={item}>{item}</option>)}
+                </select>
+                <label style={css.lbl}>Pre-auth required</label>
+                <select
+                  style={{...css.input,cursor:'pointer'}}
+                  value={String(getPreauthRule(tariffUploadInsurer)?.requiresAuth !== false)}
+                  onChange={e => setInsuranceConfig(current => ({
+                    ...current,
+                    preauthRules: {
+                      ...current.preauthRules,
+                      [tariffUploadInsurer]: {
+                        ...(getPreauthRule(tariffUploadInsurer) || {}),
+                        requiresAuth: e.target.value === 'true',
+                      },
+                    },
+                  }))}
+                >
+                  <option value="true">Yes</option>
+                  <option value="false">No</option>
+                </select>
+                <label style={css.lbl}>Pre-auth validity (days)</label>
+                <input
+                  style={css.input}
+                  type="number"
+                  value={getPreauthRule(tariffUploadInsurer)?.authWindowDays || ''}
+                  onChange={e => setInsuranceConfig(current => ({
+                    ...current,
+                    preauthRules: {
+                      ...current.preauthRules,
+                      [tariffUploadInsurer]: {
+                        ...(getPreauthRule(tariffUploadInsurer) || {}),
+                        authWindowDays: Number(e.target.value || 0),
+                      },
+                    },
+                  }))}
+                />
+                <label style={css.lbl}>Outpatient cap (KES)</label>
+                <input
+                  style={css.input}
+                  type="number"
+                  value={getPreauthRule(tariffUploadInsurer)?.outpatientCap || ''}
+                  onChange={e => setInsuranceConfig(current => ({
+                    ...current,
+                    preauthRules: {
+                      ...current.preauthRules,
+                      [tariffUploadInsurer]: {
+                        ...(getPreauthRule(tariffUploadInsurer) || {}),
+                        outpatientCap: Number(e.target.value || 0),
+                      },
+                    },
+                  }))}
+                />
+              </div>
+              <div>
+                <label style={css.lbl}>Required claim documents</label>
+                <textarea
+                  style={{...css.input,minHeight:'120px',resize:'vertical'}}
+                  value={(insuranceConfig.documentRequirements?.[tariffUploadInsurer] || []).join('\n')}
+                  onChange={e => setInsuranceConfig(current => ({
+                    ...current,
+                    documentRequirements: {
+                      ...current.documentRequirements,
+                      [tariffUploadInsurer]: e.target.value.split('\n').map(line => line.trim()).filter(Boolean),
+                    },
+                  }))}
+                />
+                <label style={css.lbl}>Manual tariff guide</label>
+                <textarea
+                  style={{...css.input,minHeight:'120px',resize:'vertical'}}
+                  value={Object.entries(insuranceConfig.tariffGuide?.[tariffUploadInsurer] || {})
+                    .map(([service, entry]) => `${service}|${entry.rate || 0}|${entry.covered !== false ? 'covered' : 'not-covered'}|${entry.plan || ''}`)
+                    .join('\n')}
+                  onChange={e => {
+                    const nextEntries = {}
+                    e.target.value.split('\n').map(line => line.trim()).filter(Boolean).forEach(line => {
+                      const [service, rate, covered, plan] = line.split('|')
+                      if (!service) return
+                      nextEntries[service.trim()] = {
+                        rate: Number(rate || 0),
+                        covered: String(covered || 'covered').toLowerCase() !== 'not-covered',
+                        plan: (plan || '').trim(),
+                      }
+                    })
+                    setInsuranceConfig(current => ({
+                      ...current,
+                      tariffGuide: {
+                        ...current.tariffGuide,
+                        [tariffUploadInsurer]: nextEntries,
+                      },
+                    }))
+                  }}
+                />
+                <div style={{display:'flex',gap:'8px'}}>
+                  <button style={{...css.btn,...css.btnGhost}} onClick={() => tariffInputRef.current?.click()}>Upload Tariff CSV</button>
+                  <button style={{...css.btn,...css.btnPri}} onClick={() => saveInsuranceConfig(insuranceConfig)} disabled={configSaving}>
+                    {configSaving ? 'Saving...' : 'Save Payer Setup'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showCollectionsModal && (
+        <div style={css.overlay} onClick={() => setShowCollectionsModal(null)}>
+          <div style={css.modal} onClick={e => e.stopPropagation()}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'12px'}}>
+              <div style={css.modalH}>Collections Letter</div>
+              <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setShowCollectionsModal(null)}>Close</button>
+            </div>
+            <div style={{fontSize:'12px',color:C.sub,marginBottom:'10px'}}>{showCollectionsModal.insurer}</div>
+            <textarea readOnly style={{...css.input,minHeight:'260px',resize:'vertical'}} value={showCollectionsModal.text} />
+            <div style={{display:'flex',gap:'8px'}}>
+              <button
+                style={{...css.btn,...css.btnGhost}}
+                onClick={async () => {
+                  await navigator.clipboard.writeText(showCollectionsModal.text)
+                  window.notifyFromLegacyAlert('Collections letter copied.')
+                }}
+              >
+                Copy Letter
+              </button>
+              <button style={{...css.btn,...css.btnPri}} onClick={() => setShowCollectionsModal(null)}>Done</button>
+            </div>
           </div>
         </div>
       )}

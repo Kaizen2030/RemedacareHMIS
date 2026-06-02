@@ -2,16 +2,17 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import supabase from '../supabase'
 import { notifyWarning } from '../notifications'
 import { resolveRole } from '../access'
+import hmsLogo from '../../icon.ico'
 
 const AUTH_GATE_KEY = 'remedacare:auth:gate'
 const AUTH_CACHE_KEY = 'remedacare:auth:profile'
 const AUTH_BRANDING_KEY = 'remedacare:auth:branding'
 const AUTH_RETURN_PATH_KEY = 'remedacare:auth:return_path'
 const DEFAULT_BRANDING = {
-  hospitalName: 'RemedacareHMIS',
-  logoBase64: '',
+  hospitalName: 'Brightpath Travel Scholars',
+  logoBase64: hmsLogo,
   level: 'Kenya',
-  primaryColor: '#0F6E56',
+  primaryColor: '#5B21B6',
 }
 
 function formatWorkspaceSetupError(prefix, error) {
@@ -49,6 +50,30 @@ function removeStorage(storage, key) {
   } catch (_) {
     // Ignore storage failures
   }
+}
+
+function clearSupabaseAuthStorage() {
+  if (typeof window === 'undefined') return
+
+  const keysToRemove = new Set()
+  const collect = (storage) => {
+    if (!storage) return
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index)
+      if (!key) continue
+      if (key.startsWith('sb-') || key.startsWith('supabase.')) {
+        keysToRemove.add(key)
+      }
+    }
+  }
+
+  collect(window.localStorage)
+  collect(window.sessionStorage)
+
+  keysToRemove.forEach((key) => {
+    removeStorage(window.localStorage, key)
+    removeStorage(window.sessionStorage, key)
+  })
 }
 
 function readAuthGate() {
@@ -248,6 +273,7 @@ export default function useAuth({ onSignedOut } = {}) {
     } catch (error) {
       console.warn('Local sign-out cleanup failed:', error?.message || error)
     }
+    clearSupabaseAuthStorage()
     resetAuthState()
   }, [resetAuthState])
 
@@ -268,30 +294,22 @@ export default function useAuth({ onSignedOut } = {}) {
 
   const handleDeepLink = useCallback((url) => {
     try {
-      let params = new URLSearchParams()
-      let token = null
-      let type = null
+      const urlObj = new URL(url)
+      const params = new URLSearchParams()
+      new URLSearchParams(urlObj.hash.replace(/^#/, '')).forEach((value, key) => params.set(key, value))
+      new URLSearchParams(urlObj.search.replace(/^\?/, '')).forEach((value, key) => params.set(key, value))
 
-      if (url.includes('#')) {
-        params = new URLSearchParams(url.split('#')[1] || '')
-      } else if (url.includes('?')) {
-        params = new URLSearchParams(url.split('?')[1] || '')
-      }
+      const type = String(params.get('type') || '').toLowerCase()
+      const host = String(urlObj.host || '').toLowerCase()
+      const pathname = String(urlObj.pathname || '').toLowerCase()
+      const isRecoveryLink = type === 'recovery' || host === 'reset' || pathname.includes('/reset')
 
-      token = params.get('token') || params.get('access_token')
-      type = params.get('type')
-
-      if (!token && (url.includes('access_token=') || url.includes('token='))) {
-        const tokenMatch = url.match(/[?&](?:access_)?token=([^&?#]+)/)
-        if (tokenMatch) token = tokenMatch[1]
-      }
-
-      if (!type && url.includes('/reset')) {
-        type = 'recovery'
-      }
-
-      if (type === 'recovery' || token) {
+      if (isRecoveryLink) {
+        const token = params.get('token') || params.get('access_token')
         setIsPasswordRecovery(true)
+        setCheckingAuth(false)
+        setAuthError(null)
+        setUser(null)
         localStorage.setItem('remedacare_password_recovery', 'true')
         if (token) localStorage.setItem('remedacare_reset_token', token)
       }
@@ -305,25 +323,43 @@ export default function useAuth({ onSignedOut } = {}) {
     if (storedFlag === 'true') setIsPasswordRecovery(true)
 
     if (typeof window !== 'undefined') {
-      const hash = window.location.hash
-      const search = window.location.search
-      const fullUrl = window.location.href
-      if (
-        hash.includes('access_token') ||
-        hash.includes('token') ||
-        search.includes('access_token') ||
-        search.includes('token') ||
-        fullUrl.includes('access_token') ||
-        fullUrl.includes('token')
-      ) {
-        setIsPasswordRecovery(true)
+      try {
+        const urlObj = new URL(window.location.href)
+        const params = new URLSearchParams()
+        new URLSearchParams(urlObj.hash.replace(/^#/, '')).forEach((value, key) => params.set(key, value))
+        new URLSearchParams(urlObj.search.replace(/^\?/, '')).forEach((value, key) => params.set(key, value))
+        const type = String(params.get('type') || '').toLowerCase()
+        const host = String(urlObj.host || '').toLowerCase()
+        const pathname = String(urlObj.pathname || '').toLowerCase()
+        if (type === 'recovery' || host === 'reset' || pathname.includes('/reset')) {
+          setIsPasswordRecovery(true)
+          setCheckingAuth(false)
+        }
+      } catch (_) {
+        // ignore non-standard URLs
       }
     }
 
     if (window.electronAPI && window.electronAPI.getCommandLine) {
       window.electronAPI.getCommandLine().then((args) => {
-        const hasResetArg = args.some((arg) => arg.includes('reset') || arg.includes('token'))
-        if (hasResetArg) setIsPasswordRecovery(true)
+        const hasResetArg = args.some((arg) => {
+          const value = String(arg || '')
+          if (!value) return false
+          try {
+            const parsed = new URL(value)
+            const type = String(parsed.searchParams.get('type') || '').toLowerCase()
+            const host = String(parsed.host || '').toLowerCase()
+            const pathname = String(parsed.pathname || '').toLowerCase()
+            return type === 'recovery' || host === 'reset' || pathname.includes('/reset')
+          } catch (_) {
+            const lower = value.toLowerCase()
+            return lower.includes('/reset') || lower.includes('type=recovery')
+          }
+        })
+        if (hasResetArg) {
+          setIsPasswordRecovery(true)
+          setCheckingAuth(false)
+        }
       }).catch(() => {})
     }
   }, [])
@@ -597,9 +633,10 @@ export default function useAuth({ onSignedOut } = {}) {
 
         if (staffError) {
           console.error('Owner staff creation failed:', staffError)
-          setAuthError('Unable to create your admin user record. Please contact support.')
-          setCheckingAuth(false)
-          return null
+          const fallbackLinkSuccess = await ensureHospitalUserLink(userId, nextHospitalId, 'admin')
+          if (!fallbackLinkSuccess) {
+            console.warn('Fallback admin link creation also failed; continuing to owner verification.')
+          }
         }
 
         const { error: rpcErr } = await supabase.rpc('set_staff_role', {
@@ -612,9 +649,7 @@ export default function useAuth({ onSignedOut } = {}) {
           console.warn('Role sync failed:', rpcErr.message)
           const fallbackSuccess = await ensureHospitalUserLink(userId, nextHospitalId, 'admin')
           if (!fallbackSuccess) {
-            setAuthError('Unable to create your admin login link. Please contact support.')
-            setCheckingAuth(false)
-            return null
+            console.warn('Admin login link fallback also failed; continuing to owner verification.')
           }
         }
       }
@@ -905,3 +940,4 @@ export default function useAuth({ onSignedOut } = {}) {
     resetPasswordRecovery,
   }
 }
+

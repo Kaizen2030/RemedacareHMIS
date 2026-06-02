@@ -1,3 +1,5 @@
+import { memo } from 'react'
+
 function vitalChips(vitals) {
   if (!vitals) return []
   return [
@@ -9,13 +11,13 @@ function vitalChips(vitals) {
   ].filter(Boolean)
 }
 
-export default function PatientWorkflowCard({
+function PatientWorkflowCard({
   patientName,
   patient = {},
   visit = {},
   latestVitals = null,
   badges = [],
-  accentColor = '#0F6E56',
+  accentColor = '#5B21B6',
   background = '#FFFFFF',
   compact = false,
   extraMeta = [],
@@ -112,3 +114,5 @@ export default function PatientWorkflowCard({
     </div>
   )
 }
+
+export default memo(PatientWorkflowCard)

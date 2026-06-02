@@ -1369,7 +1369,7 @@ async function updateStatus(id, status) {
 
     const message = buildMessage(claimSetting.template || DEFAULT_TEMPLATES[notificationType], {
       patient_name: patient?.full_name || claim.patient_name || 'Patient',
-      hospital_name: hospitalName || 'RemedacareHMIS',
+      hospital_name: hospitalName || 'Brightpath Travel Scholars',
       amount: Number(claim.amount_claimed || 0).toLocaleString(),
     })
 
@@ -2965,3 +2965,4 @@ const serviceBreakdown = Object.values(serviceMap).sort((a,b) => b.total-a.total
  </div>
  )
 }
+

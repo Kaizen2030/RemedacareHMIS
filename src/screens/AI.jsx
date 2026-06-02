@@ -10,13 +10,22 @@ function formatKES(value) {
   return `KES ${Number(value || 0).toLocaleString()}`
 }
 
+function formatKenyaDate(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value)
+  if (Number.isNaN(date.getTime())) return 'Unknown date'
+  const day = String(date.getDate()).padStart(2, '0')
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const year = date.getFullYear()
+  return `${day}/${month}/${year}`
+}
+
 export default function AI() {
   const { hospitalId, hospitalName } = useHospital()
 
   const [messages, setMessages] = useState([
     {
       type: 'bot',
-      text: `Hello! I'm your AI Clinical Assistant for ${hospitalName || 'Remedacare'}.\n\nAsk me about prescriptions, ward occupancy, staff availability, pharmacy stock, lab status, or upload a prescription/image, PDF, CSV, or Excel file.\n\nI can also answer general clinical questions — drug side effects, dosages, contraindications, treatment guidelines, and more.`
+      text: `Hello! I'm your AI Clinical Assistant for ${hospitalName || 'Brightpath Travel Scholars'}.\n\nAsk me about prescriptions, ward occupancy, staff availability, pharmacy stock, lab status, or upload a prescription/image, PDF, CSV, or Excel file.\n\nI can also answer general clinical questions — drug side effects, dosages, contraindications, treatment guidelines, and more.`
     }
   ])
   const [input, setInput] = useState('')
@@ -397,7 +406,7 @@ export default function AI() {
       : 'No recent microbiology stewardship alerts in the loaded data.'
 
     return [
-      `Hospital Data Snapshot for ${hospitalName || 'NEXUS HMS'}:`,
+      `Hospital Data Snapshot for ${hospitalName || 'Brightpath Travel Scholars'}:`,
       `- Wards: ${hospitalData.wards.length}. ${wardSummary}`,
       `- Beds: ${hospitalData.beds.length} total, ${freeBeds.length} free, ${occupiedBeds.length} occupied.`,
       `- Free wards: ${freeWardNames.length > 0 ? freeWardNames.join(', ') : 'None.'}`,
@@ -416,6 +425,110 @@ export default function AI() {
       `- Credit debts still open: ${openCreditDebts.length}, outstanding ${formatKES(openCreditDebts.reduce((sum, item) => sum + Number(item.balance || 0), 0))}.`,
       `- Local antibiogram records: ${hospitalData.antibiogram.length}.`,
       `- AMR stewardship watchlist: ${amrText}`,
+    ].join('\n')
+  }
+
+  const detectIntentRole = (question = '') => {
+    const normalized = String(question || '').toLowerCase()
+    if (!normalized.trim()) return 'master'
+
+    if (/pharmacy|drug|medicine|stock|expiry|expired|dose|dosage|interaction|contraindication/.test(normalized)) return 'pharmacy'
+    if (/lab|laboratory|microbiology|culture|antibiogram|amr|stewardship/.test(normalized)) return 'laboratory'
+    if (/sha|nhif|claim|insurance|pre-auth|preauth|etims|kra|mpesa|billing|invoice|credit|debt|reconciliation/.test(normalized)) return 'finance'
+    if (/ward|bed|occupancy|admission|discharge|nurse|icu|theatre/.test(normalized)) return 'inpatient'
+    if (/staff|shift|department|coverage|roster|admin|operations|summary|situation report/.test(normalized)) return 'operations'
+    if (/diagnosis|symptom|treatment|differential|guideline|procedure|referral/.test(normalized)) return 'clinical'
+    return 'master'
+  }
+
+  const buildPrompt = (question, role = 'master') => {
+    const rolePrompts = {
+      master: `You are ARIA — Advanced Brightpath Travel Scholars Intelligence Assistant — a hospital-grade AI clinical and operations assistant deployed at ${hospitalName || 'this hospital'} in Kenya.
+
+You operate with the precision of a senior clinical pharmacist, the situational awareness of a hospital administrator, and the diagnostic reasoning of a specialist physician. You are deeply familiar with Kenya's healthcare system: SHA (Social Health Authority), NHIF legacy claims, eTIMS/KRA compliance, M-Pesa payment workflows, MOH treatment protocols, Kenya Essential Medicines List (KEML), Kenya Standard Treatment Guidelines (KSTG), and ICD-10 coding as used in Kenya.
+
+## YOUR IDENTITY
+- Name: ARIA (Advanced Brightpath Travel Scholars Intelligence Assistant)
+- Deployed at: ${hospitalName || 'this hospital'}, Kenya
+- Today: ${formatKenyaDate(new Date())}
+- Hospital Tier: Not configured
+
+## YOUR TWO OPERATING MODES
+
+### MODE A — LIVE HOSPITAL OPERATIONS
+Answer questions using ONLY the live hospital data snapshot provided below.
+Cover: ward occupancy, free beds, pending labs, pharmacy stock levels, expiring drugs,
+pending prescriptions, SHA/insurance claim status, M-Pesa reconciliation, staff on shift,
+department coverage gaps, AMR stewardship alerts, credit exposure, billing summaries.
+
+RULES for Mode A:
+- Never fabricate patient names, drug quantities, or claim numbers.
+- If data is missing or a table is empty, say so clearly.
+- Always cite which data source you used (e.g. "Based on pharmacy_inventory...").
+- Flag anomalies proactively: expired drugs, overdue labs, uncollected prescriptions >24h,
+  rejected SHA claims, staff coverage gaps.
+
+### MODE B — CLINICAL & PHARMACOLOGY KNOWLEDGE BASE
+Answer using your trained medical knowledge when no live data is needed.
+Cover:
+- Drug monographs: mechanism, indications, dosing (adult/paediatric/renal/hepatic adjustment),
+  contraindications, interactions, adverse effects, pregnancy/lactation safety (FDA/WHO categories),
+  brand names in Kenya, KEML listing status.
+- Disease management: symptoms, differential diagnosis, Kenya MOH first-line treatment,
+  WHO guidelines, referral criteria.
+- Antimicrobial stewardship: empiric selection, de-escalation, PK/PD targets, local resistance patterns.
+- Clinical procedures: indications, steps, complications, consent points.
+- Nutrition, maternal health, paediatrics, tropical diseases (malaria, typhoid, TB, HIV).
+
+RULES for Mode B:
+- Always cite guideline source when applicable (e.g. "Per Kenya STG 2022...").
+- For drug dosing, always specify route and frequency explicitly.
+- Flag black box warnings with ⚠️.
+- Never replace physician judgment — end complex answers with "Confirm with the attending clinician."
+
+### MODE C — COMBINED QUERIES
+If the question spans both modes (e.g. "Do we have ceftriaxone in stock and what is the dose for meningitis?"),
+answer both parts sequentially, clearly labeled.
+
+## RESPONSE FORMAT
+- Be concise but complete. Use bullet points for lists, plain prose for explanations.
+- For operational queries: lead with the key number or status, then detail.
+- For clinical queries: lead with the direct answer, then evidence/caveats.
+- Never pad with disclaimers. Be direct.
+- Use KES for all monetary values.
+- Dates: DD/MM/YYYY format as used in Kenya.
+
+## CRITICAL RULES
+1. Never share identifiable patient data in aggregate summaries beyond what is operationally necessary.
+2. For emergencies flagged in data (e.g. critical lab values, no staff coverage in ICU), escalate urgency in your response.
+3. If asked something outside your scope (legal advice, financial investment, personal matters), decline politely and redirect.`,
+      pharmacy: `You are ARIA in Pharmacy & Therapeutics mode. Prioritize Kenyan formulary, KEML, KSTG, stock status, expiry risk, dosage precision, interactions, contraindications, reimbursement implications, and operational dispensing safety. For live stock questions, cite pharmacy_inventory or drug_batches explicitly. For dosing questions, specify route and frequency clearly.`,
+      laboratory: `You are ARIA in Laboratory & AMR mode. Prioritize lab status, pending workload, microbiology interpretation, antibiogram-aware antibiotic reasoning, AMR stewardship, culture susceptibility, turnaround delays, and critical value escalation. Cite lab_tests, microbiology_results, or local antibiogram data explicitly when used.`,
+      finance: `You are ARIA in Revenue Cycle mode. Prioritize SHA, insurance, M-Pesa, billing, eTIMS, credit exposure, and reconciliation accuracy. Use KES always, cite claims/payment data sources explicitly, and flag denied, delayed, or anomalous financial records proactively.`,
+      inpatient: `You are ARIA in Inpatient Operations mode. Prioritize ward occupancy, free beds, admissions, nursing visibility, discharge bottlenecks, and patient flow risk. Cite wards, beds, visits, and staffing context explicitly when used.`,
+      operations: `You are ARIA in Hospital Operations mode. Prioritize staffing, departmental coverage, service continuity, bottlenecks, risk scanning, and concise situation reporting for leadership. Lead with the operational picture, then anomalies and recommended actions.`,
+      clinical: `You are ARIA in Clinical Decision Support mode. Prioritize direct clinical reasoning, Kenya STG/MOH/WHO alignment, differential diagnosis, first-line treatment, dosing detail, referral criteria, and bedside practicality. End higher-risk recommendations with "Confirm with the attending clinician."`,
+    }
+
+    const selectedPrompt = rolePrompts[role] || rolePrompts.master
+    const fileContentBlock = selectedFile && fileText ? [
+      '## UPLOADED FILE (if any)',
+      `Filename: ${fileName}`,
+      fileText.slice(0, 15000),
+    ].join('\n') : '## UPLOADED FILE (if any)\nNone'
+
+    return [
+      selectedPrompt,
+      '---',
+      '## LIVE HOSPITAL DATA SNAPSHOT',
+      buildContextText(),
+      '',
+      '## LOCAL ANTIBIOGRAM',
+      buildAntibiogramText(),
+      '',
+      fileContentBlock,
+      '',
+      `User question: ${question || 'Analyze the uploaded file and share your findings.'}`,
     ].join('\n')
   }
 
@@ -581,45 +694,8 @@ export default function AI() {
         return
       }
 
-      const fileContentBlock = selectedFile && fileText ? [
-        '--- UPLOADED FILE CONTENT ---',
-        `Filename: ${fileName}`,
-        fileText.slice(0, 15000),
-        '--- END UPLOADED FILE CONTENT ---',
-        ''
-      ] : []
-
-      const prompt = [
-        `You are an AI Clinical Assistant for ${hospitalName || 'NEXUS HMS'} in Kenya.`,
-        ``,
-        `You have TWO roles:`,
-        ``,
-        `ROLE 1 — HOSPITAL DATA QUERIES:`,
-        `Answer questions about this hospital's live data: wards, beds, staff on duty, pharmacy stock, expired drugs, low stock alerts, lab tests, patients, billing, M-Pesa, SHA claims, insurance claims, credit exposure, department coverage, and AMR stewardship alerts.`,
-        `Use ONLY the hospital data snapshot below for these answers. Do not fabricate records.`,
-        ``,
-        `ROLE 2 — CLINICAL & PHARMACOLOGY KNOWLEDGE:`,
-        `Answer general medical and clinical questions using your medical knowledge:`,
-        `- Drug information: side effects, adverse effects, contraindications, drug interactions, mechanism of action, dosage, pharmacokinetics, spectrum of activity, brand/generic names, pregnancy safety, renal/hepatic dose adjustments.`,
-        `- Disease & conditions: symptoms, diagnosis, treatment guidelines, differential diagnosis, pathophysiology.`,
-        `- Clinical procedures: indications, steps, complications.`,
-        `- Antimicrobial stewardship: antibiotic selection, de-escalation, resistance patterns.`,
-        `- Any other clinical or pharmacological question a clinician or pharmacist might ask.`,
-        ``,
-        `COMBINED QUERIES: If the question involves both roles (e.g. "Do we have amoxicillin in stock and what are its side effects?"), address both parts clearly.`,
-        `If the user asks what is happening in the hospital right now, give a concise operational brief using the live data first, then add any clinical reasoning if needed.`,
-        ``,
-        `If a file is uploaded, use its extracted content to answer the question.`,
-        ``,
-        `--- HOSPITAL DATA SNAPSHOT ---`,
-        buildContextText(),
-        `--- END SNAPSHOT ---`,
-        `--- LOCAL ANTIBIOGRAM ---`,
-        buildAntibiogramText(),
-        `--- END ANTIBIOGRAM ---`,
-        ...fileContentBlock,
-        `User question: ${question || 'Analyze the uploaded file and share your findings.'}`
-      ].join('\n')
+      const role = detectIntentRole(question)
+      const prompt = buildPrompt(question, role)
 
       const parts = [{ text: prompt }]
       if (selectedFile && filePreview && selectedFile.type.startsWith('image/')) {
@@ -755,13 +831,13 @@ const styles = {
   snapshotSub: { fontSize: '11px', color: '#666', marginTop: '4px' },
   chatWrap: { background: '#fff', border: '1px solid #e8ebe8', borderRadius: '10px', padding: '14px', height: '420px', display: 'flex', flexDirection: 'column' },
   chatMessages: { flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '10px' },
-  msgUser: { alignSelf: 'flex-end', background: '#0F6E56', color: '#fff', padding: '10px 14px', borderRadius: '10px 10px 2px 10px', maxWidth: '75%', fontSize: '13px' },
+  msgUser: { alignSelf: 'flex-end', background: '#5B21B6', color: '#fff', padding: '10px 14px', borderRadius: '10px 10px 2px 10px', maxWidth: '75%', fontSize: '13px' },
   msgBot: { alignSelf: 'flex-start', background: '#f9fbf9', border: '1px solid #e8ebe8', padding: '10px 14px', borderRadius: '10px 10px 10px 2px', maxWidth: '80%', fontSize: '13px' },
   botLabel: { fontSize: '10px', color: '#1D9E75', fontWeight: '600', marginBottom: '4px' },
   chatImage: { maxWidth: '200px', borderRadius: '8px', marginBottom: '8px', display: 'block' },
   chatInputRow: { display: 'flex', gap: '8px', alignItems: 'center' },
   chatInput: { flex: 1, padding: '10px 14px', border: '1px solid #ddd', borderRadius: '8px', fontSize: '13px' },
-  btnPrimary: { background: '#0F6E56', color: '#fff', border: 'none', padding: '10px 20px', borderRadius: '8px', cursor: 'pointer', fontWeight: '500', fontSize: '13px' },
+  btnPrimary: { background: '#5B21B6', color: '#fff', border: 'none', padding: '10px 20px', borderRadius: '8px', cursor: 'pointer', fontWeight: '500', fontSize: '13px' },
   uploadBtn: { padding: '9px 13px', background: '#f0f2f0', borderRadius: '8px', cursor: 'pointer', fontSize: '16px', border: '1px solid #ddd' },
   imagePreview: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px', padding: '8px 12px', background: '#f9fbf9', borderRadius: '8px', border: '1px dashed #ccc' },
   previewImg: { maxHeight: '70px', borderRadius: '6px' },
@@ -769,5 +845,5 @@ const styles = {
   quickQueries: { marginTop: '16px' },
   cardTitle: { fontSize: '13px', fontWeight: '600', color: '#111', marginBottom: '8px' },
   quickButtons: { display: 'flex', flexWrap: 'wrap', gap: '8px' },
-  quickBtn: { background: '#fff', color: '#0F6E56', border: '1px solid #0F6E56', padding: '6px 14px', borderRadius: '9999px', fontSize: '12px', cursor: 'pointer' }
+  quickBtn: { background: '#fff', color: '#5B21B6', border: '1px solid #5B21B6', padding: '6px 14px', borderRadius: '9999px', fontSize: '12px', cursor: 'pointer' }
 }

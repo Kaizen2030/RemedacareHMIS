@@ -9,8 +9,8 @@ function createWindow() {
       nodeIntegration: false,
       contextIsolation: true
     },
-    icon: path.join(__dirname, 'public/icon.png'), // optional
-    title: 'RemedacareHMIS'
+    icon: path.join(__dirname, '..', 'icon.ico'), // optional
+    title: 'Brightpath Travel Scholars'
   })
 
   win.loadURL('http://localhost:5173') // your Vite dev port
@@ -20,3 +20,4 @@ function createWindow() {
 
 app.whenReady().then(createWindow)
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
+

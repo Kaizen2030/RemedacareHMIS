@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Patient R VITEK Auto Alerts Sample</title>
+  <style>
+    :root {
+      --ink: #0f172a;
+      --muted: #64748b;
+      --line: #e5e7eb;
+      --green: #16a34a;
+      --amber: #d97706;
+      --red: #dc2626;
+      --bg: #f8fafc;
+      --card: #ffffff;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font-family: Arial, Helvetica, sans-serif; }
+    .page { max-width: 920px; margin: 24px auto; background: var(--card); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; }
+    .header { padding: 24px 28px; background: linear-gradient(135deg, #0f6e56, #134e4a); color: #fff; }
+    .header .eyebrow { font-size: 12px; text-transform: uppercase; letter-spacing: 1.5px; color: #c7f9e6; font-weight: 700; margin-bottom: 8px; }
+    .header h1 { margin: 0 0 8px; font-size: 28px; line-height: 1.1; }
+    .header p { margin: 0; font-size: 13px; color: rgba(255,255,255,.78); }
+    .body { padding: 24px 28px 30px; }
+    .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .chip { padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: #fff; }
+    .chip .label { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+    .chip .value { font-size: 14px; font-weight: 800; color: var(--ink); }
+    .block { border: 1px solid var(--line); border-radius: 16px; padding: 18px; margin-bottom: 16px; break-inside: avoid; page-break-inside: avoid; }
+    .block h2 { margin: 0 0 6px; font-size: 20px; color: #0f6e56; }
+    .meta { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+    .badges { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+    .badge { padding: 6px 10px; border-radius: 999px; font-size: 12px; font-weight: 800; color: #fff; }
+    .badge.green { background: var(--green); }
+    .badge.amber { background: var(--amber); }
+    .badge.red { background: var(--red); }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+    th, td { border-top: 1px solid var(--line); padding: 10px 8px; font-size: 13px; text-align: left; vertical-align: middle; }
+    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .9px; }
+    td.result { font-weight: 800; text-align: center; width: 120px; border-radius: 999px; }
+    td.result.s { color: #166534; background: #dcfce7; }
+    td.result.i { color: #b45309; background: #fef3c7; }
+    td.result.r { color: #b91c1c; background: #fee2e2; }
+    .footer { margin-top: 16px; font-size: 11px; color: var(--muted); }
+    @media print { body { background: #fff; } .page { margin: 0; border: none; border-radius: 0; } .block { break-inside: avoid; page-break-inside: avoid; } }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div class="eyebrow">Brightpath Travel Scholars VITEK Sample</div>
+      <h1>VITEK Antibiogram Upload Test</h1>
+      <p>Fresh unique sample set for testing isolate Telegram alerts, threshold Telegram alerts, and PDF extraction.</p>
+    </div>
+    <div class="body">
+      <div class="summary">
+        <div class="chip"><div class="label">Hospital</div><div class="value">JK Havens Hospital</div></div>
+        <div class="chip"><div class="label">Sample set</div><div class="value">Patient R / S / T / U</div></div>
+        <div class="chip"><div class="label">Mode</div><div class="value">Auto alerts test</div></div>
+        <div class="chip"><div class="label">Records</div><div class="value">4 isolates</div></div>
+      </div>
+
+      <div class="block">
+        <h2>Test Patient R - Enterobacter cloacae</h2>
+        <div class="meta"><span>Blood Culture</span><span>30 May 2026</span><span>ICU / HDU</span><span>Heavy growth</span><span>Gram negative bacilli</span></div>
+        <div class="badges"><span class="badge amber">CRE / CRB</span></div>
+        <table><thead><tr><th>Antibiotic</th><th>Result</th></tr></thead><tbody>
+          <tr><td>Cotrimoxazole</td><td class="result s">S 18%</td></tr>
+          <tr><td>Ciprofloxacin</td><td class="result s">S 22%</td></tr>
+          <tr><td>Levofloxacin</td><td class="result s">S 24%</td></tr>
+          <tr><td>Gentamicin</td><td class="result r">R 30%</td></tr>
+          <tr><td>Amikacin</td><td class="result r">R 34%</td></tr>
+          <tr><td>Tobramycin</td><td class="result r">R 40%</td></tr>
+          <tr><td>Ceftriaxone</td><td class="result s">S 8%</td></tr>
+          <tr><td>Ceftazidime</td><td class="result s">S 10%</td></tr>
+          <tr><td>Cefepime</td><td class="result s">S 12%</td></tr>
+          <tr><td>Meropenem</td><td class="result s">S 6%</td></tr>
+          <tr><td>Imipenem</td><td class="result s">S 7%</td></tr>
+          <tr><td>Cefoxitin</td><td class="result s">S 12%</td></tr>
+        </tbody></table>
+      </div>
+
+      <div class="block">
+        <h2>Test Patient S - Proteus mirabilis</h2>
+        <div class="meta"><span>Urine</span><span>29 May 2026</span><span>Medical Ward</span><span>Moderate growth</span><span>Gram negative bacilli</span></div>
+        <div class="badges"><span class="badge green">ESBL</span></div>
+        <table><thead><tr><th>Antibiotic</th><th>Result</th></tr></thead><tbody>
+          <tr><td>Cotrimoxazole</td><td class="result s">S 95%</td></tr>
+          <tr><td>Ciprofloxacin</td><td class="result s">S 90%</td></tr>
+          <tr><td>Levofloxacin</td><td class="result s">S 88%</td></tr>
+          <tr><td>Gentamicin</td><td class="result s">S 74%</td></tr>
+          <tr><td>Amikacin</td><td class="result s">S 98%</td></tr>
+          <tr><td>Ceftriaxone</td><td class="result s">S 20%</td></tr>
+          <tr><td>Ceftazidime</td><td class="result s">S 26%</td></tr>
+          <tr><td>Cefepime</td><td class="result i">I 38%</td></tr>
+          <tr><td>Meropenem</td><td class="result s">S 96%</td></tr>
+          <tr><td>Imipenem</td><td class="result s">S 95%</td></tr>
+          <tr><td>Nitrofurantoin</td><td class="result s">S 10%</td></tr>
+        </tbody></table>
+      </div>
+
+      <div class="block">
+        <h2>Test Patient T - Enterococcus faecium</h2>
+        <div class="meta"><span>Wound Swab</span><span>28 May 2026</span><span>Surgical Ward</span><span>Moderate growth</span><span>Gram positive cocci</span></div>
+        <div class="badges"><span class="badge red">MRSA</span></div>
+        <table><thead><tr><th>Antibiotic</th><th>Result</th></tr></thead><tbody>
+          <tr><td>Gentamicin</td><td class="result s">S 86%</td></tr>
+          <tr><td>Amikacin</td><td class="result s">S 92%</td></tr>
+          <tr><td>Vancomycin</td><td class="result s">S 54%</td></tr>
+          <tr><td>Linezolid</td><td class="result s">S 96%</td></tr>
+          <tr><td>Doxycycline</td><td class="result s">S 90%</td></tr>
+          <tr><td>Clindamycin</td><td class="result s">S 82%</td></tr>
+          <tr><td>Erythromycin</td><td class="result r">R 16%</td></tr>
+          <tr><td>Azithromycin</td><td class="result r">R 18%</td></tr>
+        </tbody></table>
+      </div>
+
+      <div class="block">
+        <h2>Test Patient U - Acinetobacter baumannii</h2>
+        <div class="meta"><span>Tracheal Aspirate</span><span>27 May 2026</span><span>Respiratory ICU</span><span>Heavy growth</span><span>Gram negative bacilli</span></div>
+        <div class="badges"><span class="badge amber">CRE / CRB</span></div>
+        <table><thead><tr><th>Antibiotic</th><th>Result</th></tr></thead><tbody>
+          <tr><td>Cotrimoxazole</td><td class="result s">S 12%</td></tr>
+          <tr><td>Ciprofloxacin</td><td class="result s">S 14%</td></tr>
+          <tr><td>Levofloxacin</td><td class="result s">S 16%</td></tr>
+          <tr><td>Gentamicin</td><td class="result r">R 20%</td></tr>
+          <tr><td>Amikacin</td><td class="result r">R 24%</td></tr>
+          <tr><td>Tobramycin</td><td class="result r">R 28%</td></tr>
+          <tr><td>Ceftriaxone</td><td class="result s">S 6%</td></tr>
+          <tr><td>Ceftazidime</td><td class="result s">S 8%</td></tr>
+          <tr><td>Cefepime</td><td class="result s">S 10%</td></tr>
+          <tr><td>Meropenem</td><td class="result s">S 4%</td></tr>
+          <tr><td>Imipenem</td><td class="result s">S 5%</td></tr>
+        </tbody></table>
+      </div>
+
+      <div class="footer">This is a generated sample for Brightpath Travel Scholars testing only. Upload the PDF to test VITEK parsing, isolate alerts, and auto threshold Telegram alerts.</div>
+    </div>
+  </div>
+</body>
+</html>
