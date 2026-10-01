@@ -3,7 +3,7 @@ import { QRCodeSVG } from 'qrcode.react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import PaginationBar, { paginateItems } from '../components/PaginationBar'
 import { buildFunctionUrl, fetchFhirBundle } from '../utils/fhir/client'
-import { findIcd10ByCode, searchIcd10Diagnoses } from '../utils/icd10Kenya'
+import { searchIcd10Diagnoses } from '../utils/icd10Kenya'
 import { resolveRole } from '../access'
 import { useHospital } from '../context'
 import supabase from '../supabase'
@@ -202,7 +202,7 @@ function ReferralLetter({ referral, hospitalName, hospitalProfile }) {
 
   const vitals = referral.vitals_at_referral || {}
   const qrMarkup = renderToStaticMarkup(
-    <QRCodeSVG value={buildReferralQrValue(referral)} size={96} fgColor="#5B21B6" bgColor="#FFFFFF" />
+    <QRCodeSVG value={buildReferralQrValue(referral)} size={96} fgColor="#0F6E56" bgColor="#FFFFFF" />
   )
 
   return `
@@ -212,8 +212,8 @@ function ReferralLetter({ referral, hospitalName, hospitalProfile }) {
         <style>
           body{font-family:Arial,sans-serif;margin:0;padding:22px;color:#111827;background:#fff}
           .letter{max-width:920px;margin:0 auto}
-          .header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid #5B21B6;padding-bottom:18px;margin-bottom:20px}
-          .title{font-size:30px;font-weight:800;color:#5B21B6;margin:0}
+          .header{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid #0F6E56;padding-bottom:18px;margin-bottom:20px}
+          .title{font-size:30px;font-weight:800;color:#0F6E56;margin:0}
           .sub{font-size:13px;color:#64748B;margin-top:6px;line-height:1.5}
           .badge{display:inline-block;padding:6px 12px;border-radius:999px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;background:${URGENCY_META[referral.urgency || 'Routine'].bg};color:${URGENCY_META[referral.urgency || 'Routine'].color};margin-top:10px}
           .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 20px;margin-bottom:18px}
@@ -221,7 +221,7 @@ function ReferralLetter({ referral, hospitalName, hospitalProfile }) {
           .label{font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#6B7280;font-weight:800;margin-bottom:4px}
           .value{font-size:14px;line-height:1.55}
           .section{margin-bottom:18px}
-          .section-title{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#5B21B6;font-weight:800;margin:0 0 8px}
+          .section-title{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#0F6E56;font-weight:800;margin:0 0 8px}
           .big{font-size:15px;font-weight:700}
           ul{margin:8px 0 0 18px}
           .footer{margin-top:28px;display:grid;grid-template-columns:1fr 120px;gap:24px;align-items:end}
@@ -233,7 +233,7 @@ function ReferralLetter({ referral, hospitalName, hospitalProfile }) {
         <div class="letter">
           <div class="header">
             <div>
-              <h1 class="title">${hospitalName || referral.referring_facility || 'Brightpath Travel Scholars'}</h1>
+              <h1 class="title">${hospitalName || referral.referring_facility || 'RemedacareHMS'}</h1>
               <div class="sub">Kenya MOH Referral Letter<br/>Referring facility: ${referral.referring_facility || hospitalName || '—'}</div>
               <div class="badge">${referral.urgency || 'Routine'} referral</div>
             </div>

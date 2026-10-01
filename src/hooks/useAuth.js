@@ -2,17 +2,17 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import supabase from '../supabase'
 import { notifyWarning } from '../notifications'
 import { resolveRole } from '../access'
-import hmsLogo from '../../icon.ico'
+import hmsLogo from '../assets/remedacarehms-logo.svg'
 
 const AUTH_GATE_KEY = 'remedacare:auth:gate'
 const AUTH_CACHE_KEY = 'remedacare:auth:profile'
 const AUTH_BRANDING_KEY = 'remedacare:auth:branding'
 const AUTH_RETURN_PATH_KEY = 'remedacare:auth:return_path'
 const DEFAULT_BRANDING = {
-  hospitalName: 'Brightpath Travel Scholars',
+  hospitalName: 'RemedacareHMS',
   logoBase64: hmsLogo,
   level: 'Kenya',
-  primaryColor: '#5B21B6',
+  primaryColor: '#0F6E56',
 }
 
 function formatWorkspaceSetupError(prefix, error) {
@@ -802,49 +802,92 @@ export default function useAuth({ onSignedOut } = {}) {
   useEffect(() => {
     let active = true
 
-    supabase.auth.getSession().then(async ({ data: { session }, error }) => {
-      if (!active) return
+    const restoreWebAuthCallback = async () => {
+      if (window.electronAPI) return false
 
-      if (error) {
-        await clearStaleSession(`Unable to restore saved session: ${error.message}`)
-        return
-      }
+      const callbackUrl = new URL(window.location.href)
+      const params = new URLSearchParams(callbackUrl.search)
+      new URLSearchParams(callbackUrl.hash.replace(/^#/, '')).forEach((value, key) => params.set(key, value))
 
-      const gate = readAuthGate()
-      if (session?.user && gateMatchesUser(gate, session.user)) {
+      const type = String(params.get('type') || '').toLowerCase()
+      if (!['recovery', 'signup', 'invite', 'confirmation'].includes(type)) return false
+
+      const accessToken = params.get('access_token')
+      const refreshToken = params.get('refresh_token')
+      const code = params.get('code')
+
+      if (type === 'recovery') {
+        setIsPasswordRecovery(true)
         setCheckingAuth(false)
-        return
       }
 
-      if (session?.user && !isPasswordRecovery) {
-        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-          if (applyCachedOfflineAuth(session.user)) return
-        }
+      if (accessToken && refreshToken) {
+        const { error } = await supabase.auth.setSession({
+          access_token: accessToken,
+          refresh_token: refreshToken,
+        })
+        if (error) throw error
+        return true
+      }
 
-        const { error: userError } = await supabase.auth.getUser()
+      if (code) {
+        const { error } = await supabase.auth.exchangeCodeForSession(code)
+        if (error) throw error
+        return true
+      }
+
+      return false
+    }
+
+    const initializeAuth = async () => {
+      try {
+        const restoredFromCallback = await restoreWebAuthCallback()
+        if (!active || restoredFromCallback) return
+
+        const { data: { session }, error } = await supabase.auth.getSession()
         if (!active) return
 
-        if (userError) {
-          const normalized = userError.message?.toLowerCase() || ''
-          if (isConnectivityError(userError) && applyCachedOfflineAuth(session.user)) {
-            return
-          }
-          if (normalized.includes('refresh token') || normalized.includes('jwt') || normalized.includes('session')) {
-            await clearStaleSession(`Saved session expired: ${userError.message}`)
-            return
-          }
-          console.warn('Session verification warning:', userError.message)
+        if (error) {
+          await clearStaleSession(`Unable to restore saved session: ${error.message}`)
+          return
         }
 
-        setUser(session.user)
-        fetchHospitalId(session.user)
-      } else {
-        setCheckingAuth(false)
+        const gate = readAuthGate()
+        if (session?.user && gateMatchesUser(gate, session.user)) {
+          setCheckingAuth(false)
+          return
+        }
+
+        if (session?.user && !isPasswordRecovery) {
+          if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+            if (applyCachedOfflineAuth(session.user)) return
+          }
+
+          const { error: userError } = await supabase.auth.getUser()
+          if (!active) return
+
+          if (userError) {
+            const normalized = userError.message?.toLowerCase() || ''
+            if (isConnectivityError(userError) && applyCachedOfflineAuth(session.user)) {
+              return
+            }
+            if (normalized.includes('refresh token') || normalized.includes('jwt') || normalized.includes('session')) {
+              await clearStaleSession(`Saved session expired: ${userError.message}`)
+              return
+            }
+            console.warn('Session verification warning:', userError.message)
+          }
+
+          setUser(session.user)
+          fetchHospitalId(session.user)
+        } else {
+          setCheckingAuth(false)
+        }
+      } catch (error) {
+        if (!active) return
+        await clearStaleSession(`Session bootstrap failed: ${error?.message || error}`)
       }
-    }).catch(async (error) => {
-      if (!active) return
-      await clearStaleSession(`Session bootstrap failed: ${error?.message || error}`)
-    })
+    }
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       if (event === 'PASSWORD_RECOVERY') {
@@ -869,6 +912,8 @@ export default function useAuth({ onSignedOut } = {}) {
         onSignedOut?.()
       }
     })
+
+    initializeAuth()
 
     return () => {
       active = false
@@ -940,4 +985,3 @@ export default function useAuth({ onSignedOut } = {}) {
     resetPasswordRecovery,
   }
 }
-
