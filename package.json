@@ -1,7 +1,7 @@
 {
   "name": "remedacarehms",
   "private": true,
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "RemedacareHMS Hospital Management System",
   "author": "RemedacareHMS",
   "homepage": "https://remedacarehms.com",
@@ -65,7 +65,8 @@
       "runAfterFinish": true,
       "perMachine": false,
       "deleteAppDataOnUninstall": false
-    }
+    },
+    "npmRebuild": false
   },
   "dependencies": {
     "@google/generative-ai": "^0.2.1",

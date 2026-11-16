@@ -13,3 +13,6 @@ Thumbs.db
 !.env.example
 supabase.exe  
 supabase/.temp/ 
+
+# installers handed out to hospitals (published as GitHub Release assets, too big for the repo)
+release/
