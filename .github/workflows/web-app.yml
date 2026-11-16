@@ -42,9 +42,10 @@ jobs:
             echo "::error::Add the repository secrets VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY (Settings -> Secrets and variables -> Actions)."
             exit 1
           fi
+      - run: npm ci
+      # after npm ci: the check script imports vite (to read .env files the same way the build does)
       - name: Block service-role keys from browser builds
         run: node scripts/check-browser-key.mjs production
-      - run: npm ci
       - name: Tests
         run: npx vitest run
       - name: Build
