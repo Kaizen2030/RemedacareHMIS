@@ -1630,7 +1630,7 @@ const RESPONSIVE_CSS = `
 
 const styles = {
   fullscreen: {
-    height: '100vh',
+    minHeight: '100%', // fills #root (the visible screen); 100vh is taller than the screen on iPhone
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -1656,7 +1656,7 @@ const styles = {
   },
   container: {
     display: 'flex',
-    height: '100vh',
+    height: '100%', // exactly the visible screen: only the menu and the content area scroll
     background: colors.bgAlt,
     fontFamily: typography.systemFontFamily,
   },
@@ -1805,7 +1805,7 @@ const styles = {
     justifyContent: 'center',
     flexShrink: 0,
   },
-  main: { flex: 1, overflowY: 'auto', background: colors.bgAlt, minWidth: 0 },
+  main: { flex: 1, overflowY: 'auto', overflowX: 'hidden', overscrollBehavior: 'contain', WebkitOverflowScrolling: 'touch', background: colors.bgAlt, minWidth: 0 },
   topbar: {
     position: 'sticky',
     top: 0,
