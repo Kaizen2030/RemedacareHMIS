@@ -30,8 +30,6 @@ export function facilityBadge(level) {
 
 const MFA_WINDOW_MS = 5 * 60 * 1000
 const DEVICE_TRUST_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
-const PASSWORD_RESET_REDIRECT_URL = getAuthResetRedirectUrl()
-const ACCOUNT_CONFIRM_REDIRECT_URL = getAuthConfirmRedirectUrl()
 const PENDING_SIGNUP_EMAIL_KEY = 'remedacare:auth:pending_signup_email'
 
 function isRlsError(error) {
@@ -699,7 +697,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
       email: profile.email,
       options: {
         shouldCreateUser: false,
-        emailRedirectTo: PASSWORD_RESET_REDIRECT_URL,
+        emailRedirectTo: getAuthResetRedirectUrl(),
       },
     })
 
@@ -992,7 +990,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
     setLoading(true)
     setError('')
     try {
-      const { error: err } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: PASSWORD_RESET_REDIRECT_URL })
+      const { error: err } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: getAuthResetRedirectUrl() })
       if (err) throw err
 
       setResetSent(true)
@@ -1015,7 +1013,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
         email,
         password,
         options: {
-          emailRedirectTo: ACCOUNT_CONFIRM_REDIRECT_URL,
+          emailRedirectTo: getAuthConfirmRedirectUrl(),
           data: {
             full_name: name,
             pending_hospital_name: newHospitalName.trim(),

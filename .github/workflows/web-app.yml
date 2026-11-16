@@ -1,0 +1,62 @@
+# Web app on GitHub Pages: what iPhone and Android staff open in Safari/Chrome and add to the home screen.
+# Runs on every push to main (and by hand from the Actions tab): tests, build, publish.
+#
+# One-time setup in GitHub (Settings):
+#   1. Secrets and variables -> Actions -> New repository secret:
+#        VITE_SUPABASE_URL       (the same value as in the .env file)
+#        VITE_SUPABASE_ANON_KEY  (the public "anon" key, same as in .env - never the service_role key)
+#   2. Pages -> Build and deployment -> Source: GitHub Actions
+#   3. Supabase -> Authentication -> URL Configuration: add https://<owner>.github.io/<repo>/ to Redirect URLs
+name: Web app (GitHub Pages)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+      VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1' # the desktop app is not built here
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Check the Supabase settings are present
+        run: |
+          if [ -z "$VITE_SUPABASE_URL" ] || [ -z "$VITE_SUPABASE_ANON_KEY" ]; then
+            echo "::error::Add the repository secrets VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY (Settings -> Secrets and variables -> Actions)."
+            exit 1
+          fi
+      - run: npm ci
+      - name: Tests
+        run: npx vitest run
+      - name: Build
+        run: npx vite build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

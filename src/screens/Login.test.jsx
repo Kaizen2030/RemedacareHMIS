@@ -119,6 +119,7 @@ describe('Login password recovery', () => {
   })
 
   it('sends reset emails through the remedacare deep link redirect', async () => {
+    window.electronAPI = { onDeepLink: () => {} } // the desktop app
     render(<Login onLogin={vi.fn()} isPasswordRecovery={false} onResetDone={vi.fn()} />)
 
     fireEvent.click(screen.getByText('Forgot Password?'))
@@ -132,10 +133,22 @@ describe('Login password recovery', () => {
         redirectTo: 'remedacarehms://reset',
       })
     })
+    delete window.electronAPI
+  })
+
+  it('in the web and iPhone app, reset emails come back to the web address', async () => {
+    render(<Login onLogin={vi.fn()} isPasswordRecovery={false} onResetDone={vi.fn()} />)
+    fireEvent.click(screen.getByText('Forgot Password?'))
+    fireEvent.change(screen.getByPlaceholderText('admin@hospital.co.ke'), { target: { value: 'admin@hospital.co.ke' } })
+    fireEvent.click(screen.getByText('Send Reset Link'))
+    await waitFor(() => {
+      expect(resetPasswordForEmail).toHaveBeenCalledWith('admin@hospital.co.ke', { redirectTo: `${window.location.origin}/?type=recovery` })
+    })
   })
 
   it('sends signup confirmation links through the activation deep link', async () => {
     signUp.mockResolvedValue({ data: { user: { id: 'user-2' } }, error: null })
+    window.electronAPI = { onDeepLink: () => {} } // the desktop app
 
     render(<Login onLogin={vi.fn()} isPasswordRecovery={false} onResetDone={vi.fn()} />)
 
@@ -169,6 +182,7 @@ describe('Login password recovery', () => {
         }),
       })
     })
+    delete window.electronAPI
   })
 
   it('retains the signup email after a confirmation link opens the login screen', async () => {
