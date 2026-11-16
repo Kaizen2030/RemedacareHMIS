@@ -9,6 +9,7 @@ import useStaff from '../hooks/useStaff'
 import { executeWithFallback, omitKeys } from '../utils/dbCompat'
 import { logAudit } from '../utils/audit'
 import { buildWorkflowInvoiceNote, createServiceLine, SERVICE_SOURCES, stringifyServiceLines } from '../utils/workflowBilling'
+import { isSelfPayMethod, notifySentToCashier, unpaidInvoiceFields } from '../utils/payments/invoices'
 import { buildMessage, DEFAULT_TEMPLATES, fetchNotificationConfig, getNotificationSetting, sendPatientNotification } from '../utils/notifications'
 import {
   deriveMicrobiologyResultSummary,
@@ -31,8 +32,12 @@ import {
 } from '../utils/labStructuredResults'
 import LabOrdersTab from './laboratory/LabOrdersTab'
 import LabResultsTab from './laboratory/LabResultsTab'
+import LabQuality from './laboratory/LabQuality'
 import LabReferralsTab from './laboratory/LabReferralsTab'
 import LabSampleLabel from './laboratory/LabSampleLabel'
+import LabAnalyserInbox from './laboratory/LabAnalyserInbox'
+import { notifyError, notifySuccess, notifyWarning } from '../notifications'
+import { priceForPayer } from '../utils/hospitalConfig'
 
 // ── Microbiology C&S tests that need antibiogram PDF upload instead of simple result entry ──
 function isCultureSensitivityTest(testType, category) {
@@ -56,7 +61,7 @@ function isCultureSensitivityTest(testType, category) {
 const STATUS_COLORS = {
   Pending: { bg: '#FFF3DC', color: '#C07000', border: '#FAC775' },
   'In Progress': { bg: '#E3F0FB', color: '#1a6fb5', border: '#90C4F0' },
-  Complete: { bg: '#F3E8FF', color: '#5B21B6', border: '#D8B4FE' },
+  Complete: { bg: '#E1F5EE', color: '#0F6E56', border: '#B4E5D0' },
   Critical: { bg: '#FCEBEB', color: '#A32D2D', border: '#F09595' },
 }
 
@@ -70,13 +75,13 @@ const SAMPLE_STATUS_COLORS = {
   Ordered: { bg: '#F3F4F6', color: '#555', border: '#D1D5DB' },
   Collected: { bg: '#FEF3C7', color: '#B45309', border: '#FCD34D' },
   'In Progress': { bg: '#DBEAFE', color: '#1D4ED8', border: '#93C5FD' },
-  'Referred Out': { bg: '#F3E8FF', color: '#7C3AED', border: '#D8B4FE' },
+  'Referred Out': { bg: '#E1F5EE', color: '#0A9272', border: '#B4E5D0' },
   Resulted: { bg: '#DCFCE7', color: '#15803D', border: '#86EFAC' },
 }
 
 const LAB_STAGE_PIPELINE = ['Ordered', 'Sample Collected', 'Processing', 'Results Ready', 'Reviewed']
 const AGE_BUCKET_COLORS = {
-  fresh: { bg: '#F3E8FF', color: '#5B21B6', border: '#D8B4FE' },
+  fresh: { bg: '#E1F5EE', color: '#0F6E56', border: '#B4E5D0' },
   watch: { bg: '#FFF3DC', color: '#C07000', border: '#FAC775' },
   late: { bg: '#FFF0E3', color: '#C46600', border: '#FDBA74' },
   critical: { bg: '#FCEBEB', color: '#A32D2D', border: '#F09595' },
@@ -523,14 +528,15 @@ export default function Laboratory() {
     if (hasLinkedLabInvoice(invoices, test)) return
 
     const cc = matchLabChargeCode(test.test_type)
-    const amount = cc?.unit_price_kes || 0
+    // Payer price list (SHA / insurer) overrides the base tariff when one is set in Settings
+    const { amount } = cc?.code
+      ? await priceForPayer(supabase, hospitalId, cc.code, cc.unit_price_kes || 0, { paymentMethod: test.payment_method, insurer: test.insurer_name })
+      : { amount: 0 }
     // If no price match and amount is 0, still create a Pending invoice
     // so the billing desk can see and price it — don't silently drop it
-    const isInsurance = !['Cash', 'M-Pesa'].includes(test.payment_method || 'Cash')
+    // A doctor's order is a bill, not a payment: the patient still has to pay at the cashier.
     const payMethod = test.payment_method || 'Cash'
-    const paidAmount = (!isInsurance && amount > 0) ? amount : 0
-    const balance = amount - paidAmount
-    const status = amount === 0 ? 'Pending' : (balance <= 0 ? 'Paid' : 'Pending')
+    const isInsurance = !isSelfPayMethod(payMethod)
     const receiptNo = `INV-${Date.now().toString().slice(-6)}`
 
     await supabase.from('invoices').insert({
@@ -549,19 +555,15 @@ export default function Laboratory() {
         visitId: test.visit_id || null,
         meta: { category: test.category, priority: test.priority },
       })]),
-      amount_kes: amount,
-      paid_kes: paidAmount,
-      balance_kes: balance,
+      ...unpaidInvoiceFields(amount),
       payment_method: payMethod,
       insurer: isInsurance ? payMethod : null,
-      status,
       notes: buildWorkflowInvoiceNote({
         source: SERVICE_SOURCES.LABORATORY,
         sourceId: test.id,
         visitId: test.visit_id || null,
         summary: `Lab: ${test.test_type}${cc ? '' : ' — price to be set'}`,
       }),
-      paid_at: status === 'Paid' ? new Date().toISOString() : null,
     })
     fetchInvoices()
     try {
@@ -620,15 +622,15 @@ export default function Laboratory() {
     const testName = linkedTest?.test_name || linkedTest?.test_type || referralForm.standalone_test_name
 
     if (!patientId) {
-      window.notifyFromLegacyAlert('Select a patient or link the referral to an existing lab test.')
+      notifyWarning('Select a patient or link the referral to an existing lab test.')
       return
     }
     if (!testName) {
-      window.notifyFromLegacyAlert('Select a pending test or enter the standalone test name.')
+      notifyWarning('Select a pending test or enter the standalone test name.')
       return
     }
     if (!referralForm.referred_to) {
-      window.notifyFromLegacyAlert('Enter the referral facility name.')
+      notifyWarning('Enter the referral facility name.')
       return
     }
 
@@ -657,7 +659,7 @@ export default function Laboratory() {
 
     const { error } = await supabase.from('lab_referrals').insert(payload)
     if (error) {
-      window.notifyFromLegacyAlert('Error saving referral: ' + error.message)
+      notifyError('Error saving referral: ' + error.message)
       setSaving(false)
       return
     }
@@ -688,7 +690,7 @@ export default function Laboratory() {
   async function handleSaveReferralResult() {
     if (!selectedReferral) return
     if (!referralResultForm.result_text.trim()) {
-      window.notifyFromLegacyAlert('Enter the result text before saving.')
+      notifyWarning('Enter the result text before saving.')
       return
     }
     setSaving(true)
@@ -700,7 +702,7 @@ export default function Laboratory() {
     }
     const { error } = await supabase.from('lab_referrals').update(referralUpdate).eq('id', selectedReferral.id)
     if (error) {
-      window.notifyFromLegacyAlert('Error saving referral result: ' + error.message)
+      notifyError('Error saving referral result: ' + error.message)
       setSaving(false)
       return
     }
@@ -757,9 +759,9 @@ export default function Laboratory() {
 
   // ── Handle antibiogram PDF upload & result save ───────────────────────────
   async function handleSaveAntibiogram() {
-    if (!antibiogramForm.organism) { window.notifyFromLegacyAlert('Enter the organism identified (or "No growth" if culture is negative)'); return }
-    if (!antibiogramFile) { window.notifyFromLegacyAlert('Upload the PDF or image of the culture & sensitivity report from the lab machine'); return }
-    if (!antibiogramForm.performed_by) { window.notifyFromLegacyAlert('Enter the name of the lab technician who performed this test'); return }
+    if (!antibiogramForm.organism) { notifyWarning('Enter the organism identified (or "No growth" if culture is negative)'); return }
+    if (!antibiogramFile) { notifyWarning('Upload the PDF or image of the culture & sensitivity report from the lab machine'); return }
+    if (!antibiogramForm.performed_by) { notifyWarning('Enter the name of the lab technician who performed this test'); return }
 
     setAntibiogramUploading(true)
     const test = selected
@@ -911,18 +913,24 @@ export default function Laboratory() {
         const { data: allVisitTests } = await supabase
           .from('lab_tests')
           .select('id, status, priority, test_location')
+          .eq('hospital_id', hospitalId)
           .eq('visit_id', test.visit_id)
 
         const withCurrent = (allVisitTests || []).map(t =>
           t.id === test.id ? { ...t, status: 'Complete' } : t
         )
-        const criticalPending = withCurrent.filter(t =>
+        const pendingLabTests = withCurrent.filter(t =>
           (t.test_location || 'In-House') === 'In-House' &&
-          (t.priority === 'Urgent' || t.priority === 'STAT') &&
-          t.status !== 'Complete' && t.status !== 'Critical'
+          !['Complete', 'Completed', 'Critical', 'Cancelled'].includes(t.status)
         )
-        if (criticalPending.length === 0) {
-          await supabase.from('visits').update({ status: 'Doctor' }).eq('id', test.visit_id)
+        const { data: pendingImaging } = await supabase
+          .from('radiology_orders')
+          .select('id')
+          .eq('hospital_id', hospitalId)
+          .eq('visit_id', test.visit_id)
+          .not('status', 'in', '(Reported,Verified,Cancelled)')
+        if (pendingLabTests.length === 0 && (pendingImaging || []).length === 0) {
+          await supabase.from('visits').update({ status: 'Doctor' }).eq('id', test.visit_id).eq('hospital_id', hospitalId)
         }
       }
 
@@ -943,10 +951,10 @@ export default function Laboratory() {
       setAntibiogramFile(null)
       setAntibiogramFileName('')
       fetchTests()
-      window.notifyFromLegacyAlert(`✅ Culture & Sensitivity report saved successfully!\n\nOrganism: ${antibiogramForm.organism}\nThe result is now visible in:\n• Antibiogram screen (full S/I/R can be entered there)\n• Consultation — Labs tab\n• Pharmacy — AMR Stewardship watchlist`)
+      notifySuccess(`✅ Culture & Sensitivity report saved successfully!\n\nOrganism: ${antibiogramForm.organism}\nThe result is now visible in:\n• Antibiogram screen (full S/I/R can be entered there)\n• Consultation — Labs tab\n• Pharmacy — AMR Stewardship watchlist`)
 
     } catch (err) {
-      window.notifyFromLegacyAlert('Error saving antibiogram: ' + err.message)
+      notifyError('Error saving antibiogram: ' + err.message)
     }
 
     setAntibiogramUploading(false)
@@ -1015,12 +1023,14 @@ export default function Laboratory() {
 
   async function handleOrderTest() {
     const testName = orderForm.test_type === '__custom__' ? customTest : orderForm.test_type
-    if (!testName) { window.notifyFromLegacyAlert('Select or enter a test name'); return }
-    if (!orderForm.patient_name) { window.notifyFromLegacyAlert('Patient name required'); return }
+    if (!testName) { notifyWarning('Select or enter a test name'); return }
+    if (!orderForm.patient_name) { notifyWarning('Patient name required'); return }
     setSaving(true)
     const manualAmount = parseFloat(orderForm.amount) || 0
     const ccMatch = manualAmount === 0 ? matchLabChargeCode(testName) : null
-    const amount = manualAmount > 0 ? manualAmount : (ccMatch?.unit_price_kes || 0)
+    const amount = manualAmount > 0 ? manualAmount : ccMatch?.code
+      ? (await priceForPayer(supabase, hospitalId, ccMatch.code, ccMatch.unit_price_kes || 0, { paymentMethod: orderForm.payment_method })).amount
+      : 0
     const receiptNumber = `LAB-${Date.now().toString().slice(-8)}`
     const orderedAt = new Date().toISOString()
     const assignedTo = (orderForm.assigned_to || '').trim()
@@ -1047,15 +1057,15 @@ export default function Laboratory() {
       sent_to_external_at: orderForm.test_location === 'External' ? new Date().toISOString() : null,
       ordered_at: orderedAt,
     }).select('*').single()
-    if (error) { window.notifyFromLegacyAlert('Error: ' + error.message); setSaving(false); return }
+    if (error) { notifyError('Error: ' + error.message); setSaving(false); return }
+    let walkInInvoice = null
+    const isInsurance = !isSelfPayMethod(orderForm.payment_method)
     if (amount > 0) {
-      const isInsurance = !['Cash', 'M-Pesa'].includes(orderForm.payment_method)
-      const invoiceStatus = isInsurance ? 'Pending' : 'Paid'
-      const paidAmount = isInsurance ? 0 : amount
-      const balanceAmount = isInsurance ? amount : 0
       const ledgerPayload = { hospital_id: hospitalId, patient_id: selectedPatient?.id || null, visit_id: createdTest?.visit_id || null, patient_name: orderForm.patient_name, drug_name: testName, quantity: 1, unit_price: amount, total_kes: amount, payment_method: orderForm.payment_method, mpesa_ref: orderForm.mpesa_ref || null, category: 'Laboratory', receipt_number: receiptNumber, sold_at: orderedAt }
       await executeWithFallback(() => supabase.from('sales_ledger').insert(ledgerPayload), async () => supabase.from('sales_ledger').insert(omitKeys(ledgerPayload, ['visit_id'])))
-      await supabase.from('invoices').insert({ hospital_id: hospitalId, patient_id: selectedPatient?.id || null, visit_id: createdTest?.visit_id || null, patient_name: orderForm.patient_name, invoice_no: receiptNumber.replace('LAB-', 'INV-'), services: stringifyServiceLines([createServiceLine({ label: testName, qty: 1, unitPrice: amount, total: amount, source: SERVICE_SOURCES.LABORATORY, sourceId: createdTest?.id || null, visitId: createdTest?.visit_id || null, meta: { category: orderForm.category, priority: orderForm.priority } })]), amount_kes: amount, paid_kes: paidAmount, balance_kes: balanceAmount, payment_method: orderForm.payment_method, insurer: isInsurance ? orderForm.payment_method : null, sha_member_no: null, status: invoiceStatus, notes: buildWorkflowInvoiceNote({ source: SERVICE_SOURCES.LABORATORY, sourceId: createdTest?.id || 'walkin', visitId: createdTest?.visit_id || null, summary: `Lab receipt: ${receiptNumber}` }), paid_at: invoiceStatus === 'Paid' ? orderedAt : null, created_at: orderedAt })
+      const { data: inv, error: invError } = await supabase.from('invoices').insert({ hospital_id: hospitalId, patient_id: selectedPatient?.id || null, visit_id: createdTest?.visit_id || null, patient_name: orderForm.patient_name, invoice_no: receiptNumber.replace('LAB-', 'INV-'), services: stringifyServiceLines([createServiceLine({ label: testName, qty: 1, unitPrice: amount, total: amount, source: SERVICE_SOURCES.LABORATORY, sourceId: createdTest?.id || null, visitId: createdTest?.visit_id || null, meta: { category: orderForm.category, priority: orderForm.priority } })]), ...unpaidInvoiceFields(amount), payment_method: orderForm.payment_method, insurer: isInsurance ? orderForm.payment_method : null, sha_member_no: null, notes: buildWorkflowInvoiceNote({ source: SERVICE_SOURCES.LABORATORY, sourceId: createdTest?.id || 'walkin', visitId: createdTest?.visit_id || null, summary: `Lab receipt: ${receiptNumber}` }), created_at: orderedAt }).select('*').single()
+      if (invError) notifyError(`Test ordered, but the bill could not be created: ${invError.message}`)
+      walkInInvoice = inv || null
     }
     setShowOrderModal(false)
     resetOrderForm()
@@ -1063,6 +1073,8 @@ export default function Laboratory() {
     fetchInvoices()
     try { window.dispatchEvent(new CustomEvent('remedacare:workflow_changed', { detail: { test_id: createdTest?.id, source: 'lab-order' } })) } catch (e) {}
     setSaving(false)
+    // Money is taken at the cashier only; the bill is already in the cashier's queue.
+    if (walkInInvoice && !isInsurance) notifySentToCashier(walkInInvoice, 'Test ordered')
   }
 
   function resetOrderForm() {
@@ -1123,7 +1135,7 @@ export default function Laboratory() {
       <div style={{ fontFamily: 'Arial, sans-serif', padding: 32, color: '#1F2937' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16, marginBottom: 24 }}>
           <div>
-            <div style={{ fontSize: 24, fontWeight: 800 }}>{hospitalName || 'Brightpath Travel Scholars'}</div>
+            <div style={{ fontSize: 24, fontWeight: 800 }}>{hospitalName || 'RemedacareHMS'}</div>
             <div style={{ fontSize: 12, color: '#6B7280' }}>Laboratory Result Report</div>
             <div style={{ fontSize: 12, color: '#6B7280', marginTop: 6 }}>Logo / Letterhead placeholder</div>
           </div>
@@ -1191,7 +1203,7 @@ export default function Laboratory() {
     if (!code) return
     const test = tests.find(item => String(item.sample_barcode || '').toUpperCase() === code)
     if (!test) {
-      window.notifyFromLegacyAlert(`No lab sample found for barcode ${code}.`)
+      notifyWarning(`No lab sample found for barcode ${code}.`)
       return
     }
     setSelected(test)
@@ -1211,7 +1223,7 @@ export default function Laboratory() {
       async () => supabase.from('lab_tests').update(omitKeys(payload, ['sample_collected_at', 'processing_started_at', 'results_ready_at'])).eq('id', test.id),
     )
     if (error) {
-      window.notifyFromLegacyAlert('Error updating sample status: ' + error.message)
+      notifyError('Error updating sample status: ' + error.message)
       return
     }
     fetchTests()
@@ -1227,7 +1239,7 @@ export default function Laboratory() {
       () => supabase.from('lab_tests').update({ status, sample_status: nextSampleStatus, ...extraPayload }).eq('id', test.id),
       async () => supabase.from('lab_tests').update({ status, sample_status: nextSampleStatus }).eq('id', test.id),
     )
-    if (error) { window.notifyFromLegacyAlert('Error updating status: ' + error.message); return }
+    if (error) { notifyError('Error updating status: ' + error.message); return }
     // Auto-invoice doctor-ordered tests the moment they are picked up
     if (status === 'In Progress' && test.source === 'Doctor' && !hasLinkedLabInvoice(invoices, test)) {
       await autoInvoiceLabTest(test)
@@ -1252,7 +1264,7 @@ export default function Laboratory() {
       async () => supabase.from('lab_tests').update(omitKeys(payload, ['sample_collected_at', 'processing_started_at', 'reviewed_at', 'reviewed_by'])).eq('id', test.id),
     )
     if (result.error) {
-      window.notifyFromLegacyAlert('Error advancing workflow stage: ' + result.error.message)
+      notifyError('Error advancing workflow stage: ' + result.error.message)
       return
     }
     fetchTests()
@@ -1261,11 +1273,11 @@ export default function Laboratory() {
 
   async function handleAssignTechnician() {
     const tech = assignTech === '__custom__' ? customTech : assignTech
-    if (!tech) { window.notifyFromLegacyAlert('Select or enter technician name'); return }
+    if (!tech) { notifyWarning('Select or enter technician name'); return }
     setSaving(true)
     const nextStatus = selected.status === 'Pending' ? 'In Progress' : selected.status
     const { error } = await supabase.from('lab_tests').update({ assigned_to: tech, status: nextStatus, sample_status: nextStatus === 'In Progress' ? 'In Progress' : getSampleStatusFromLabRow(selected) }).eq('id', selected.id)
-    if (error) { window.notifyFromLegacyAlert('Error assigning technician: ' + error.message); setSaving(false); return }
+    if (error) { notifyError('Error assigning technician: ' + error.message); setSaving(false); return }
     // Auto-invoice doctor-ordered tests when assigned
     if (selected.source === 'Doctor' && !hasLinkedLabInvoice(invoices, selected)) {
       await autoInvoiceLabTest({ ...selected, status: 'In Progress' })
@@ -1280,7 +1292,7 @@ export default function Laboratory() {
 
   async function handleSaveResult() {
     if (!canPostLabResults) {
-      window.notifyFromLegacyAlert('Only lab technicians can post results.')
+      notifyWarning('Only lab technicians can post results.')
       return
     }
     const template = matchStructuredTemplate(selected?.test_type, selected?.category)
@@ -1292,7 +1304,7 @@ export default function Laboratory() {
     const structuredSummary = template ? summarizeStructuredResult(template, structuredValues) : null
     const criticalAlerts = template ? buildCriticalAlerts(template, structuredValues) : []
     if (!resultForm.result_text && !resultForm.result_value && !structuredSummary?.resultText) {
-      window.notifyFromLegacyAlert('Enter result details')
+      notifyWarning('Enter result details')
       return
     }
     if (criticalAlerts.length > 0) {
@@ -1320,7 +1332,7 @@ export default function Laboratory() {
       () => supabase.from('lab_tests').update(updatePayload).eq('id', selected.id),
       async () => supabase.from('lab_tests').update(omitKeys(updatePayload, ['results_ready_at', 'result_json', 'result_template_key', 'critical_flags'])).eq('id', selected.id),
     )
-    if (updateErr) { window.notifyFromLegacyAlert('Error saving result: ' + updateErr.message); setSaving(false); return }
+    if (updateErr) { notifyError('Error saving result: ' + updateErr.message); setSaving(false); return }
 
     if (isMicrobiologySensitivityOrder(selected.test_type, selected.category)) {
       await syncMicrobiologyResultFromLab(selected, resultForm)
@@ -1332,11 +1344,12 @@ export default function Laboratory() {
     }
 
     if (selected.visit_id) {
-      const { data: allVisitTests } = await supabase.from('lab_tests').select('id, status, priority, test_location').eq('visit_id', selected.visit_id)
+      const { data: allVisitTests } = await supabase.from('lab_tests').select('id, status, priority, test_location').eq('hospital_id', hospitalId).eq('visit_id', selected.visit_id)
       const withCurrent = (allVisitTests || []).map(t => t.id === selected.id ? { ...t, status: 'Complete' } : t)
-      const criticalPending = withCurrent.filter(t => (t.test_location || 'In-House') === 'In-House' && (t.priority === 'Urgent' || t.priority === 'STAT') && t.status !== 'Complete' && t.status !== 'Critical')
-      if (criticalPending.length === 0) {
-        await supabase.from('visits').update({ status: 'Doctor' }).eq('id', selected.visit_id)
+      const pendingLabTests = withCurrent.filter(t => (t.test_location || 'In-House') === 'In-House' && !['Complete', 'Completed', 'Critical', 'Cancelled'].includes(t.status))
+      const { data: pendingImaging } = await supabase.from('radiology_orders').select('id').eq('hospital_id', hospitalId).eq('visit_id', selected.visit_id).not('status', 'in', '(Reported,Verified,Cancelled)')
+      if (pendingLabTests.length === 0 && (pendingImaging || []).length === 0) {
+        await supabase.from('visits').update({ status: 'Doctor' }).eq('id', selected.visit_id).eq('hospital_id', hospitalId)
         try { window.dispatchEvent(new CustomEvent('remedacare:workflow_changed', { detail: { visit_id: selected.visit_id, status: 'Doctor' } })) } catch (e) {}
       }
     }
@@ -1365,7 +1378,7 @@ export default function Laboratory() {
 
         const message = buildMessage(labSetting.template || DEFAULT_TEMPLATES.lab_result, {
           patient_name: selected.patient_name || patientRecord?.full_name || 'Patient',
-          hospital_name: hospitalName || 'Brightpath Travel Scholars',
+          hospital_name: hospitalName || 'RemedacareHMS',
           test_name: selected.test_type || selected.test_name || 'lab test',
         })
 
@@ -1427,7 +1440,7 @@ export default function Laboratory() {
     const statuses = [
       { name: 'Pending', value: tests.filter(test => test.status === 'Pending').length, color: '#C07000' },
       { name: 'In Progress', value: tests.filter(test => test.status === 'In Progress').length, color: '#1a6fb5' },
-      { name: 'Complete', value: tests.filter(test => test.status === 'Complete').length, color: '#5B21B6' },
+      { name: 'Complete', value: tests.filter(test => test.status === 'Complete').length, color: '#0F6E56' },
       { name: 'Critical', value: tests.filter(test => test.status === 'Critical').length, color: '#A32D2D' },
     ].filter(item => item.value > 0)
 
@@ -1553,7 +1566,7 @@ export default function Laboratory() {
   }).sort((a, b) => b.latestOrderedAt - a.latestOrderedAt), [groupedByPatient, invoices, patients, patientsById])
 
   if (loading) return (
-    <div style={s.loadWrap}><div style={s.spinner} /><p style={{ color: '#5B21B6', marginTop: 12 }}>Loading Lab...</p>
+    <div style={s.loadWrap}><div style={s.spinner} /><p style={{ color: '#0F6E56', marginTop: 12 }}>Loading Lab...</p>
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
     </div>
   )
@@ -1577,20 +1590,22 @@ export default function Laboratory() {
                 {referrals.length} total referrals &nbsp;&bull;&nbsp;
                 <span style={{ color: '#C07000', fontWeight: 600 }}>{pendingReferrals.length} pending</span> &nbsp;&bull;&nbsp;
                 <span style={{ color: '#A32D2D', fontWeight: 600 }}>{overdueReferrals.length} overdue</span> &nbsp;&bull;&nbsp;
-                <span style={{ color: '#5B21B6', fontWeight: 600 }}>{referralResultsThisMonth.length} results this month</span>
+                <span style={{ color: '#0F6E56', fontWeight: 600 }}>{referralResultsThisMonth.length} results this month</span>
               </>
             ) : activeTab === 'dashboard' ? (
               <>
-                <span style={{ color: '#5B21B6', fontWeight: 600 }}>{dashboardMetrics.statuses.reduce((sum, item) => sum + item.value, 0)} tracked tests</span> &nbsp;&bull;&nbsp;
+                <span style={{ color: '#0F6E56', fontWeight: 600 }}>{dashboardMetrics.statuses.reduce((sum, item) => sum + item.value, 0)} tracked tests</span> &nbsp;&bull;&nbsp;
                 <span style={{ color: '#C07000', fontWeight: 600 }}>{dashboardMetrics.unreviewed.length} results ready for doctor review</span> &nbsp;&bull;&nbsp;
                 <span style={{ color: '#A32D2D', fontWeight: 600 }}>{filtered.filter(test => test.aging?.overFourHours && test.status !== 'Complete').length} pending over 4h</span>
               </>
+            ) : activeTab === 'analyzers' ? (
+              <>Instrument results are held for manual review before they update a laboratory order.</>
             ) : (
               <>
                 {counts.All} total &nbsp;&bull;&nbsp;
                 <span style={{ color: '#C07000', fontWeight: 600 }}>{counts.Pending} pending</span> &nbsp;&bull;&nbsp;
                 <span style={{ color: '#1a6fb5', fontWeight: 600 }}>{counts.Processing} processing</span> &nbsp;&bull;&nbsp;
-                <span style={{ color: '#5B21B6', fontWeight: 600 }}>{counts.Completed} completed</span>
+                <span style={{ color: '#0F6E56', fontWeight: 600 }}>{counts.Completed} completed</span>
               </>
             )}
           </p>
@@ -1599,7 +1614,7 @@ export default function Laboratory() {
           <button style={{ ...s.btn, background: activeTab === 'dashboard' ? '#1a6fb5' : '#fff', color: activeTab === 'dashboard' ? '#fff' : '#1a6fb5', border: '1px solid #1a6fb5' }} onClick={() => setActiveTab('dashboard')}>
             Dashboard
           </button>
-          <button style={{ ...s.btn, background: activeTab === 'tests' ? '#5B21B6' : '#fff', color: activeTab === 'tests' ? '#fff' : '#5B21B6', border: '1px solid #5B21B6' }} onClick={() => setActiveTab('tests')}>
+          <button style={{ ...s.btn, background: activeTab === 'tests' ? '#0F6E56' : '#fff', color: activeTab === 'tests' ? '#fff' : '#0F6E56', border: '1px solid #0F6E56' }} onClick={() => setActiveTab('tests')}>
             Tests
           </button>
           <button style={{ ...s.btn, background: activeTab === 'technicians' ? '#7B5EA7' : '#fff', color: activeTab === 'technicians' ? '#fff' : '#7B5EA7', border: '1px solid #7B5EA7' }} onClick={() => setActiveTab('technicians')}>
@@ -1608,18 +1623,21 @@ export default function Laboratory() {
           <button style={{ ...s.btn, background: activeTab === 'referrals' ? '#B45309' : '#fff', color: activeTab === 'referrals' ? '#fff' : '#B45309', border: '1px solid #B45309' }} onClick={() => setActiveTab('referrals')}>
             Referrals
           </button>
+          <button style={{ ...s.btn, background: activeTab === 'analyzers' ? '#7B5EA7' : '#fff', color: activeTab === 'analyzers' ? '#fff' : '#7B5EA7', border: '1px solid #7B5EA7' }} onClick={() => setActiveTab('analyzers')}>
+            Analyzer inbox
+          </button>
           {activeTab === 'referrals' ? (
             <button style={{ ...s.btn, background: '#B45309' }} onClick={openReferralModal}>+ New Referral</button>
           ) : activeTab === 'dashboard' ? (
             <button style={{ ...s.btn, background: '#1a6fb5' }} onClick={() => setActiveTab('tests')}>Open Active Queue</button>
-          ) : (
+          ) : activeTab === 'analyzers' ? null : (
             <button style={s.btn} onClick={() => { resetOrderForm(); setShowOrderModal(true) }}>+ Order Lab Test</button>
           )}
-          <button style={{ ...s.btn, background: '#fff', color: '#5B21B6', border: '1px solid #5B21B6' }} onClick={() => { fetchTests(); fetchReferrals(); fetchInvoices() }}>Refresh</button>
+          <button style={{ ...s.btn, background: '#fff', color: '#0F6E56', border: '1px solid #0F6E56' }} onClick={() => { fetchTests(); fetchReferrals(); fetchInvoices() }}>Refresh</button>
         </div>
       </div>
 
-      {activeTab !== 'referrals' && activeTab !== 'dashboard' && (
+      {activeTab !== 'referrals' && activeTab !== 'dashboard' && activeTab !== 'analyzers' && (
       <LabResultsTab
         variant="scanner"
         styles={s}
@@ -1629,6 +1647,8 @@ export default function Laboratory() {
       />
       )}
 
+      {activeTab === 'dashboard' && <LabQuality hospitalId={hospitalId} />}
+      {activeTab === 'analyzers' && <LabAnalyserInbox hospitalId={hospitalId} />}
       {activeTab === 'dashboard' && (
         <div style={{ display: 'grid', gap: 16 }}>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(220px,1fr))', gap: 14 }}>
@@ -1677,10 +1697,10 @@ export default function Laboratory() {
                   <div key={item.category}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, marginBottom: 4 }}>
                       <span style={{ fontWeight: 600, color: '#1F2937' }}>{item.category}</span>
-                      <span style={{ color: '#5B21B6', fontWeight: 700 }}>{item.avgHours}h</span>
+                      <span style={{ color: '#0F6E56', fontWeight: 700 }}>{item.avgHours}h</span>
                     </div>
                     <div style={{ background: '#E5E7EB', borderRadius: 999, height: 8 }}>
-                      <div style={{ width: `${Math.min(100, item.avgHours * 8)}%`, background: item.avgHours > 8 ? '#A32D2D' : item.avgHours > 4 ? '#C07000' : '#5B21B6', borderRadius: 999, height: '100%' }} />
+                      <div style={{ width: `${Math.min(100, item.avgHours * 8)}%`, background: item.avgHours > 8 ? '#A32D2D' : item.avgHours > 4 ? '#C07000' : '#0F6E56', borderRadius: 999, height: '100%' }} />
                     </div>
                   </div>
                 ))}
@@ -1705,7 +1725,7 @@ export default function Laboratory() {
             <div style={s.dashboardCard}>
               <div style={s.dashboardCardTitle}>Results Not Yet Reviewed By Doctor</div>
               <div style={{ display: 'grid', gap: 10 }}>
-                {dashboardMetrics.unreviewed.length === 0 && <div style={{ color: '#5B21B6', fontSize: 13, fontWeight: 600 }}>All completed results have been reviewed.</div>}
+                {dashboardMetrics.unreviewed.length === 0 && <div style={{ color: '#0F6E56', fontSize: 13, fontWeight: 600 }}>All completed results have been reviewed.</div>}
                 {dashboardMetrics.unreviewed.slice(0, 8).map(test => (
                   <button
                     key={test.id}
@@ -1770,15 +1790,15 @@ export default function Laboratory() {
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
                       <div>
                         <div style={{ fontWeight: 700, fontSize: 14, color: '#111' }}>🔬 {tech}</div>
-                        <div style={{ fontSize: 12, color: active > 0 ? '#C07000' : '#5B21B6', fontWeight: 600, marginTop: 3 }}>{active > 0 ? `${active} active test${active !== 1 ? 's' : ''}` : 'No active tests'}</div>
+                        <div style={{ fontSize: 12, color: active > 0 ? '#C07000' : '#0F6E56', fontWeight: 600, marginTop: 3 }}>{active > 0 ? `${active} active test${active !== 1 ? 's' : ''}` : 'No active tests'}</div>
                       </div>
                       <div style={{ textAlign: 'right' }}>
-                        <div style={{ fontSize: 18, fontWeight: 800, color: active > 3 ? '#A32D2D' : active > 0 ? '#C07000' : '#5B21B6' }}>{active}</div>
+                        <div style={{ fontSize: 18, fontWeight: 800, color: active > 3 ? '#A32D2D' : active > 0 ? '#C07000' : '#0F6E56' }}>{active}</div>
                         <div style={{ fontSize: 10, color: '#aaa', fontWeight: 600 }}>ACTIVE</div>
                       </div>
                     </div>
                     <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-                      {[['#FFF3DC', '#C07000', w.pending.length, 'PENDING'], ['#E3F0FB', '#1a6fb5', w.processing.length, 'PROCESSING'], ['#F3E8FF', '#5B21B6', w.completed.length, 'DONE']].map(([bg, color, count, label]) => (
+                      {[['#FFF3DC', '#C07000', w.pending.length, 'PENDING'], ['#E3F0FB', '#1a6fb5', w.processing.length, 'PROCESSING'], ['#E1F5EE', '#0F6E56', w.completed.length, 'DONE']].map(([bg, color, count, label]) => (
                         <div key={label} style={{ flex: 1, background: bg, borderRadius: 8, padding: '8px 10px', textAlign: 'center' }}>
                           <div style={{ fontSize: 16, fontWeight: 800, color }}>{count}</div>
                           <div style={{ fontSize: 10, color, fontWeight: 600 }}>{label}</div>
@@ -1969,8 +1989,8 @@ export default function Laboratory() {
               <div style={s.sectionLabel}>Culture Result</div>
               <div style={s.formGrid2}>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Organism Identified *</label>
-                  <input style={s.input} placeholder="e.g. Escherichia coli, MRSA, No Growth"
+                  <label htmlFor="lab-organism-identified" style={s.label}>Organism Identified *</label>
+                  <input id="lab-organism-identified" style={s.input} placeholder="e.g. Escherichia coli, MRSA, No Growth"
                     value={antibiogramForm.organism} onChange={e => setAntibiogramForm(f => ({ ...f, organism: e.target.value }))} />
                   {(inferredMicroFlags.mrsa || inferredMicroFlags.esbl || inferredMicroFlags.carbapenem_r) && (
                     <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 8 }}>
@@ -1981,20 +2001,20 @@ export default function Laboratory() {
                   )}
                 </div>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Sample Type</label>
-                  <select style={s.input} value={antibiogramForm.sample_type} onChange={e => setAntibiogramForm(f => ({ ...f, sample_type: e.target.value }))}>
+                  <label htmlFor="lab-sample-type" style={s.label}>Sample Type</label>
+                  <select id="lab-sample-type" style={s.input} value={antibiogramForm.sample_type} onChange={e => setAntibiogramForm(f => ({ ...f, sample_type: e.target.value }))}>
                     {SAMPLE_TYPES.map(t => <option key={t}>{t}</option>)}
                   </select>
                 </div>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Growth</label>
-                  <select style={s.input} value={antibiogramForm.growth} onChange={e => setAntibiogramForm(f => ({ ...f, growth: e.target.value }))}>
+                  <label htmlFor="lab-growth" style={s.label}>Growth</label>
+                  <select id="lab-growth" style={s.input} value={antibiogramForm.growth} onChange={e => setAntibiogramForm(f => ({ ...f, growth: e.target.value }))}>
                     {['Heavy', 'Moderate', 'Light', 'No Growth'].map(g => <option key={g}>{g}</option>)}
                   </select>
                 </div>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Interpretation</label>
-                  <select style={s.input} value={antibiogramForm.interpretation} onChange={e => setAntibiogramForm(f => ({ ...f, interpretation: e.target.value }))}>
+                  <label htmlFor="lab-interpretation" style={s.label}>Interpretation</label>
+                  <select id="lab-interpretation" style={s.input} value={antibiogramForm.interpretation} onChange={e => setAntibiogramForm(f => ({ ...f, interpretation: e.target.value }))}>
                     <option value="">-- Select --</option>
                     {['Sensitive — treat per susceptibility', 'Resistant — consider alternative therapy', 'No growth — culture negative', 'Contaminated — repeat recommended', 'Mixed growth — clinical correlation needed'].map(i => <option key={i}>{i}</option>)}
                   </select>
@@ -2015,7 +2035,7 @@ export default function Laboratory() {
                 <div style={s.sectionLabel}>Sensitivity Pattern</div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', marginBottom: 12, alignItems: 'center' }}>
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                    <span style={{ ...s.pill, background: '#F3E8FF', color: '#5B21B6', border: '1px solid #D8B4FE' }}>{antibiogramProfileSummary.sensitive} Sensitive</span>
+                    <span style={{ ...s.pill, background: '#E1F5EE', color: '#0F6E56', border: '1px solid #B4E5D0' }}>{antibiogramProfileSummary.sensitive} Sensitive</span>
                     <span style={{ ...s.pill, background: '#FFF3DC', color: '#C07000', border: '1px solid #FAC775' }}>{antibiogramProfileSummary.intermediate} Intermediate</span>
                     <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D', border: '1px solid #F09595' }}>{antibiogramProfileSummary.resistant} Resistant</span>
                     <span style={{ ...s.pill, background: '#F3F4F6', color: '#555', border: '1px solid #D1D5DB' }}>{antibiogramProfileSummary.testedCount} Tested</span>
@@ -2046,7 +2066,7 @@ export default function Laboratory() {
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 6 }}>
                         {[
                           ['', 'NT', '#F3F4F6', '#555'],
-                          ['S', 'S', '#F3E8FF', '#5B21B6'],
+                          ['S', 'S', '#E1F5EE', '#0F6E56'],
                           ['I', 'I', '#FFF3DC', '#C07000'],
                           ['R', 'R', '#FCEBEB', '#A32D2D'],
                         ].map(([value, label, bg, color]) => {
@@ -2093,16 +2113,16 @@ export default function Laboratory() {
               )}
 
               <div style={s.formGroup}>
-                <label style={s.label}>Result Summary / Clinical Notes</label>
-                <textarea style={{ ...s.input, height: 70, resize: 'vertical' }}
+                <label htmlFor="lab-result-summary-clinical-notes" style={s.label}>Result Summary / Clinical Notes</label>
+                <textarea id="lab-result-summary-clinical-notes" style={{ ...s.input, height: 70, resize: 'vertical' }}
                   placeholder="Summarise key findings, e.g. E.coli — sensitive to nitrofurantoin and ciprofloxacin, resistant to amoxicillin. Full S/I/R data in Antibiogram module."
                   value={antibiogramForm.result_summary} onChange={e => setAntibiogramForm(f => ({ ...f, result_summary: e.target.value }))} />
               </div>
 
               <div style={s.formGrid2}>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Performed By *</label>
-                  <select style={s.input} value={antibiogramForm.performed_by} onChange={e => setAntibiogramForm(f => ({ ...f, performed_by: e.target.value }))}>
+                  <label htmlFor="lab-performed-by" style={s.label}>Performed By *</label>
+                  <select id="lab-performed-by" style={s.input} value={antibiogramForm.performed_by} onChange={e => setAntibiogramForm(f => ({ ...f, performed_by: e.target.value }))}>
                     <option value="">-- Select Technician --</option>
                     {labStaff.map(t => <option key={t.id} value={t.full_name}>{t.full_name}{t.role ? ` — ${t.role}` : ''}</option>)}
                     <option value="__other__">Other (type below)</option>
@@ -2112,12 +2132,12 @@ export default function Laboratory() {
                   )}
                 </div>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Verified By (optional)</label>
-                  <input style={s.input} placeholder="Consultant or senior tech" value={antibiogramForm.verified_by} onChange={e => setAntibiogramForm(f => ({ ...f, verified_by: e.target.value }))} />
+                  <label htmlFor="lab-verified-by-optional" style={s.label}>Verified By (optional)</label>
+                  <input id="lab-verified-by-optional" style={s.input} placeholder="Consultant or senior tech" value={antibiogramForm.verified_by} onChange={e => setAntibiogramForm(f => ({ ...f, verified_by: e.target.value }))} />
                 </div>
               </div>
 
-              <div style={{ background: '#F3E8FF', border: '1px solid #D8B4FE', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: '#5B21B6', fontWeight: 600 }}>
+              <div style={{ background: '#E1F5EE', border: '1px solid #B4E5D0', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: '#0F6E56', fontWeight: 600 }}>
                 ✅ After saving:
                 <ul style={{ margin: '4px 0 0', paddingLeft: 16, fontSize: 11, fontWeight: 400 }}>
                   <li>The lab test is marked <strong>Complete</strong></li>
@@ -2156,20 +2176,20 @@ export default function Laboratory() {
                 {availableLabStaff.map(tech => {
                   const workload = tests.filter(t => t.assigned_to === tech.full_name && (t.status === 'Pending' || t.status === 'In Progress')).length
                   return (
-                    <div key={tech.id} style={{ padding: '10px 14px', borderRadius: 8, border: `2px solid ${assignTech === tech.full_name ? '#7B5EA7' : '#eee'}`, background: assignTech === tech.full_name ? '#F0EAFC' : '#fafafa', cursor: 'pointer', fontSize: 13, fontWeight: assignTech === tech.full_name ? 700 : 400, color: assignTech === tech.full_name ? '#7B5EA7' : '#333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                    <div key={tech.id} style={{ padding: '10px 14px', borderRadius: 8, border: `2px solid ${assignTech === tech.full_name ? '#7B5EA7' : '#eee'}`, background: assignTech === tech.full_name ? '#EAF5EF' : '#fafafa', cursor: 'pointer', fontSize: 13, fontWeight: assignTech === tech.full_name ? 700 : 400, color: assignTech === tech.full_name ? '#7B5EA7' : '#333', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
                       onClick={() => setAssignTech(tech.full_name)}>
                       <span>{tech.full_name}{tech.role ? ` — ${tech.role}` : ''}</span>
-                      <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 99, background: workload === 0 ? '#F3E8FF' : workload < 3 ? '#FFF3DC' : '#FCEBEB', color: workload === 0 ? '#5B21B6' : workload < 3 ? '#C07000' : '#A32D2D' }}>{workload} active</span>
+                      <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 99, background: workload === 0 ? '#E1F5EE' : workload < 3 ? '#FFF3DC' : '#FCEBEB', color: workload === 0 ? '#0F6E56' : workload < 3 ? '#C07000' : '#A32D2D' }}>{workload} active</span>
                     </div>
                   )
                 })}
                 {availableLabStaff.length === 0 && <div style={{ padding: '10px 14px', borderRadius: 8, border: '1px solid #F5F3F5', background: '#FEF3F2', color: '#B91C1C', fontSize: 12 }}>No active lab staff found. Add laboratory staff in HR.</div>}
-                <div style={{ padding: '10px 14px', borderRadius: 8, border: `2px solid ${assignTech === '__custom__' ? '#7B5EA7' : '#eee'}`, background: assignTech === '__custom__' ? '#F0EAFC' : '#fafafa', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#888' }} onClick={() => setAssignTech('__custom__')}>Other / Custom</div>
+                <div style={{ padding: '10px 14px', borderRadius: 8, border: `2px solid ${assignTech === '__custom__' ? '#7B5EA7' : '#eee'}`, background: assignTech === '__custom__' ? '#EAF5EF' : '#fafafa', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#888' }} onClick={() => setAssignTech('__custom__')}>Other / Custom</div>
               </div>
               {assignTech === '__custom__' && (
                 <div style={s.formGroup}>
-                  <label style={s.label}>Custom Technician Name</label>
-                  <input style={s.input} placeholder="Enter full name" value={customTech} onChange={e => setCustomTech(e.target.value)} autoFocus />
+                  <label htmlFor="lab-custom-technician-name" style={s.label}>Custom Technician Name</label>
+                  <input id="lab-custom-technician-name" style={s.input} placeholder="Enter full name" value={customTech} onChange={e => setCustomTech(e.target.value)} autoFocus />
                 </div>
               )}
             </div>
@@ -2204,9 +2224,9 @@ export default function Laboratory() {
                       ...s.actionBtn,
                       flex: 1,
                       padding: '10px 12px',
-                      background: referralForm.linked_mode === option.key ? '#5B21B6' : '#fff',
-                      color: referralForm.linked_mode === option.key ? '#fff' : '#5B21B6',
-                      border: '1px solid #5B21B6',
+                      background: referralForm.linked_mode === option.key ? '#0F6E56' : '#fff',
+                      color: referralForm.linked_mode === option.key ? '#fff' : '#0F6E56',
+                      border: '1px solid #0F6E56',
                     }}
                     onClick={() => setReferralForm(prev => ({ ...prev, linked_mode: option.key, lab_test_id: '', standalone_patient_id: '', standalone_test_name: '' }))}
                   >
@@ -2218,8 +2238,8 @@ export default function Laboratory() {
               {referralForm.linked_mode === 'linked' ? (
                 <>
                   <div style={s.formGroup}>
-                    <label style={s.label}>Search Pending Test</label>
-                    <input
+                    <label htmlFor="lab-search-pending-test" style={s.label}>Search Pending Test</label>
+                    <input id="lab-search-pending-test"
                       style={s.input}
                       placeholder="Type patient name or test name..."
                       value={referralTestSearch}
@@ -2233,8 +2253,8 @@ export default function Laboratory() {
                         style={{
                           padding: '10px 12px',
                           borderRadius: 10,
-                          border: `1px solid ${referralForm.lab_test_id === test.id ? '#5B21B6' : '#E6ECE8'}`,
-                          background: referralForm.lab_test_id === test.id ? '#FAF5FF' : '#fff',
+                          border: `1px solid ${referralForm.lab_test_id === test.id ? '#0F6E56' : '#E6ECE8'}`,
+                          background: referralForm.lab_test_id === test.id ? '#F4FBF7' : '#fff',
                           cursor: 'pointer',
                         }}
                         onClick={() => setReferralForm(prev => ({
@@ -2257,8 +2277,8 @@ export default function Laboratory() {
               ) : (
                 <>
                   <div style={s.formGroup}>
-                    <label style={s.label}>Search Patient</label>
-                    <input
+                    <label htmlFor="lab-search-patient" style={s.label}>Search Patient</label>
+                    <input id="lab-search-patient"
                       style={s.input}
                       placeholder="Type patient name or number..."
                       value={referralPatientSearch}
@@ -2272,8 +2292,8 @@ export default function Laboratory() {
                         style={{
                           padding: '10px 12px',
                           borderRadius: 10,
-                          border: `1px solid ${referralForm.standalone_patient_id === patient.id ? '#5B21B6' : '#E6ECE8'}`,
-                          background: referralForm.standalone_patient_id === patient.id ? '#FAF5FF' : '#fff',
+                          border: `1px solid ${referralForm.standalone_patient_id === patient.id ? '#0F6E56' : '#E6ECE8'}`,
+                          background: referralForm.standalone_patient_id === patient.id ? '#F4FBF7' : '#fff',
                           cursor: 'pointer',
                         }}
                         onClick={() => setReferralForm(prev => ({ ...prev, standalone_patient_id: patient.id, lab_test_id: '' }))}
@@ -2284,8 +2304,8 @@ export default function Laboratory() {
                     ))}
                   </div>
                   <div style={s.formGroup}>
-                    <label style={s.label}>Standalone Test Name</label>
-                    <input
+                    <label htmlFor="lab-standalone-test-name" style={s.label}>Standalone Test Name</label>
+                    <input id="lab-standalone-test-name"
                       style={s.input}
                       placeholder="e.g. Histopathology review, specialized PCR"
                       value={referralForm.standalone_test_name}
@@ -2297,8 +2317,8 @@ export default function Laboratory() {
 
               <div style={s.formGrid2}>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Referred To</label>
-                  <input
+                  <label htmlFor="lab-referred-to" style={s.label}>Referred To</label>
+                  <input id="lab-referred-to"
                     style={s.input}
                     list="lab-referral-labs"
                     value={referralForm.referred_to}
@@ -2309,8 +2329,8 @@ export default function Laboratory() {
                   </datalist>
                 </div>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Sample Type</label>
-                  <select style={s.input} value={referralForm.sample_type} onChange={e => setReferralForm(prev => ({ ...prev, sample_type: e.target.value }))}>
+                  <label htmlFor="lab-sample-type-2" style={s.label}>Sample Type</label>
+                  <select id="lab-sample-type-2" style={s.input} value={referralForm.sample_type} onChange={e => setReferralForm(prev => ({ ...prev, sample_type: e.target.value }))}>
                     {REFERRAL_SAMPLE_TYPES.map(type => <option key={type}>{type}</option>)}
                   </select>
                 </div>
@@ -2318,12 +2338,12 @@ export default function Laboratory() {
 
               <div style={s.formGrid2}>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Date Sent</label>
-                  <input style={s.input} type="date" value={referralForm.date_sent} onChange={e => setReferralForm(prev => ({ ...prev, date_sent: e.target.value }))} />
+                  <label htmlFor="lab-date-sent" style={s.label}>Date Sent</label>
+                  <input id="lab-date-sent" style={s.input} type="date" value={referralForm.date_sent} onChange={e => setReferralForm(prev => ({ ...prev, date_sent: e.target.value }))} />
                 </div>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Transport Method</label>
-                  <select style={s.input} value={referralForm.transport_method} onChange={e => setReferralForm(prev => ({ ...prev, transport_method: e.target.value }))}>
+                  <label htmlFor="lab-transport-method" style={s.label}>Transport Method</label>
+                  <select id="lab-transport-method" style={s.input} value={referralForm.transport_method} onChange={e => setReferralForm(prev => ({ ...prev, transport_method: e.target.value }))}>
                     {REFERRAL_TRANSPORT_METHODS.map(method => <option key={method}>{method}</option>)}
                   </select>
                 </div>
@@ -2331,18 +2351,18 @@ export default function Laboratory() {
 
               <div style={s.formGrid2}>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Expected TAT (days)</label>
-                  <input style={s.input} type="number" min="0" value={referralForm.expected_tat_days} onChange={e => setReferralForm(prev => ({ ...prev, expected_tat_days: e.target.value }))} />
+                  <label htmlFor="lab-expected-tat-days" style={s.label}>Expected TAT (days)</label>
+                  <input id="lab-expected-tat-days" style={s.input} type="number" min="0" value={referralForm.expected_tat_days} onChange={e => setReferralForm(prev => ({ ...prev, expected_tat_days: e.target.value }))} />
                 </div>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Referral Cost (KES)</label>
-                  <input style={s.input} type="number" min="0" value={referralForm.referral_cost} onChange={e => setReferralForm(prev => ({ ...prev, referral_cost: e.target.value }))} />
+                  <label htmlFor="lab-referral-cost-kes" style={s.label}>Referral Cost (KES)</label>
+                  <input id="lab-referral-cost-kes" style={s.input} type="number" min="0" value={referralForm.referral_cost} onChange={e => setReferralForm(prev => ({ ...prev, referral_cost: e.target.value }))} />
                 </div>
               </div>
 
               <div style={s.formGroup}>
-                <label style={s.label}>Special Instructions</label>
-                <textarea
+                <label htmlFor="lab-special-instructions" style={s.label}>Special Instructions</label>
+                <textarea id="lab-special-instructions"
                   style={{ ...s.input, minHeight: 84, resize: 'vertical' }}
                   placeholder="Sample handling notes, packaging requirements, contact person..."
                   value={referralForm.special_instructions}
@@ -2372,8 +2392,8 @@ export default function Laboratory() {
             </div>
             <div style={s.modalBody}>
               <div style={s.formGroup}>
-                <label style={s.label}>Result Text</label>
-                <textarea
+                <label htmlFor="lab-result-text" style={s.label}>Result Text</label>
+                <textarea id="lab-result-text"
                   style={{ ...s.input, minHeight: 110, resize: 'vertical' }}
                   placeholder="Enter the full result returned by the external laboratory..."
                   value={referralResultForm.result_text}
@@ -2382,12 +2402,12 @@ export default function Laboratory() {
               </div>
               <div style={s.formGrid2}>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Result Date</label>
-                  <input style={s.input} type="date" value={referralResultForm.result_date} onChange={e => setReferralResultForm(prev => ({ ...prev, result_date: e.target.value }))} />
+                  <label htmlFor="lab-result-date" style={s.label}>Result Date</label>
+                  <input id="lab-result-date" style={s.input} type="date" value={referralResultForm.result_date} onChange={e => setReferralResultForm(prev => ({ ...prev, result_date: e.target.value }))} />
                 </div>
                 <div style={s.formGroup}>
-                  <label style={s.label}>External Reference</label>
-                  <input style={s.input} placeholder="Reference / accession number" value={referralResultForm.external_reference} onChange={e => setReferralResultForm(prev => ({ ...prev, external_reference: e.target.value }))} />
+                  <label htmlFor="lab-external-reference" style={s.label}>External Reference</label>
+                  <input id="lab-external-reference" style={s.input} placeholder="Reference / accession number" value={referralResultForm.external_reference} onChange={e => setReferralResultForm(prev => ({ ...prev, external_reference: e.target.value }))} />
                 </div>
               </div>
             </div>
@@ -2426,48 +2446,48 @@ export default function Laboratory() {
                 )}
               </div>
               <div style={s.formGrid2}>
-                <div style={s.formGroup}><label style={s.label}>Patient Name *</label><input style={s.input} placeholder="Full name" value={orderForm.patient_name} onChange={e => setOrderForm(f => ({ ...f, patient_name: e.target.value }))} /></div>
-                <div style={s.formGroup}><label style={s.label}>Phone</label><input style={s.input} placeholder="07XXXXXXXX" value={orderForm.phone} onChange={e => setOrderForm(f => ({ ...f, phone: e.target.value }))} /></div>
+                <div style={s.formGroup}><label htmlFor="lab-patient-name" style={s.label}>Patient Name *</label><input id="lab-patient-name" style={s.input} placeholder="Full name" value={orderForm.patient_name} onChange={e => setOrderForm(f => ({ ...f, patient_name: e.target.value }))} /></div>
+                <div style={s.formGroup}><label htmlFor="lab-phone" style={s.label}>Phone</label><input id="lab-phone" style={s.input} placeholder="07XXXXXXXX" value={orderForm.phone} onChange={e => setOrderForm(f => ({ ...f, phone: e.target.value }))} /></div>
               </div>
               <div style={s.sectionLabel}>Test Details</div>
               <div style={s.formGrid2}>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Category</label>
-                  <select style={s.input} value={orderForm.category} onChange={e => setOrderForm(f => ({ ...f, category: e.target.value, test_type: '' }))}>
+                  <label htmlFor="lab-category" style={s.label}>Category</label>
+                  <select id="lab-category" style={s.input} value={orderForm.category} onChange={e => setOrderForm(f => ({ ...f, category: e.target.value, test_type: '' }))}>
                     {LAB_TEST_CATEGORIES.map(c => <option key={c}>{c}</option>)}
                   </select>
                 </div>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Test Name *</label>
-                  <select style={s.input} value={orderForm.test_type} onChange={e => setOrderForm(f => ({ ...f, test_type: e.target.value }))}>
+                  <label htmlFor="lab-test-name" style={s.label}>Test Name *</label>
+                  <select id="lab-test-name" style={s.input} value={orderForm.test_type} onChange={e => setOrderForm(f => ({ ...f, test_type: e.target.value }))}>
                     <option value="">-- Select Test --</option>
                     {getLabTestsForCategory(orderForm.category).map(t => <option key={t}>{t}</option>)}
                     <option value="__custom__">✏️ Custom / Other</option>
                   </select>
                 </div>
               </div>
-              {orderForm.test_type === '__custom__' && <div style={s.formGroup}><label style={s.label}>Custom Test Name *</label><input style={s.input} placeholder="Enter test name" value={customTest} onChange={e => setCustomTest(e.target.value)} /></div>}
+              {orderForm.test_type === '__custom__' && <div style={s.formGroup}><label htmlFor="lab-custom-test-name" style={s.label}>Custom Test Name *</label><input id="lab-custom-test-name" style={s.input} placeholder="Enter test name" value={customTest} onChange={e => setCustomTest(e.target.value)} /></div>}
               {/* Show antibiogram hint if Microbiology category */}
               {orderForm.category === 'Microbiology' && (
-                <div style={{ background: '#F5F0FF', border: '1px solid #DDD6FE', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: '#7B3AED', fontWeight: 600, marginBottom: 12 }}>
+                <div style={{ background: '#F5F0FF', border: '1px solid #B4E5D0', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: '#7B3AED', fontWeight: 600, marginBottom: 12 }}>
                   🧫 Microbiology C&S tests will use the <strong>Upload Antibiogram</strong> flow when entering results — attaches the VITEK/lab PDF and feeds the Antibiogram module.
                 </div>
               )}
               <div style={s.formGrid2}>
-                <div style={s.formGroup}><label style={s.label}>Priority</label><select style={s.input} value={orderForm.priority} onChange={e => setOrderForm(f => ({ ...f, priority: e.target.value }))}><option>Routine</option><option>Urgent</option><option>STAT</option></select></div>
-                <div style={s.formGroup}><label style={s.label}>Ordered By (Doctor)</label><input style={s.input} placeholder="Dr. name" value={orderForm.ordered_by} onChange={e => setOrderForm(f => ({ ...f, ordered_by: e.target.value }))} /></div>
+                <div style={s.formGroup}><label htmlFor="lab-priority" style={s.label}>Priority</label><select id="lab-priority" style={s.input} value={orderForm.priority} onChange={e => setOrderForm(f => ({ ...f, priority: e.target.value }))}><option>Routine</option><option>Urgent</option><option>STAT</option></select></div>
+                <div style={s.formGroup}><label htmlFor="lab-ordered-by-doctor" style={s.label}>Ordered By (Doctor)</label><input id="lab-ordered-by-doctor" style={s.input} placeholder="Dr. name" value={orderForm.ordered_by} onChange={e => setOrderForm(f => ({ ...f, ordered_by: e.target.value }))} /></div>
               </div>
               <div style={s.formGrid2}>
-                <div style={s.formGroup}><label style={s.label}>Test Location *</label><select style={s.input} value={orderForm.test_location} onChange={e => setOrderForm(f => ({ ...f, test_location: e.target.value }))}><option value="In-House">In-House Lab</option><option value="External">Send to External Lab</option></select></div>
-                <div style={s.formGroup}><label style={s.label}>Assign Technician (optional)</label><select style={s.input} value={orderForm.assigned_to || ''} onChange={e => setOrderForm(f => ({ ...f, assigned_to: e.target.value }))}><option value="">-- Assign Later --</option>{labStaff.map(t => <option key={t.id} value={t.full_name}>{t.full_name}{t.role ? ` — ${t.role}` : ''}</option>)}</select></div>
+                <div style={s.formGroup}><label htmlFor="lab-test-location" style={s.label}>Test Location *</label><select id="lab-test-location" style={s.input} value={orderForm.test_location} onChange={e => setOrderForm(f => ({ ...f, test_location: e.target.value }))}><option value="In-House">In-House Lab</option><option value="External">Send to External Lab</option></select></div>
+                <div style={s.formGroup}><label htmlFor="lab-assign-technician-optional" style={s.label}>Assign Technician (optional)</label><select id="lab-assign-technician-optional" style={s.input} value={orderForm.assigned_to || ''} onChange={e => setOrderForm(f => ({ ...f, assigned_to: e.target.value }))}><option value="">-- Assign Later --</option>{labStaff.map(t => <option key={t.id} value={t.full_name}>{t.full_name}{t.role ? ` — ${t.role}` : ''}</option>)}</select></div>
               </div>
-              <div style={s.formGroup}><label style={s.label}>Clinical Notes</label><input style={s.input} placeholder="Special instructions..." value={orderForm.notes} onChange={e => setOrderForm(f => ({ ...f, notes: e.target.value }))} /></div>
+              <div style={s.formGroup}><label htmlFor="lab-clinical-notes" style={s.label}>Clinical Notes</label><input id="lab-clinical-notes" style={s.input} placeholder="Special instructions..." value={orderForm.notes} onChange={e => setOrderForm(f => ({ ...f, notes: e.target.value }))} /></div>
               <div style={s.sectionLabel}>Payment</div>
               <div style={s.formGrid2}>
-                <div style={s.formGroup}><label style={s.label}>Amount (KES)</label><input style={s.input} type="number" placeholder="e.g. 500" value={orderForm.amount} onChange={e => setOrderForm(f => ({ ...f, amount: e.target.value }))} /></div>
-                <div style={s.formGroup}><label style={s.label}>Payment Method</label><select style={s.input} value={orderForm.payment_method} onChange={e => setOrderForm(f => ({ ...f, payment_method: e.target.value }))}><option>Cash</option><option>M-Pesa</option><option>Insurance</option><option>SHA</option><option>Credit</option></select></div>
+                <div style={s.formGroup}><label htmlFor="lab-amount-kes" style={s.label}>Amount (KES)</label><input id="lab-amount-kes" style={s.input} type="number" placeholder="e.g. 500" value={orderForm.amount} onChange={e => setOrderForm(f => ({ ...f, amount: e.target.value }))} /></div>
+                <div style={s.formGroup}><label htmlFor="lab-payment-method" style={s.label}>Payment Method</label><select id="lab-payment-method" style={s.input} value={orderForm.payment_method} onChange={e => setOrderForm(f => ({ ...f, payment_method: e.target.value }))}><option>Cash</option><option>M-Pesa</option><option>Insurance</option><option>SHA</option><option>Credit</option></select></div>
               </div>
-              {orderForm.payment_method === 'M-Pesa' && <div style={s.formGroup}><label style={s.label}>M-Pesa Ref</label><input style={{ ...s.input, textTransform: 'uppercase', letterSpacing: 1 }} placeholder="e.g. QHJ2KL8MNP" value={orderForm.mpesa_ref} onChange={e => setOrderForm(f => ({ ...f, mpesa_ref: e.target.value.toUpperCase() }))} /></div>}
+              {orderForm.payment_method === 'M-Pesa' && <div style={s.formGroup}><label htmlFor="lab-m-pesa-ref" style={s.label}>M-Pesa Ref</label><input id="lab-m-pesa-ref" style={{ ...s.input, textTransform: 'uppercase', letterSpacing: 1 }} placeholder="e.g. QHJ2KL8MNP" value={orderForm.mpesa_ref} onChange={e => setOrderForm(f => ({ ...f, mpesa_ref: e.target.value.toUpperCase() }))} /></div>}
             </div>
             <div style={s.modalFooter}>
               <button style={s.cancelBtn} onClick={() => setShowOrderModal(false)}>Cancel</button>
@@ -2528,34 +2548,34 @@ export default function Laboratory() {
                 </div>
               )}
               <div style={s.formGroup}>
-                <label style={s.label}>Result Text / Full Report</label>
-                <textarea style={{ ...s.input, height: 100, resize: 'vertical' }} placeholder="Enter full result report, findings, or detailed text..." value={resultForm.result_text} onChange={e => setResultForm(f => ({ ...f, result_text: e.target.value }))} />
+                <label htmlFor="lab-result-text-full-report" style={s.label}>Result Text / Full Report</label>
+                <textarea id="lab-result-text-full-report" style={{ ...s.input, height: 100, resize: 'vertical' }} placeholder="Enter full result report, findings, or detailed text..." value={resultForm.result_text} onChange={e => setResultForm(f => ({ ...f, result_text: e.target.value }))} />
               </div>
               <div style={s.formGrid2}>
-                <div style={s.formGroup}><label style={s.label}>Key Value / Reading</label><input style={s.input} placeholder="e.g. 11.2 g/dL, Positive" value={resultForm.result_value} onChange={e => setResultForm(f => ({ ...f, result_value: e.target.value }))} /></div>
-                <div style={s.formGroup}><label style={s.label}>Reference Range</label><input style={s.input} placeholder="e.g. 12–16 g/dL, Negative" value={resultForm.reference_range} onChange={e => setResultForm(f => ({ ...f, reference_range: e.target.value }))} /></div>
+                <div style={s.formGroup}><label htmlFor="lab-key-value-reading" style={s.label}>Key Value / Reading</label><input id="lab-key-value-reading" style={s.input} placeholder="e.g. 11.2 g/dL, Positive" value={resultForm.result_value} onChange={e => setResultForm(f => ({ ...f, result_value: e.target.value }))} /></div>
+                <div style={s.formGroup}><label htmlFor="lab-reference-range" style={s.label}>Reference Range</label><input id="lab-reference-range" style={s.input} placeholder="e.g. 12–16 g/dL, Negative" value={resultForm.reference_range} onChange={e => setResultForm(f => ({ ...f, reference_range: e.target.value }))} /></div>
               </div>
               <div style={s.formGroup}>
-                <label style={s.label}>Interpretation</label>
-                <select style={s.input} value={resultForm.interpretation} onChange={e => setResultForm(f => ({ ...f, interpretation: e.target.value }))}>
+                <label htmlFor="lab-interpretation-2" style={s.label}>Interpretation</label>
+                <select id="lab-interpretation-2" style={s.input} value={resultForm.interpretation} onChange={e => setResultForm(f => ({ ...f, interpretation: e.target.value }))}>
                   <option value="">-- Select --</option>
                   {['Normal', 'Abnormal - Low', 'Abnormal - High', 'Positive', 'Negative', 'Borderline', 'Inconclusive', 'Pending Confirmation'].map(i => <option key={i}>{i}</option>)}
                 </select>
               </div>
               <div style={s.formGrid2}>
                 <div style={s.formGroup}>
-                  <label style={s.label}>Performed By</label>
-                  <select style={s.input} value={resultForm.performed_by} onChange={e => setResultForm(f => ({ ...f, performed_by: e.target.value }))}>
+                  <label htmlFor="lab-performed-by-2" style={s.label}>Performed By</label>
+                  <select id="lab-performed-by-2" style={s.input} value={resultForm.performed_by} onChange={e => setResultForm(f => ({ ...f, performed_by: e.target.value }))}>
                     <option value="">-- Select Technician --</option>
                     {labStaff.map(t => <option key={t.id} value={t.full_name}>{t.full_name}{t.role ? ` — ${t.role}` : ''}</option>)}
                     <option value="__custom__">Other</option>
                   </select>
                 </div>
-                <div style={s.formGroup}><label style={s.label}>Result File URL (optional)</label><input style={s.input} placeholder="Link to PDF/image" value={resultForm.result_file_url} onChange={e => setResultForm(f => ({ ...f, result_file_url: e.target.value }))} /></div>
+                <div style={s.formGroup}><label htmlFor="lab-result-file-url-optional" style={s.label}>Result File URL (optional)</label><input id="lab-result-file-url-optional" style={s.input} placeholder="Link to PDF/image" value={resultForm.result_file_url} onChange={e => setResultForm(f => ({ ...f, result_file_url: e.target.value }))} /></div>
               </div>
-              <div style={s.formGroup}><label style={s.label}>Additional Notes</label><textarea style={{ ...s.input, height: 60, resize: 'vertical' }} placeholder="Any additional clinical notes..." value={resultForm.result_notes} onChange={e => setResultForm(f => ({ ...f, result_notes: e.target.value }))} /></div>
+              <div style={s.formGroup}><label htmlFor="lab-additional-notes" style={s.label}>Additional Notes</label><textarea id="lab-additional-notes" style={{ ...s.input, height: 60, resize: 'vertical' }} placeholder="Any additional clinical notes..." value={resultForm.result_notes} onChange={e => setResultForm(f => ({ ...f, result_notes: e.target.value }))} /></div>
               {selected.visit_id && (
-                <div style={{ background: '#F0EAFC', border: '1px solid #D4C5F5', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: '#7B5EA7', fontWeight: 600 }}>
+                <div style={{ background: '#EAF5EF', border: '1px solid #D4C5F5', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: '#7B5EA7', fontWeight: 600 }}>
                   ⚡ Saving returns patient to Doctor queue when all critical in-house tests are done.
                 </div>
               )}
@@ -2581,25 +2601,25 @@ export default function Laboratory() {
 const s = {
   page: { padding: '20px 24px', flex: 1, overflowY: 'auto', background: '#f7f8f7', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', minHeight: '100vh', boxSizing: 'border-box' },
   loadWrap: { height: '80vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
-  spinner: { width: 36, height: 36, border: '3px solid #e8ebe8', borderTop: '3px solid #5B21B6', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
+  spinner: { width: 36, height: 36, border: '3px solid #e8ebe8', borderTop: '3px solid #0F6E56', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
   header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 },
   title: { fontSize: 24, fontWeight: 800, margin: 0, color: '#111' },
   subtitle: { color: '#777', margin: '4px 0 0', fontSize: 13 },
-  btn: { background: '#5B21B6', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 8, fontWeight: 600, cursor: 'pointer', fontSize: 13 },
+  btn: { background: '#0F6E56', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 8, fontWeight: 600, cursor: 'pointer', fontSize: 13 },
   tabRow: { display: 'flex', gap: 4, marginBottom: 14, background: '#fff', padding: '6px 8px', borderRadius: 10, border: '1px solid #eee', flexWrap: 'wrap' },
   tabBtn: { padding: '8px 14px', border: 'none', background: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#888', borderRadius: 7, display: 'flex', alignItems: 'center', gap: 6 },
-  tabBtnActive: { background: '#5B21B6', color: '#fff' },
+  tabBtnActive: { background: '#0F6E56', color: '#fff' },
   tabCount: { fontSize: 11, padding: '2px 7px', borderRadius: 99, background: '#f0f0f0', color: '#666', fontWeight: 700 },
   tabCountActive: { background: 'rgba(255,255,255,0.25)', color: '#fff' },
-  patientCardActive: { border: '2px solid #5B21B6', background: '#FAF5FF', borderRadius: 12 },
+  patientCardActive: { border: '2px solid #0F6E56', background: '#F4FBF7', borderRadius: 12 },
   testCard: { borderRadius: 12, padding: '14px 16px', cursor: 'pointer', display: 'flex', alignItems: 'flex-start', gap: 12, boxShadow: '0 2px 6px rgba(0,0,0,0.04)', flexWrap: 'wrap', transition: 'box-shadow 0.15s' },
   detailPanel: { width: 300, flexShrink: 0, background: '#fff', borderRadius: 12, border: '1px solid #eee', padding: 18, overflowY: 'auto', maxHeight: 'calc(100vh - 140px)' },
-  sectionLabel: { fontSize: 11, fontWeight: 700, color: '#5B21B6', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 10, marginTop: 4, paddingBottom: 5, borderBottom: '1px solid #F3E8FF' },
+  sectionLabel: { fontSize: 11, fontWeight: 700, color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 10, marginTop: 4, paddingBottom: 5, borderBottom: '1px solid #E1F5EE' },
   pill: { fontSize: 11, fontWeight: 600, padding: '3px 9px', borderRadius: 99, display: 'inline-block' },
   chip: { fontSize: 11, padding: '5px 12px', borderRadius: 99, border: '1px solid #e0e0e0', background: '#fff', cursor: 'pointer', fontWeight: 500, color: '#555' },
-  chipActive: { background: '#5B21B6', color: '#fff', border: '1px solid #5B21B6' },
+  chipActive: { background: '#0F6E56', color: '#fff', border: '1px solid #0F6E56' },
   actionBtn: { fontSize: 12, padding: '6px 12px', borderRadius: 6, cursor: 'pointer', fontWeight: 600, whiteSpace: 'nowrap', border: 'none' },
-  btnPri: { background: '#5B21B6', color: '#fff' },
+  btnPri: { background: '#0F6E56', color: '#fff' },
   btnGhost: { background: '#F3F4F6', color: '#9CA3AF', border: '1px solid #E5E7EB' },
   empty: { textAlign: 'center', padding: '80px 20px', color: '#999' },
   metricCard: { background: '#fff', border: '1px solid #E5E7EB', borderRadius: 14, padding: 16, boxShadow: '0 2px 10px rgba(15,110,86,0.04)' },
@@ -2625,7 +2645,6 @@ const s = {
   label: { fontSize: 12, color: '#666', display: 'block', marginBottom: 5, fontWeight: 500 },
   input: { width: '100%', padding: '10px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 13, outline: 'none', boxSizing: 'border-box', background: '#fff', color: '#111', fontFamily: 'inherit' },
   cancelBtn: { padding: '10px 20px', border: '1px solid #ddd', borderRadius: 8, background: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#555' },
-  submitBtn: { padding: '10px 24px', border: 'none', borderRadius: 8, background: '#5B21B6', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
+  submitBtn: { padding: '10px 24px', border: 'none', borderRadius: 8, background: '#0F6E56', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
 }
-
 

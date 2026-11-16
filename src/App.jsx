@@ -6,16 +6,24 @@ import AccessDenied from './components/AccessDenied'
 import ErrorBoundary from './components/ErrorBoundary'
 import SkeletonLoader from './components/SkeletonLoader'
 import ToastViewport from './components/ToastViewport'
-import { canAccessScreen, resolveRole } from './access'
+import { canAccessPayroll, canAccessScreen, resolveRole } from './access'
 import { openConfirmDialog } from './confirmDialog'
 import useAuth from './hooks/useAuth'
 import useDepartments from './hooks/useDepartments'
 import useOnlineSync from './hooks/useOnlineSync'
+import SyncIndicator from './components/SyncIndicator'
+import HelpCentre from './components/HelpCentre'
+import NavGroups from './components/NavGroups'
+import { canonicalDepartmentName, uniqueDepartmentNames } from './utils/departmentNames'
+import { installErrorCapture } from './utils/problemReport'
 import useSessionTimeout from './hooks/useSessionTimeout'
 import Login from './screens/Login'
 import Dashboard from './screens/Dashboard'
+import HospitalWorkflowBoard from './screens/HospitalWorkflowBoard'
+import { HOSPITAL_WORKFLOW_MODULES } from './screens/hospitalWorkflowModules'
 import { notifyFromLegacyAlert } from './notifications'
 import supabase from './supabase'
+import { loadRoleOverrides } from './utils/hospitalConfig'
 import { performSyncableAction } from './utils/offlineSync'
 import { fetchAppNotifications, markAllNotificationsRead, markNotificationRead, APP_NOTIFICATION_TYPES } from './utils/appNotifications'
 import { searchAcrossHospital, groupSearchResults } from './utils/globalSearch'
@@ -25,15 +33,28 @@ import { openPrintPreview, printTemplates } from './utils/printSystem'
 import { buildBilingualWhatsAppMessage, generateWhatsAppLink } from './utils/whatsapp'
 import { registerPwaServiceWorker } from './utils/pwa'
 import { applyThemeMode, colors, getStoredThemeMode, THEME_MODES, typography } from './theme'
-import hmsLogo from '../icon.png'
+import hmsLogo from './assets/remedacarehms-logo.svg'
 
 const Patients = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Patients'))
 const Appointments = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Appointments'))
 const Consultation = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/consultation'))
 const CarePathways = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/CarePathways'))
 const ChronicDisease = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/ChronicDisease'))
+const HivTb = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/HivTb'))
+const Emergency = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Emergency'))
+const Theatre = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Theatre'))
+const ICU = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/ICU'))
+const PharmacyControls = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/PharmacyControls'))
+const Dialysis = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Dialysis'))
+const Mortuary = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Mortuary'))
+const Dashboards = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Dashboards'))
+const Microbiology = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Microbiology'))
+const CriticalResults = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/CriticalResults'))
+const ClinicalReferences = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/ClinicalReferences'))
+const Maternity = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Maternity'))
 const Referrals = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Referrals'))
 const Wards = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/Wards'))
+const BloodBank = lazy(() => import(/* @vite-chunk-name: "clinical" */ './screens/BloodBank'))
 const Laboratory = lazy(() => import(/* @vite-chunk-name: "lab" */ './screens/Laboratory'))
 const Radiology = lazy(() => import(/* @vite-chunk-name: "lab" */ './screens/Radiology'))
 const Pharmacy = lazy(() => import(/* @vite-chunk-name: "pharmacy" */ './screens/pharmacy'))
@@ -59,34 +80,54 @@ const NAV_GROUPS = [
     items: [{ id: 'dashboard', path: '/dashboard', label: 'Dashboard', icon: '' }],
   },
   {
-    label: 'CLINICAL',
+    label: 'PATIENT CARE',
     items: [
       { id: 'patients', path: '/patients', label: 'Patients', icon: '' },
       { id: 'appointments', path: '/appointments', label: 'Appointments', icon: '' },
       { id: 'consultation', path: '/consultation', label: 'Consultation', icon: '' },
-      { id: 'care-pathways', path: '/care-pathways', label: 'Care Pathways', icon: '' },
-      { id: 'chronic-disease', path: '/chronic-disease', label: 'Chronic Disease', icon: '' },
       { id: 'referrals', path: '/referrals', label: 'Referrals', icon: '' },
+      { id: 'care-pathways', path: '/care-pathways', label: 'Care Pathways', icon: '' },
+      { id: 'references', path: '/references', label: 'Clinical guides & references', icon: '' },
+      { id: 'chronic-disease', path: '/chronic-disease', label: 'Chronic Disease', icon: '' },
+      { id: 'hivtb', path: '/hivtb', label: 'HIV & TB Care', icon: '' },
+      { id: 'maternity', path: '/maternity', label: 'Maternity & Child Health', icon: '' },
+      { id: 'telemedicine', path: '/telemedicine', label: 'Telemedicine', icon: '' },
+      { id: 'ai', path: '/ai', label: 'AI Clinical Assist', icon: '' },
+    ],
+  },
+  {
+    label: 'EMERGENCY & INPATIENT',
+    items: [
       { id: 'wards', path: '/wards', label: 'Ward & Beds', icon: '' },
+      { id: 'dialysis', path: '/dialysis', label: 'Dialysis', icon: '' },
+    ],
+  },
+  {
+    label: 'DIAGNOSTICS',
+    items: [
       { id: 'lab', path: '/laboratory', label: 'Laboratory', icon: '' },
       { id: 'radiology', path: '/radiology', label: 'Radiology', icon: '' },
-      { id: 'antibiogram', path: '/antibiogram', label: 'Antibiogram', icon: '' },
-      { id: 'prescriptions', path: '/prescriptions', label: 'Prescriptions', icon: '' },
-      { id: 'expiry', path: '/expiry', label: 'Expiry Alerts', icon: '' },
+      { id: 'blood-bank', path: '/blood-bank', label: 'Blood Bank', icon: '' },
+      { id: 'antibiogram', path: '/antibiogram', label: 'Antibiogram & AMR', icon: '' },
+      { id: 'microbiology', path: '/microbiology', label: 'Microbiology surveillance', icon: '' },
+      { id: 'critical-results', path: '/critical-results', label: 'Critical results & TDM', icon: '' },
     ],
   },
   {
-    label: 'OPERATIONS',
+    label: 'PHARMACY',
     items: [
       { id: 'pharmacy', path: '/pharmacy', label: 'Pharmacy & POS', icon: '' },
+      { id: 'prescriptions', path: '/prescriptions', label: 'Prescriptions', icon: '' },
       { id: 'inventory', path: '/inventory', label: 'Drug Inventory', icon: '' },
-      { id: 'billing', path: '/billing', label: 'Billing', icon: '' },
-      { id: 'credit', path: '/credit', label: 'Credit & Debts', icon: '' },
+      { id: 'expiry', path: '/expiry', label: 'Expiry Alerts', icon: '' },
+      { id: 'pharmacy-controls', path: '/pharmacy-controls', label: 'Controlled drugs & ward stock', icon: '' },
     ],
   },
   {
-    label: 'FINANCE',
+    label: 'BILLING & FINANCE',
     items: [
+      { id: 'billing', path: '/billing', label: 'Billing', icon: '' },
+      { id: 'credit', path: '/credit', label: 'Credit & Debts', icon: '' },
       { id: 'mpesa', path: '/mpesa', label: 'M-Pesa', icon: '' },
       { id: 'sha', path: '/sha-claims', label: 'SHA Claims', icon: '' },
       { id: 'insurance', path: '/insurance', label: 'Insurance Claims', icon: '' },
@@ -94,11 +135,19 @@ const NAV_GROUPS = [
     ],
   },
   {
-    label: 'ADMIN',
+    label: 'HOSPITAL MANAGEMENT',
     items: [
       { id: 'hr', path: '/hr', label: 'HR & Staff', icon: '' },
-      { id: 'ai', path: '/ai', label: 'AI Clinical Assist', icon: '' },
+      { id: 'procurement', path: '/procurement', label: 'Procurement', icon: '' },
+      { id: 'biomedical', path: '/biomedical', label: 'Biomedical', icon: '' },
+      { id: 'quality-safety', path: '/quality-safety', label: 'Quality & Safety', icon: '' },
+    ],
+  },
+  {
+    label: 'SYSTEM',
+    items: [
       { id: 'reports', path: '/reports', label: 'Reports', icon: '' },
+      { id: 'dashboards', path: '/dashboards', label: 'Management dashboards', icon: '' },
       { id: 'settings', path: '/settings', label: 'Settings', icon: '' },
     ],
   },
@@ -113,11 +162,32 @@ const SCREEN_PATHS = {
   'chronic-disease': '/chronic-disease',
   referrals: '/referrals',
   wards: '/wards',
+  'blood-bank': '/blood-bank',
+  morgue: '/morgue',
+  theatre: '/theatre',
   lab: '/laboratory',
   radiology: '/radiology',
+  telemedicine: '/telemedicine',
+  maternity: '/maternity',
+  dialysis: '/dialysis',
+  emergency: '/emergency',
+  ed: '/emergency',
+  'theatre-suite': '/theatre',
+  icu: '/icu',
+  nutrition: '/nutrition',
+  hivtb: '/hivtb',
+  biomedical: '/biomedical',
+  'quality-safety': '/quality-safety',
+  procurement: '/procurement',
+  payroll: '/payroll',
   antibiogram: '/antibiogram',
+  microbiology: '/microbiology',
+  'critical-results': '/critical-results',
+  references: '/references',
   prescriptions: '/prescriptions',
   expiry: '/expiry',
+  'pharmacy-controls': '/pharmacy-controls',
+  dashboards: '/dashboards',
   pharmacy: '/pharmacy',
   inventory: '/inventory',
   billing: '/billing',
@@ -240,7 +310,7 @@ function ShellModal({ title, subtitle, onClose, children, width = 760 }) {
             <div style={styles.modalTitle}>{title}</div>
             {subtitle ? <div style={styles.modalSubtitle}>{subtitle}</div> : null}
           </div>
-          <button type="button" style={styles.modalClose} onClick={onClose}>×</button>
+          <button type="button" style={styles.modalClose} onClick={onClose} aria-label="Close" title="Close">×</button>
         </div>
         {children}
       </div>
@@ -294,7 +364,10 @@ function DepartmentRoute({ navigateApp }) {
 function AppShell() {
   const routerNavigate = useNavigate()
   const location = useLocation()
-  const [departmentsOpen, setDepartmentsOpen] = useState(false)
+  // Phones / tablets: the sidebar is a slide-in drawer, closed whenever the page changes.
+  const [navOpen, setNavOpen] = useState(false)
+  useEffect(() => { setNavOpen(false) }, [location.pathname])
+
 
   useEffect(() => {
     const originalAlert = window.alert
@@ -335,7 +408,7 @@ function AppShell() {
     user,
     hospitalId,
     hospitalName,
-    userRole,
+    userRole: homeRole,
     userDepartment,
     authError,
     checkingAuth,
@@ -366,9 +439,12 @@ function AppShell() {
   const [globalSearchLoading, setGlobalSearchLoading] = useState(false)
   const [globalSearchResults, setGlobalSearchResults] = useState([])
   const [notificationCenterOpen, setNotificationCenterOpen] = useState(false)
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false)
   const [appNotifications, setAppNotifications] = useState([])
   const [notificationsCompat, setNotificationsCompat] = useState(false)
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false)
+  const [helpTab, setHelpTab] = useState(null)
+  useEffect(() => installErrorCapture(), [])
   const shortcutSequenceRef = useRef([])
   const shortcutTimerRef = useRef(null)
   const globalSearchDebounced = useDebouncedValue(globalSearchTerm, 300)
@@ -379,6 +455,8 @@ function AppShell() {
     [availableBranches, effectiveHospitalId],
   )
   const effectiveHospitalName = activeBranch?.name || hospitalName
+  // Per-site roles: at another facility the user works with that facility's role (its staff / hospital_users row)
+  const userRole = (activeBranch && String(activeBranch.id) !== String(hospitalId) && activeBranch.accessRole) || homeRole
   const zoomPercentLabel = `${Math.round((zoomFactor || DEFAULT_ZOOM_FACTOR) * 100)}%`
   const canZoomOut = zoomFactor > MIN_ZOOM_FACTOR + 0.001
   const canZoomIn = zoomFactor < MAX_ZOOM_FACTOR - 0.001
@@ -500,6 +578,15 @@ function AppShell() {
         branchRows = branchRes.data || []
       }
 
+      // The role at each facility comes from that facility's staff record (hospital_users.role can be a generic 'staff')
+      const staffRoleByBranch = new Map()
+      if (user.email) {
+        const staffRes = await supabase.from('staff').select('hospital_id, role, status').ilike('email', user.email).in('hospital_id', branchIds)
+        for (const row of staffRes.data || []) {
+          if (row?.role && !/suspend|terminat|reject/i.test(String(row.status || ''))) staffRoleByBranch.set(String(row.hospital_id), row.role)
+        }
+      }
+
       const branchMap = new Map(branchRows.map((row) => [String(row.id), row]))
       const branches = branchIds
         .map((branchId) => normalizeBranchRecord(
@@ -507,10 +594,9 @@ function AppShell() {
             id: branchId,
             name: String(branchId) === String(hospitalId) ? (hospitalName || 'Hospital Branch') : 'Hospital Branch',
           },
-          accessMap.get(String(branchId)) || {
-            hospital_id: branchId,
-            role: userRole,
-            is_primary: String(branchId) === String(hospitalId),
+          {
+            ...(accessMap.get(String(branchId)) || { hospital_id: branchId, role: homeRole, is_primary: String(branchId) === String(hospitalId) }),
+            ...(staffRoleByBranch.has(String(branchId)) ? { role: staffRoleByBranch.get(String(branchId)) } : {}),
           },
         ))
         .filter((branch) => branch.id)
@@ -553,7 +639,17 @@ function AppShell() {
     return () => {
       active = false
     }
-  }, [hospitalId, hospitalName, user?.id, userRole])
+  }, [hospitalId, hospitalName, user?.id, user?.email, homeRole])
+
+  // Role matrix from Settings → Configuration; re-render the menus once loaded or after an admin saves it
+  const [, setRoleConfigVersion] = useState(0)
+  useEffect(() => {
+    let active = true
+    const load = () => loadRoleOverrides(supabase, effectiveHospitalId).then(() => { if (active) setRoleConfigVersion((v) => v + 1) })
+    void load()
+    window.addEventListener('rc-role-config-changed', load)
+    return () => { active = false; window.removeEventListener('rc-role-config-changed', load) }
+  }, [effectiveHospitalId])
 
   // FIXED: Deep link handler that restores session from tokens
   useEffect(() => {
@@ -677,7 +773,7 @@ function AppShell() {
   })
 
   const { departments, departmentsLoading, loadDepartments } = useDepartments(effectiveHospitalId)
-  const { isOnlineState, syncStatus } = useOnlineSync()
+  const { isOnlineState, syncStatus, queue: offlineQueue, syncPendingActions: syncOfflineNow, applyAnyway: applyOfflineAnyway, discard: discardOffline } = useOnlineSync()
 
   useEffect(() => {
     if (!effectiveHospitalId) {
@@ -865,14 +961,16 @@ function AppShell() {
     routerNavigate(location.pathname, { replace: true, state: null })
   }, [location.pathname, location.state, routerNavigate])
 
-  const departmentNames = departments.map((department) => department.name).filter(Boolean)
-  
+  // One entry per real department: spellings and synonyms ("Psychiatry" / "Mental Health") are merged.
+  const departmentNames = uniqueDepartmentNames(departments.map((department) => department.name))
+
   const visibleDepartmentNames = (() => {
     const resolved = resolveRole(userRole)
     if (resolved === 'Admin') return departmentNames
     if (departmentsLoading || !userRole) return departmentNames
     if (!userDepartment) return departmentNames
-    const filtered = departmentNames.filter(n => n === userDepartment)
+    const own = canonicalDepartmentName(userDepartment)
+    const filtered = departmentNames.filter(n => n === own)
     return filtered.length > 0 ? filtered : departmentNames
   })()
   
@@ -880,8 +978,12 @@ function AppShell() {
   const userInitials = (user?.email || 'U').slice(0, 2).toUpperCase()
   const resolvedRole = resolveRole(userRole)
   const isAdmin = resolvedRole === 'Admin'
+  const canSeePayroll = canAccessPayroll(userRole) || isAdmin
   const financialActionsBlocked = offlineMode || !isOnlineState
   const unreadNotifications = appNotifications.filter((item) => !item.is_read && !item.read_at).length
+  const accountDisplayName = user?.user_metadata?.full_name || user?.user_metadata?.name || user?.email || 'Signed-in account'
+  const accountDisplayRole = resolvedRole === 'Admin' ? 'Administrator' : (resolvedRole || 'User')
+  const accountAvatarText = accountDisplayName.slice(0, 1).toUpperCase()
   const groupedSearchResults = useMemo(() => groupSearchResults(globalSearchResults), [globalSearchResults])
   const shortcutGroups = useMemo(() => {
     const baseShortcuts = APP_SHORTCUTS.filter((item) => item.type !== 'command' || item.id !== 'help')
@@ -907,6 +1009,16 @@ function AppShell() {
     if (location.pathname.startsWith('/departments/')) return selectedDepartment || 'Department'
     return 'Dashboard'
   }, [location.pathname, selectedDepartment])
+  // First sign-in on this computer for this user and role: show the quick-start once.
+  useEffect(() => {
+    if (!user?.id || !resolvedRole) return
+    const key = `rc-quickstart-seen:${user.id}:${resolvedRole}`
+    try {
+      if (window.localStorage.getItem(key)) return
+      window.localStorage.setItem(key, new Date().toISOString())
+    } catch { return }
+    setHelpTab('start')
+  }, [user?.id, resolvedRole])
   const breadcrumbItems = useMemo(() => {
     if (location.pathname === '/dashboard') return [{ label: 'Dashboard', path: null }]
     if (location.pathname.startsWith('/departments/')) {
@@ -925,7 +1037,9 @@ function AppShell() {
   const visibleNavGroups = NAV_GROUPS
     .map((group) => ({
       ...group,
-      items: group.items.filter((item) => (isAdmin || canAccessScreen(userRole, item.path)) && !(financialActionsBlocked && OFFLINE_RESTRICTED_PATHS.includes(item.path))),
+      items: group.items
+        .filter((item) => item.path !== '/payroll' || canSeePayroll)
+        .filter((item) => (isAdmin || canAccessScreen(userRole, item.path)) && !(financialActionsBlocked && OFFLINE_RESTRICTED_PATHS.includes(item.path))),
     }))
     .filter((group) => group.items.length > 0)
 
@@ -1072,7 +1186,9 @@ function AppShell() {
   return (
     <HospitalContext.Provider value={contextValue}>
       <div style={styles.container}>
-        <aside style={styles.sidebar}>
+        <style>{RESPONSIVE_CSS}</style>
+        {navOpen && <div className="rc-nav-backdrop" onClick={() => setNavOpen(false)} aria-hidden="true" />}
+        <aside id="rc-sidebar" className={`rc-sidebar${navOpen ? ' open' : ''}`} style={styles.sidebar} aria-label="Main menu">
           <div style={styles.logoArea}>
             <img src={hospitalProfile.logoBase64 || loginBranding?.logoBase64 || HMS_LOGO_SRC} alt="RemedacareHMS logo" style={styles.brandLogo} />
             <div style={{ minWidth: 0 }}>
@@ -1082,70 +1198,17 @@ function AppShell() {
           </div>
 
           <div style={styles.nav}>
-            {visibleNavGroups.map((group) => (
-              <div key={group.label} style={styles.navSection}>
-                <div style={styles.navSectionTitle}>{group.label}</div>
-                {group.items.map((item) => {
-                  const active = location.pathname === item.path
-                  return (
-                    <button
-                      key={item.id}
-                      type="button"
-                      style={{ ...styles.navItem, ...(active ? styles.navItemActive : {}) }}
-                      onClick={() => navigateApp(item.id)}
-                    >
-                      <span style={styles.navIcon}>{item.icon}</span>
-                      <span>{item.label}</span>
-                    </button>
-                  )
-                })}
-              </div>
-            ))}
-
-            <div style={styles.navSection}>
-              <button
-                type="button"
-                style={styles.navSectionToggle}
-                onClick={() => setDepartmentsOpen((previous) => !previous)}
-              >
-                <span>DEPARTMENTS</span>
-                <span>{departmentsOpen ? '-' : '+'}</span>
-              </button>
-
-              {departmentsOpen && (
-                <div style={{ paddingBottom: '6px' }}>
-                  {departmentsLoading && (
-                    <div style={{ ...styles.navItem, ...styles.navStaticItem }}>
-                      <div style={{ width: '100%' }}>
-                        <SkeletonLoader rows={2} height={10} width={['85%', '60%']} />
-                      </div>
-                    </div>
-                  )}
-
-                  {!departmentsLoading && visibleDepartmentNames.map((name) => {
-                    const active = selectedDepartment === name
-                    return (
-                      <button
-                        key={name}
-                        type="button"
-                        style={{ ...styles.navItem, ...(active ? styles.navItemActive : {}) }}
-                        onClick={() => navigateApp('department', { department: name })}
-                      >
-                        <span style={styles.navIcon}></span>
-                        <span>{name}</span>
-                      </button>
-                    )
-                  })}
-
-                  {!departmentsLoading && visibleDepartmentNames.length === 0 && (
-                    <div style={{ ...styles.navItem, ...styles.navStaticItem }}>
-                      <span style={styles.navIcon}></span>
-                      <span>No departments added yet</span>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
+            <NavGroups
+              groups={[
+                ...visibleNavGroups.map((group) => (group.label === 'OVERVIEW' ? { ...group, link: true } : group)),
+                {
+                  label: 'DEPARTMENTS', divider: true, loading: departmentsLoading, emptyText: 'No departments added yet',
+                  items: visibleDepartmentNames.map((name) => ({ id: `dept:${name}`, path: `/departments/${encodeURIComponent(name)}`, label: name, department: name })),
+                },
+              ]}
+              activePath={selectedDepartment ? `/departments/${encodeURIComponent(canonicalDepartmentName(selectedDepartment))}` : location.pathname}
+              onNavigate={(item) => (item.department ? navigateApp('department', { department: item.department }) : navigateApp(item.id))}
+            />
           </div>
 
           <div style={styles.userBar}>
@@ -1160,9 +1223,11 @@ function AppShell() {
           </div>
         </aside>
 
-        <main style={styles.main}>
+        <main className="rc-main" style={styles.main}>
           <div style={styles.topbar}>
-            <div>
+            <button type="button" className="rc-menu-btn" aria-label={navOpen ? 'Close menu' : 'Open menu'} aria-expanded={navOpen} aria-controls="rc-sidebar"
+              onClick={() => setNavOpen((v) => !v)}>☰</button>
+            <div style={{ minWidth: 0 }}>
               <Breadcrumbs items={breadcrumbItems} onNavigate={(path) => routerNavigate(path)} />
               <div style={styles.screenTitle}>{currentScreenLabel}</div>
               <div style={styles.screenSubtitle}>
@@ -1227,21 +1292,61 @@ function AppShell() {
               <button type="button" style={styles.headerIconBtn} onClick={toggleThemeMode} title="Toggle dark mode">
                 {themeMode === THEME_MODES.dark ? 'Light' : 'Dark'}
               </button>
-              <button type="button" style={styles.headerIconBtn} onClick={() => setShortcutHelpOpen(true)} title="Keyboard shortcuts">
+              <button type="button" style={styles.headerIconBtn} onClick={() => setHelpTab('start')} title="Quick start for your role and Report a problem">
+                Help
+              </button>
+              <button type="button" style={styles.headerIconBtn} onClick={() => setShortcutHelpOpen(true)} title="Keyboard shortcuts" aria-label="Keyboard shortcuts">
                 ?
               </button>
-              <button type="button" style={styles.notificationBtn} onClick={() => setNotificationCenterOpen(true)} title="Notification centre">
-                Bell
+              <button
+                type="button"
+                style={styles.notificationBtn}
+                onClick={() => { setAccountMenuOpen(false); setNotificationCenterOpen(true) }}
+                title="Notification centre"
+                aria-label={`Notifications${unreadNotifications ? `, ${unreadNotifications} unread` : ''}`}
+                aria-expanded={notificationCenterOpen}
+              >
+                <span aria-hidden="true">{String.fromCodePoint(0x1F514)}</span>
                 {unreadNotifications > 0 ? <span style={styles.notificationBadge}>{unreadNotifications}</span> : null}
               </button>
+              <div style={styles.accountMenuWrap}>
+                <button
+                  type="button"
+                  style={styles.accountMenuButton}
+                  onClick={() => { setNotificationCenterOpen(false); setAccountMenuOpen(open => !open) }}
+                  aria-expanded={accountMenuOpen}
+                  aria-label={`Account: ${accountDisplayName}, ${accountDisplayRole}`}
+                >
+                  <span style={styles.accountAvatar}>{accountAvatarText}</span>
+                  <span style={styles.accountIdentity}>
+                    <strong>{accountDisplayName}</strong>
+                    <span>{accountDisplayRole}</span>
+                  </span>
+                  <span style={styles.accountChevron} aria-hidden="true">▾</span>
+                </button>
+                {accountMenuOpen && (
+                  <div style={styles.accountMenuDropdown}>
+                    <div style={styles.accountMenuHeading}>Account</div>
+                    <div style={styles.accountMenuEmail}>{user?.email || 'Signed-in account'}</div>
+                    <div style={styles.accountMenuDivider} />
+                    <div style={styles.accountMenuHeading}>Active workspace</div>
+                    <div style={styles.accountMenuWorkspace}>{effectiveHospitalName || 'Hospital workspace'}</div>
+                    <button type="button" style={styles.accountMenuAction} onClick={() => { setAccountMenuOpen(false); navigateApp('settings') }}>
+                      Profile &amp; settings
+                    </button>
+                    <button type="button" style={styles.accountMenuSignOut} onClick={() => { setAccountMenuOpen(false); handleLogout() }}>
+                      Sign out
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 
-          {syncStatus !== 'idle' && (
-            <div style={styles.syncBanner}>
-              {syncStatus === 'syncing'
-                ? 'Syncing offline changes...'
-                : 'Offline sync failed. Some actions still need to be retried.'}
+          {(offlineQueue.length > 0 || !isOnlineState || syncStatus === 'syncing') && (
+            <div style={{ display: 'flex', justifyContent: 'flex-end', padding: '6px 18px 0' }}>
+              <SyncIndicator online={isOnlineState} syncStatus={syncStatus} queue={offlineQueue}
+                onRetry={() => void syncOfflineNow()} onApply={(id) => void applyOfflineAnyway(id)} onDiscard={(id) => void discardOffline(id)} />
             </div>
           )}
 
@@ -1379,6 +1484,28 @@ function AppShell() {
             </ShellModal>
           )}
 
+          {helpTab && (
+            <ShellModal
+              title="Help"
+              subtitle="How to use RemedacareHMS in your role, and a quick way to tell IT when something is wrong"
+              onClose={() => setHelpTab(null)}
+              width={720}
+            >
+              <HelpCentre
+                key={helpTab}
+                initialTab={helpTab}
+                resolvedRole={resolvedRole}
+                onNavigate={(path) => { setHelpTab(null); routerNavigate(path) }}
+                hospitalId={effectiveHospitalId}
+                screen={currentScreenLabel}
+                path={location.pathname}
+                role={userRole}
+                userName={accountDisplayName}
+                online={isOnlineState && !offlineMode}
+              />
+            </ShellModal>
+          )}
+
           {shortcutHelpOpen && (
             <ShellModal
               title="Keyboard Shortcuts"
@@ -1409,11 +1536,30 @@ function AppShell() {
             {renderProtectedRoute('/chronic-disease', 'Chronic Disease', <ChronicDisease />)}
             {renderProtectedRoute('/referrals', 'Referrals', <Referrals />)}
             {renderProtectedRoute('/wards', 'Wards', <Wards />)}
+            {renderProtectedRoute('/blood-bank', 'Blood Bank', <BloodBank />)}
+            {renderProtectedRoute('/morgue', 'Mortuary', <Mortuary />)}
+            {renderProtectedRoute('/theatre', 'Theatre', <Theatre />)}
+            {renderProtectedRoute('/telemedicine', 'Telemedicine', <HospitalWorkflowBoard config={HOSPITAL_WORKFLOW_MODULES.telemedicine} />)}
+            {renderProtectedRoute('/maternity', 'Maternity', <Maternity />)}
+            {renderProtectedRoute('/dialysis', 'Dialysis', <Dialysis />)}
+            {renderProtectedRoute('/emergency', 'Emergency department', <Emergency />)}
+            {renderProtectedRoute('/icu', 'ICU / HDU', <ICU />)}
+            <Route path="/nutrition" element={<Navigate to="/departments/Nutrition%20%26%20Dietetics?module=nutrition" replace />} />
+            {renderProtectedRoute('/hivtb', 'HIV & TB Care', <HivTb />)}
+            {renderProtectedRoute('/biomedical', 'Biomedical', <HospitalWorkflowBoard config={HOSPITAL_WORKFLOW_MODULES.biomedical} />)}
+            {renderProtectedRoute('/quality-safety', 'Quality & Safety', <HospitalWorkflowBoard config={HOSPITAL_WORKFLOW_MODULES['quality-safety']} />)}
+            {renderProtectedRoute('/procurement', 'Procurement', <HospitalWorkflowBoard config={HOSPITAL_WORKFLOW_MODULES.procurement} />)}
+            <Route path="/payroll" element={<Navigate to="/hr?tab=payroll" replace />} />
             {renderProtectedRoute('/laboratory', 'Laboratory', <LaboratoryRoute navigateApp={navigateApp} />)}
             {renderProtectedRoute('/radiology', 'Radiology', <Radiology />)}
             {renderProtectedRoute('/antibiogram', 'Antibiogram', <AntibiogramRoute navigateApp={navigateApp} />)}
+            {renderProtectedRoute('/microbiology', 'Microbiology surveillance', <Microbiology />)}
+            {renderProtectedRoute('/critical-results', 'Critical results & TDM', <CriticalResults />)}
+            {renderProtectedRoute('/references', 'Clinical guides & references', <ClinicalReferences />)}
             {renderProtectedRoute('/prescriptions', 'Prescriptions', <Prescriptions />)}
             {renderProtectedRoute('/expiry', 'Expiry', <Expiry />)}
+            {renderProtectedRoute('/pharmacy-controls', 'Controlled drugs & ward stock', <PharmacyControls />)}
+            {renderProtectedRoute('/dashboards', 'Management dashboards', <Dashboards />)}
             {renderProtectedRoute('/pharmacy', 'Pharmacy', <Pharmacy />)}
             {renderProtectedRoute('/inventory', 'Inventory', <DrugInventory />)}
             {renderProtectedRoute('/billing', 'Billing', <Billing />)}
@@ -1437,13 +1583,50 @@ function AppShell() {
   )
 }
 
+// Public pages (no staff sign-in): referral letter links and the patient portal. Everything else is the staff app.
+const SharedReferral = lazy(() => import('./screens/public/SharedReferral'))
+const PatientPortal = lazy(() => import('./screens/portal/PatientPortal'))
+
+function RootSwitch() {
+  const { pathname } = useLocation()
+  if (pathname.startsWith('/shared/') || pathname.startsWith('/portal')) {
+    return (
+      <Suspense fallback={<div style={{ padding: 24, fontFamily: 'system-ui' }}>Loading…</div>}>
+        <Routes>
+          <Route path="/shared/referral/:token" element={<SharedReferral />} />
+          <Route path="/portal/*" element={<PatientPortal />} />
+          <Route path="*" element={<Navigate to="/portal" replace />} />
+        </Routes>
+      </Suspense>
+    )
+  }
+  return <AppShell />
+}
+
 export default function App() {
   return (
     <HashRouter>
-      <AppShell />
+      <RootSwitch />
     </HashRouter>
   )
 }
+
+// Layout rules that inline styles cannot express: phone / tablet drawer, scrollable tables, visible keyboard focus.
+const RESPONSIVE_CSS = `
+.rc-menu-btn { display: none; }
+.rc-main :focus-visible, .rc-sidebar :focus-visible { outline: 2px solid #12B76A; outline-offset: 2px; }
+@media (max-width: 900px) {
+  .rc-sidebar { position: fixed; top: 0; bottom: 0; left: 0; z-index: 1300; width: min(280px, 86vw) !important; overflow-y: auto;
+    transform: translateX(-105%); transition: transform .2s ease; box-shadow: 0 0 40px rgba(15,23,42,.35); }
+  .rc-sidebar.open { transform: translateX(0); }
+  .rc-nav-backdrop { position: fixed; inset: 0; background: rgba(15,23,42,.45); z-index: 1250; }
+  .rc-menu-btn { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; flex-shrink: 0;
+    border: 1px solid #D0D5DD; border-radius: 10px; background: #fff; font-size: 20px; cursor: pointer; }
+  .rc-main table { display: block; max-width: 100%; overflow-x: auto; }
+  .rc-main input, .rc-main select, .rc-main textarea { font-size: 16px; }
+}
+@media (prefers-reduced-motion: reduce) { .rc-sidebar { transition: none; } }
+`
 
 const styles = {
   fullscreen: {
@@ -1478,7 +1661,7 @@ const styles = {
     fontFamily: typography.systemFontFamily,
   },
   sidebar: {
-    width: '210px',
+    width: '252px',
     background: colors.primaryDark,
     color: colors.white,
     display: 'flex',
@@ -1487,7 +1670,7 @@ const styles = {
   },
   logoArea: {
     padding: '18px 16px 14px',
-    borderBottom: '1px solid rgba(255,255,255,0.12)',
+    borderBottom: '1px solid #9FE1CB',
     display: 'flex',
     alignItems: 'center',
     gap: '10px',
@@ -1501,7 +1684,7 @@ const styles = {
   logoText: { fontSize: '14px', fontWeight: '700', margin: 0, letterSpacing: '0.3px' },
   logoSub: {
     fontSize: '10px',
-    color: 'rgba(255,255,255,0.5)',
+    color: '#FFFFFF',
     margin: 0,
     whiteSpace: 'nowrap',
     overflow: 'hidden',
@@ -1511,7 +1694,7 @@ const styles = {
   navSection: { marginBottom: '6px' },
   navSectionTitle: {
     fontSize: '9px',
-    color: 'rgba(255,255,255,0.35)',
+    color: '#FFFFFF',
     padding: '10px 16px 4px',
     textTransform: 'uppercase',
     fontWeight: '600',
@@ -1521,15 +1704,29 @@ const styles = {
     width: '100%',
     background: 'transparent',
     border: 'none',
-    color: 'rgba(255,255,255,0.35)',
-    padding: '10px 16px 4px',
+    color: '#FFFFFF',
+    padding: '9px 16px 7px',
     cursor: 'pointer',
     display: 'flex',
     justifyContent: 'space-between',
     alignItems: 'center',
-    fontSize: '9px',
-    fontWeight: '600',
-    letterSpacing: '0.8px',
+    fontSize: '10.5px',
+    fontWeight: '700',
+    letterSpacing: '0.7px',
+    textAlign: 'left',
+  },
+  navSectionToggleActive: { color: colors.white },
+  navCount: { fontSize: '10px', fontWeight: 600, color: '#FFFFFF', background: '#033D2D', borderRadius: '999px', padding: '1px 7px' },
+  navSearch: {
+    width: '100%',
+    boxSizing: 'border-box',
+    background: '#033D2D',
+    border: '1px solid #9FE1CB',
+    borderRadius: '8px',
+    color: colors.white,
+    padding: '7px 10px',
+    fontSize: '12.5px',
+    outline: 'none',
   },
   navItem: {
     width: '100%',
@@ -1538,7 +1735,7 @@ const styles = {
     gap: '10px',
     padding: '8px 16px',
     fontSize: '12.5px',
-    color: 'rgba(255,255,255,0.7)',
+    color: '#FFFFFF',
     cursor: 'pointer',
     border: 'none',
     borderLeft: '3px solid transparent',
@@ -1546,11 +1743,11 @@ const styles = {
     textAlign: 'left',
   },
   navStaticItem: {
-    color: 'rgba(255,255,255,0.55)',
+    color: '#FFFFFF',
     cursor: 'default',
   },
   navItemActive: {
-    background: 'rgba(255,255,255,0.14)',
+    background: '#033D2D',
     color: colors.white,
     borderLeft: `3px solid ${colors.accent}`,
     fontWeight: '500',
@@ -1559,7 +1756,7 @@ const styles = {
   userBar: {
     marginTop: 'auto',
     padding: '12px 16px',
-    borderTop: '1px solid rgba(255,255,255,0.12)',
+    borderTop: '1px solid #9FE1CB',
     display: 'flex',
     alignItems: 'center',
     gap: '10px',
@@ -1588,7 +1785,7 @@ const styles = {
   },
   userRole: {
     fontSize: '10px',
-    color: 'rgba(255,255,255,0.5)',
+    color: '#FFFFFF',
     margin: 0,
     whiteSpace: 'nowrap',
     overflow: 'hidden',
@@ -1608,7 +1805,7 @@ const styles = {
     justifyContent: 'center',
     flexShrink: 0,
   },
-  main: { flex: 1, overflowY: 'auto', background: colors.bgAlt },
+  main: { flex: 1, overflowY: 'auto', background: colors.bgAlt, minWidth: 0 },
   topbar: {
     position: 'sticky',
     top: 0,
@@ -1752,15 +1949,31 @@ const styles = {
   },
   notificationBtn: {
     position: 'relative',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
     border: `1px solid ${colors.border}`,
     background: colors.surface,
     color: colors.text,
     borderRadius: 12,
-    padding: '10px 14px',
+    width: 42,
+    height: 42,
+    padding: 0,
     cursor: 'pointer',
-    fontWeight: 700,
-    minWidth: 74,
+    fontSize: 18,
   },
+  accountMenuWrap: { position: 'relative' },
+  accountMenuButton: { display: 'flex', alignItems: 'center', gap: 8, minWidth: 168, maxWidth: 240, padding: '4px 7px', border: `1px solid ${colors.border}`, borderRadius: 12, background: colors.surface, color: colors.text, cursor: 'pointer', textAlign: 'left' },
+  accountAvatar: { width: 32, height: 32, borderRadius: '50%', background: colors.primary, color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 12, fontWeight: 800, flexShrink: 0 },
+  accountIdentity: { display: 'flex', flexDirection: 'column', gap: 2, overflow: 'hidden', flex: 1, fontSize: 11 },
+  accountChevron: { color: colors.primary, fontSize: 13, flexShrink: 0 },
+  accountMenuDropdown: { position: 'absolute', right: 0, top: 'calc(100% + 7px)', width: 240, padding: 12, background: colors.surface, border: `1px solid ${colors.border}`, borderRadius: 12, boxShadow: '0 16px 34px rgba(16,24,40,0.16)', zIndex: 80 },
+  accountMenuHeading: { color: colors.sub, fontSize: 10, fontWeight: 700, textTransform: 'uppercase' },
+  accountMenuEmail: { color: colors.text, fontSize: 12, marginTop: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  accountMenuWorkspace: { color: colors.text, fontSize: 13, fontWeight: 700, margin: '4px 0 8px' },
+  accountMenuDivider: { height: 1, background: colors.border, margin: '10px 0' },
+  accountMenuAction: { width: '100%', padding: '9px 8px', border: 0, borderRadius: 8, background: 'transparent', color: colors.primary, fontSize: 12, textAlign: 'left', cursor: 'pointer' },
+  accountMenuSignOut: { width: '100%', padding: '9px 8px', marginTop: 3, border: 0, borderRadius: 8, background: '#FCEBEB', color: '#A32D2D', fontSize: 12, fontWeight: 700, textAlign: 'left', cursor: 'pointer' },
   notificationBadge: {
     position: 'absolute',
     top: -6,
@@ -2045,3 +2258,5 @@ const styles = {
   },
 }
 
+// Used by tools/ui-preview to show the real menu in screenshots.
+export { NAV_GROUPS, styles as APP_STYLES }

@@ -20,6 +20,8 @@ import { executeWithFallback, omitKeys } from '../utils/dbCompat'
 import { logAudit } from '../utils/audit'
 import { broadcastWorkflowChanged } from '../utils/workflowEvents'
 import { colors as themeColors, typography } from '../theme'
+import { recordLegacyPayment } from '../utils/payments/invoices'
+import { notifyError, notifyWarning } from '../notifications'
 
 const C = {
   ...themeColors,
@@ -46,7 +48,7 @@ const PAYMENT_METHODS = ['Cash', 'M-Pesa', 'EFT', 'Bank Transfer', 'Cheque', 'Wa
 const FOLLOW_UP_STATUSES = ['No Contact', 'Promised Payment', 'Dispute', 'Legal', 'Written Off']
 const RECORD_TYPES = ['Debt', 'Credit']
 const CATEGORIES = ['Consultation', 'Lab', 'Pharmacy', 'Radiology', 'Procedures', 'Accommodation', 'Deposit', 'Overpayment', 'Other']
-const CHART_COLORS = ['#5B21B6', '#EAB308', '#F97316', '#D32F2F']
+const CHART_COLORS = ['#0F6E56', '#EAB308', '#F97316', '#D32F2F']
 const LOCAL_ACCOUNT_KEY_PREFIX = 'remedacare:credit_accounts:'
 const LOCAL_PAYMENT_KEY_PREFIX = 'remedacare:credit_payments:'
 const LOCAL_FOLLOWUP_KEY_PREFIX = 'remedacare:credit_followups:'
@@ -305,7 +307,7 @@ function buildPaymentReceiptHtml({ hospitalName, payment, account, allocations, 
     </tr>`
   }).join('')
   return `
-    <h1>${hospitalName || 'Brightpath Travel Scholars'}</h1>
+    <h1>${hospitalName || 'RemedacareHMS'}</h1>
     <div class="muted">Computer-generated credit payment receipt</div>
     <div class="section">
       <table>
@@ -338,7 +340,7 @@ function buildCorporateStatementHtml({ hospitalName, account, rows, month }) {
     </tr>
   `).join('')
   return `
-    <h1>${hospitalName || 'Brightpath Travel Scholars'}</h1>
+    <h1>${hospitalName || 'RemedacareHMS'}</h1>
     <div class="muted">Corporate credit statement for ${account.account_name}</div>
     <div class="section">
       <table>
@@ -365,31 +367,16 @@ async function exportWorkbook(filename, sheets) {
   XLSX.writeFile(workbook, filename)
 }
 
+// Money received against a debt is also a payment on the bill it came from. It is written to the
+// payments ledger (receipt number, method, reference, cash-up) against THAT bill only — a debt with no
+// matching bill (e.g. an opening balance) stays in the Credit book and touches no other invoice.
 async function syncPaymentToBillingInvoice(hospitalId, record, amountPaid, paymentMethod, referenceNo) {
-  if (!record.visit_id && !record.patient_id) return
-  let query = supabase
-    .from('invoices')
-    .select('id, amount_kes, paid_kes, balance_kes, status, payment_method')
-    .eq('hospital_id', hospitalId)
-    .in('status', ['Pending', 'Partial'])
-    .order('created_at', { ascending: true })
-    .limit(1)
-  if (record.visit_id) query = query.eq('visit_id', record.visit_id)
-  else query = query.eq('patient_id', record.patient_id)
-  const { data } = await query
-  if (!data || !data.length) return
-  const invoice = data[0]
-  const newPaid = Math.min(Number(invoice.amount_kes || 0), Number(invoice.paid_kes || 0) + Number(amountPaid || 0))
-  const newBalance = Math.max(0, Number(invoice.amount_kes || 0) - newPaid)
-  const newStatus = newBalance <= 0 ? 'Paid' : newPaid > 0 ? 'Partial' : 'Pending'
-  await supabase.from('invoices').update({
-    paid_kes: newPaid,
-    balance_kes: newBalance,
-    status: newStatus,
-    payment_method: paymentMethod || invoice.payment_method,
-    mpesa_ref: paymentMethod === 'M-Pesa' ? (referenceNo || null) : undefined,
-    paid_at: newStatus === 'Paid' ? new Date().toISOString() : null,
-  }).eq('id', invoice.id)
+  if (!(Number(amountPaid) > 0)) return null
+  const result = await recordLegacyPayment({ hospitalId, record, amount: amountPaid, method: paymentMethod, reference: referenceNo })
+  if (!result.ok && !/No matching invoice/.test(result.error || '')) {
+    notifyError(`Saved in the Credit book, but the billing receipt could not be posted: ${result.error}`)
+  }
+  return result
 }
 
 function normalizeDebtRecord(record = {}) {
@@ -465,11 +452,11 @@ function groupAgingRows(records) {
   }, {})
 }
 
-function MetricCard({ title, value, hint, accent = C.primary, background = C.surface }) {
+function MetricCard({ title, value, hint }) {
   return (
-    <div style={{ ...styles.metricCard, background, borderColor: `${accent}22` }}>
+    <div style={{ ...styles.metricCard, background: C.surface, borderColor: C.border }}>
       <div style={styles.metricTitle}>{title}</div>
-      <div style={{ ...styles.metricValue, color: accent }}>{value}</div>
+      <div style={{ ...styles.metricValue, color: C.textStrong }}>{value}</div>
       {hint ? <div style={styles.metricHint}>{hint}</div> : null}
     </div>
   )
@@ -1013,11 +1000,11 @@ export default function CreditDebts() {
         : String(form.insurer_name || form.account_name || '').trim()
 
     if (!accountName && accountType !== 'Individual') {
-      window.notifyFromLegacyAlert(`Enter the ${accountType === 'Corporate' ? 'corporate' : 'insurer'} account name.`)
+      notifyWarning(`Enter the ${accountType === 'Corporate' ? 'corporate' : 'insurer'} account name.`)
       return null
     }
     if (accountType === 'Individual' && !form.patient_id) {
-      window.notifyFromLegacyAlert('Select a patient account first.')
+      notifyWarning('Select a patient account first.')
       return null
     }
 
@@ -1051,7 +1038,7 @@ export default function CreditDebts() {
 
     const { error } = await persistAccountRows(nextRows.map((row) => omitKeys(row, ['key', 'source', 'debts', 'credits', 'balance', 'totalInvoiced', 'totalPaid', 'creditBalance', 'utilisation', 'overUtilised', 'latestFollowUp', 'dueToday', 'followupStatus', 'collectedViaReceipts', 'writtenOff'])))
     if (error) {
-      window.notifyFromLegacyAlert(`Could not save credit account: ${error.message}`)
+      notifyError(`Could not save credit account: ${error.message}`)
       return null
     }
     return payload
@@ -1072,11 +1059,11 @@ export default function CreditDebts() {
 
   const handleSaveAccount = useCallback(async () => {
     if (accountForm.account_type === 'Individual' && !accountForm.patient_id) {
-      window.notifyFromLegacyAlert('Select the patient linked to this individual credit account.')
+      notifyWarning('Select the patient linked to this individual credit account.')
       return
     }
     if (accountForm.account_type !== 'Individual' && !String(accountForm.account_name || '').trim()) {
-      window.notifyFromLegacyAlert('Account name is required.')
+      notifyWarning('Account name is required.')
       return
     }
     setSaving(true)
@@ -1091,11 +1078,11 @@ export default function CreditDebts() {
   }, [accountForm, ensureAccount, loadData])
 
   const handleSaveRecord = useCallback(async () => {
-    if (!recordForm.description.trim()) return window.notifyFromLegacyAlert('Enter the credit or debt description.')
-    if (!recordForm.amount_charged) return window.notifyFromLegacyAlert('Enter the amount charged.')
-    if (recordForm.account_type === 'Individual' && !recordForm.patient_id) return window.notifyFromLegacyAlert('Select a patient account.')
+    if (!recordForm.description.trim()) return notifyWarning('Enter the credit or debt description.')
+    if (!recordForm.amount_charged) return notifyWarning('Enter the amount charged.')
+    if (recordForm.account_type === 'Individual' && !recordForm.patient_id) return notifyWarning('Select a patient account.')
     if (recordForm.account_type !== 'Individual' && !(recordForm.corporate_name || recordForm.insurer_name)) {
-      return window.notifyFromLegacyAlert(`Enter the ${recordForm.account_type === 'Corporate' ? 'corporate' : 'insurer'} account name.`)
+      return notifyWarning(`Enter the ${recordForm.account_type === 'Corporate' ? 'corporate' : 'insurer'} account name.`)
     }
 
     setSaving(true)
@@ -1114,7 +1101,7 @@ export default function CreditDebts() {
     const selectedAccount = accountSummaryMap[account.id ? `account:${account.id}` : `${account.account_type}:${normalizeText(account.account_name)}`]
     const projectedBalance = Number(selectedAccount?.balance || 0) + (editingRecord ? 0 : balance)
     if (account.credit_limit_kes > 0 && projectedBalance > account.credit_limit_kes && !isAdmin) {
-      window.notifyFromLegacyAlert(`Credit limit would be exceeded: ${formatKES(projectedBalance)} against a limit of ${formatKES(account.credit_limit_kes)}.`)
+      notifyWarning(`Credit limit would be exceeded: ${formatKES(projectedBalance)} against a limit of ${formatKES(account.credit_limit_kes)}.`)
       setSaving(false)
       return
     }
@@ -1163,7 +1150,7 @@ export default function CreditDebts() {
 
     const { data, error } = await saveDebtRecord(payload, editingRecord?.id || null)
     if (error) {
-      window.notifyFromLegacyAlert(`Error saving credit record: ${error.message}`)
+      notifyError(`Error saving credit record: ${error.message}`)
       setSaving(false)
       return
     }
@@ -1188,7 +1175,7 @@ export default function CreditDebts() {
       const paymentRows = compatMode.payments ? [...payments, paymentRow] : [...payments.filter((row) => row.id !== paymentRow.id), paymentRow]
       const paymentResult = await persistPaymentRows(paymentRows)
       if (paymentResult.error) {
-        window.notifyFromLegacyAlert(`Credit record saved, but payment receipt logging failed: ${paymentResult.error.message}`)
+        notifyError(`Credit record saved, but payment receipt logging failed: ${paymentResult.error.message}`)
       }
       await syncPaymentToBillingInvoice(hospitalId, data, amountPaid, recordForm.payment_method, recordForm.reference_no)
     }
@@ -1217,9 +1204,9 @@ export default function CreditDebts() {
   const handleRecordPayment = useCallback(async () => {
     if (!paymentTarget) return
     const amount = Number(paymentForm.amount_kes || 0)
-    if (!amount || amount <= 0) return window.notifyFromLegacyAlert('Enter the payment amount first.')
+    if (!amount || amount <= 0) return notifyWarning('Enter the payment amount first.')
     if (amount > Number(paymentTarget.balance || 0)) {
-      return window.notifyFromLegacyAlert('This payment is higher than the open balance. Record the extra amount as a separate patient credit instead.')
+      return notifyWarning('This payment is higher than the open balance. Record the extra amount as a separate patient credit instead.')
     }
 
     setSaving(true)
@@ -1260,7 +1247,7 @@ export default function CreditDebts() {
       }
       const updateResult = await supabase.from('credit_debts').update(payload).eq('id', row.id)
       if (updateResult.error) {
-        window.notifyFromLegacyAlert(`Could not update balance for ${row.description}: ${updateResult.error.message}`)
+        notifyError(`Could not update balance for ${row.description}: ${updateResult.error.message}`)
         setSaving(false)
         return
       }
@@ -1295,7 +1282,7 @@ export default function CreditDebts() {
     const nextPaymentRows = [...payments.filter((row) => row.id !== paymentRow.id), paymentRow]
     const paymentResult = await persistPaymentRows(nextPaymentRows)
     if (paymentResult.error) {
-      window.notifyFromLegacyAlert(`Payment applied, but receipt logging failed: ${paymentResult.error.message}`)
+      notifyError(`Payment applied, but receipt logging failed: ${paymentResult.error.message}`)
     }
 
     await logAudit(supabase, {
@@ -1327,7 +1314,7 @@ export default function CreditDebts() {
 
   const handleSaveFollowUp = useCallback(async () => {
     if (!followUpTarget) return
-    if (!followUpForm.contact_made_to.trim()) return window.notifyFromLegacyAlert('Enter the contact person or recipient.')
+    if (!followUpForm.contact_made_to.trim()) return notifyWarning('Enter the contact person or recipient.')
     setSaving(true)
     const row = {
       id: createUuid(),
@@ -1346,7 +1333,7 @@ export default function CreditDebts() {
     }
     const result = await persistFollowUpRows([row, ...followUps.filter((item) => item.id !== row.id)])
     if (result.error) {
-      window.notifyFromLegacyAlert(`Could not save follow-up log: ${result.error.message}`)
+      notifyError(`Could not save follow-up log: ${result.error.message}`)
       setSaving(false)
       return
     }
@@ -1366,12 +1353,12 @@ export default function CreditDebts() {
 
   const handleWriteOff = useCallback(async () => {
     if (!writeOffTarget) return
-    if (!isAdmin) return window.notifyFromLegacyAlert('Only Admin users can approve write-offs.')
+    if (!isAdmin) return notifyWarning('Only Admin users can approve write-offs.')
     const amount = Number(writeOffForm.amount_kes || 0)
-    if (!amount || amount <= 0) return window.notifyFromLegacyAlert('Enter the amount to write off.')
-    if (amount > Number(writeOffTarget.balance || 0)) return window.notifyFromLegacyAlert('Write-off amount cannot exceed the current balance.')
-    if (!writeOffForm.reason.trim()) return window.notifyFromLegacyAlert('Enter the write-off reason.')
-    if (!writeOffForm.approved_by.trim()) return window.notifyFromLegacyAlert('Enter the approving officer name.')
+    if (!amount || amount <= 0) return notifyWarning('Enter the amount to write off.')
+    if (amount > Number(writeOffTarget.balance || 0)) return notifyWarning('Write-off amount cannot exceed the current balance.')
+    if (!writeOffForm.reason.trim()) return notifyWarning('Enter the write-off reason.')
+    if (!writeOffForm.approved_by.trim()) return notifyWarning('Enter the approving officer name.')
     if (!await window.openConfirmDialog(`Write off ${formatKES(amount)} from ${writeOffTarget.patients?.full_name || writeOffTarget.account_name}?`)) return
 
     setSaving(true)
@@ -1406,7 +1393,7 @@ export default function CreditDebts() {
       async () => supabase.from('credit_debts').update(omitKeys(patch, ['writeoff_reason', 'writeoff_approved_by', 'payment_plan_json'])).eq('id', writeOffTarget.id),
     )
     if (updateResult.error) {
-      window.notifyFromLegacyAlert(`Could not apply write-off: ${updateResult.error.message}`)
+      notifyError(`Could not apply write-off: ${updateResult.error.message}`)
       setSaving(false)
       return
     }
@@ -1426,7 +1413,7 @@ export default function CreditDebts() {
     }
     const result = await persistWriteOffRows([row, ...writeOffs.filter((item) => item.id !== row.id)])
     if (result.error) {
-      window.notifyFromLegacyAlert(`Debt updated, but write-off register failed: ${result.error.message}`)
+      notifyError(`Debt updated, but write-off register failed: ${result.error.message}`)
     }
     await logAudit(supabase, {
       hospitalId,
@@ -1489,7 +1476,7 @@ export default function CreditDebts() {
   const handleSendReminder = useCallback((account) => {
     const message = `Dear ${account.account_name}, this is a reminder from ${hospitalName || 'our hospital'} that your outstanding balance is ${formatKES(account.balance)}. Please contact the accounts team to settle or confirm your payment plan.`
     if (!openWhatsAppMessage(account.contact_phone || account.guarantor_phone, message)) {
-      window.notifyFromLegacyAlert('No valid phone number is available for this WhatsApp reminder.')
+      notifyWarning('No valid phone number is available for this WhatsApp reminder.')
     }
   }, [hospitalName])
 
@@ -1505,7 +1492,7 @@ export default function CreditDebts() {
     }
     const { error } = await supabase.from('credit_debts').update(payload).eq('id', record.id)
     if (error) {
-      window.notifyFromLegacyAlert(`Could not update the record: ${error.message}`)
+      notifyError(`Could not update the record: ${error.message}`)
       setSaving(false)
       return
     }
@@ -1887,7 +1874,7 @@ export default function CreditDebts() {
                     <XAxis dataKey="month" tick={{ fontSize: 11 }} />
                     <YAxis tickFormatter={(value) => `${Math.round(Number(value || 0) / 1000)}k`} tick={{ fontSize: 11 }} />
                     <RechartsTooltip formatter={(value) => formatKES(value)} />
-                    <Line type="monotone" dataKey="invoiced" stroke="#5B21B6" strokeWidth={3} dot={false} name="Invoiced" />
+                    <Line type="monotone" dataKey="invoiced" stroke="#0F6E56" strokeWidth={3} dot={false} name="Invoiced" />
                     <Line type="monotone" dataKey="collected" stroke="#1D4ED8" strokeWidth={3} dot={false} name="Collected" />
                     <Line type="monotone" dataKey="writtenOff" stroke="#D32F2F" strokeWidth={3} dot={false} name="Written Off" />
                   </LineChart>

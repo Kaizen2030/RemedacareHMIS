@@ -30,6 +30,7 @@ vi.mock('../supabase', () => ({
       })),
     })),
   },
+  isLocalPreview: false,
 }))
 
 describe('Login password recovery', () => {

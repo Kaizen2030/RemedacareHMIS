@@ -36,3 +36,21 @@ export function searchIcd10Diagnoses(query, { signal } = {}) {
     .filter(item => item.code.toLowerCase().includes(term) || item.desc.toLowerCase().includes(term))
     .map(toDiagnosis)
 }
+/**
+ * Full search against the ICD-10 reference table (icd_search RPC, includes ICD-11 codes where mapped).
+ * Falls back to the built-in common list when offline or before the reference migration is installed.
+ * Returns [{ code, description, icd11_code }].
+ */
+export async function searchDiagnoses(query, { signal, limit = 20 } = {}) {
+  const term = String(query || '').trim()
+  if (term.length < 2 || signal?.aborted) return []
+  try {
+    const { default: supabase } = await import('../supabase')
+    const { data, error } = await supabase.rpc('icd_search', { p_query: term, p_limit: limit })
+    if (signal?.aborted) return []
+    if (!error && Array.isArray(data) && data.length) {
+      return data.map(row => ({ code: row.code, description: row.title, icd11_code: row.icd11_code || null }))
+    }
+  } catch (_) { /* offline or not installed */ }
+  return searchIcd10Diagnoses(term, { signal })
+}

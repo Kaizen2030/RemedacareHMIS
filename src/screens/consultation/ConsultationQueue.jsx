@@ -1,6 +1,6 @@
 import { useMemo } from 'react'
 
-const AVATAR_COLORS = ['#E1F5EE', '#E3F0FB', '#F0EAFC', '#FFF3DC', '#FCEBEB', '#EAF3DE']
+const AVATAR_COLORS = ['#E1F5EE', '#E3F0FB', '#EAF5EF', '#FFF3DC', '#FCEBEB', '#EAF3DE']
 
 export default function ConsultationQueue({
   visits = [],

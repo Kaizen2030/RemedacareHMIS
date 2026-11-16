@@ -4,6 +4,7 @@ import { useHospital } from '../context';
 import { matchesDrugSearch } from '../utils/pharmacy';
 import { broadcastWorkflowChanged } from '../utils/workflowEvents';
 import { colors as C, typography } from '../theme';
+import { notifyError, notifyWarning } from '../notifications'
 
 const css = {
  page: { minHeight:'100vh', background:C.bg, fontFamily:typography.fontFamily, fontSize:'13px', color:C.text },
@@ -31,7 +32,7 @@ const css = {
  td: { padding:'10px 14px', borderBottom:`1px solid ${C.border}`, fontSize:'13px', verticalAlign:'middle' },
  badge: { display:'inline-block', padding:'2px 8px', borderRadius:'20px', fontSize:'11px', fontWeight:600 },
  overlay: { position:'fixed', inset:0, background:'rgba(0,0,0,.4)', zIndex:999, display:'flex', alignItems:'center', justifyContent:'center' },
- modal: { background:C.surface, borderRadius:'12px', padding:'24px', width:'520px', maxWidth:'95vw', boxShadow:'0 20px 60px rgba(0,0,0,.2)', maxHeight:'90vh', overflowY:'auto' },
+ modal: { background:C.surface, borderRadius:'12px', padding:'24px', width:'760px', maxWidth:'95vw', boxShadow:'0 20px 60px rgba(0,0,0,.2)', maxHeight:'90vh', overflowY:'auto' },
  modalH: { fontSize:'15px', fontWeight:700, marginBottom:'16px' },
  lbl: { fontSize:'11px', fontWeight:600, color:C.sub, textTransform:'uppercase', letterSpacing:'.4px', marginBottom:'4px', display:'block' },
  input: { width:'100%', boxSizing:'border-box', padding:'8px 10px', border:`1px solid ${C.border}`, borderRadius:'7px', fontSize:'13px', color:C.text, outline:'none', background:C.surface, marginBottom:'10px' },
@@ -43,6 +44,7 @@ const CATEGORIES = ['All Categories','General','Analgesic','Antibiotic','Antibio
 const DOSAGE_FORMS = ['Tablet','Capsule','Syrup','Injection','IV Infusion','Cream','Drops','Inhaler','Suppository','Patch'];
 const SUPPLIERS = ['MedSupply Ltd.','PharmaCare','HealthPlus Distributors','Global Pharma','Sterling Labs','Prime Meds'];
 const LOCATIONS = ['Shelf A1','Shelf A2','Shelf B1','Shelf B2','Shelf C1','Shelf C2','Fridge 1','Fridge 2','Store 1','Store 2'];
+const INVENTORY_PAGE_SIZE = 50;
 const PHARMACY_DRUG_TEMPLATES = [
  { drug_name:'Amoxicillin 500mg', generic_name:'Amoxicillin', category:'Antibiotic', dosage_form:'Capsule', strength:'500mg' },
  { drug_name:'Augmentin 1g', generic_name:'Amoxicillin/Clavulanate', category:'Antibiotic', dosage_form:'Tablet', strength:'1g' },
@@ -171,14 +173,42 @@ function Badge({ color, label }) {
 
 function getStatus(item) {
  const qty = item.quantity_in_stock ?? 0;
- const reorder = item.reorder_level ?? 10;
+ const reorder = item.minimum_stock_level ?? item.reorder_level ?? 10;
  if (qty === 0) return { label:'Out of Stock', color:'red' };
  if (qty <= reorder) return { label:'Low Stock', color:'yellow' };
  return { label:'In Stock', color:'green' };
 }
 
+function getPackSize(item) {
+ return Math.max(parseInt(item?.pack_size, 10) || 1, 1);
+}
+
+function getStockWholes(item) {
+ if (item?.stock_wholes != null) return Math.max(Number(item.stock_wholes) || 0, 0);
+ return Math.floor(Math.max(Number(item?.quantity_in_stock) || 0, 0) / getPackSize(item));
+}
+
+function getStockPieces(item) {
+ if (item?.stock_pieces != null) return Math.max(Number(item.stock_pieces) || 0, 0);
+ return Math.max(Number(item?.quantity_in_stock) || 0, 0) % getPackSize(item);
+}
+
+function formatCurrency(value) {
+ return `KES ${Number(value || 0).toLocaleString('en-KE', { maximumFractionDigits: 2 })}`;
+}
+
+function getSuggestedOrder(item) {
+ const qty = Number(item.quantity_in_stock || 0);
+ const dailyUsage = Number(item.average_daily_usage || 0);
+ const leadDays = Number(item.reorder_lead_days || 0);
+ const safetyStock = Number(item.safety_stock || 0);
+ const target = Number(item.maximum_stock_level || 0) || Math.max(Number(item.minimum_stock_level || item.reorder_level || 0) * 3, safetyStock + dailyUsage * leadDays);
+ return Math.max(0, Math.ceil(target - qty));
+}
+
 function DrugModal({ drug, onClose, onSave }) {
  const editing = !!drug?.id;
+ const existingPackSize = Math.max(parseInt(drug?.pack_size, 10) || 1, 1);
  const [form, setForm] = useState({
  drug_name: drug?.drug_name || '',
  generic_name: drug?.generic_name || '',
@@ -187,19 +217,84 @@ function DrugModal({ drug, onClose, onSave }) {
  strength: drug?.strength || '',
  unit_cost: drug?.unit_cost || '',
  selling_price: drug?.selling_price || '',
- quantity_in_stock: drug?.quantity_in_stock|| '',
+ stock_wholes: drug ? (drug.stock_wholes ?? Math.floor(Number(drug.quantity_in_stock || 0) / existingPackSize)) : '',
+ stock_pieces: drug ? (drug.stock_pieces ?? (Number(drug.quantity_in_stock || 0) % existingPackSize)) : '',
+ pack_size: drug?.pack_size || 1,
+ price_kes: drug?.price_kes ?? (Number(drug?.selling_price || 0) * existingPackSize) ?? '',
+ piece_price_kes: drug?.piece_price_kes ?? drug?.selling_price ?? '',
+ cost_price_kes: drug?.cost_price_kes ?? (Number(drug?.unit_cost || 0) * existingPackSize) ?? '',
+ image_url: drug?.image_url || '',
+ image_source: drug?.image_source || '',
  reorder_level: drug?.reorder_level || 10,
+ minimum_stock_level: drug?.minimum_stock_level ?? drug?.reorder_level ?? 10,
+ maximum_stock_level: drug?.maximum_stock_level || '',
+ reorder_lead_days: drug?.reorder_lead_days ?? 7,
+ average_daily_usage: drug?.average_daily_usage ?? 0,
+ safety_stock: drug?.safety_stock ?? 0,
+ item_code: drug?.item_code || '',
+ barcode: drug?.barcode || '',
+ controlled_drug: Boolean(drug?.controlled_drug),
+ requires_cold_chain: Boolean(drug?.requires_cold_chain),
  supplier: drug?.supplier || '',
  location: drug?.location || '',
  });
+ const [imageUploading, setImageUploading] = useState(false);
+ const [imageSuggestions, setImageSuggestions] = useState([]);
  const set = k => e => setForm(f => ({...f, [k]: e.target.value}));
+
+ useEffect(() => {
+ const query = String(form.generic_name || form.drug_name || '').trim();
+ if (query.length < 2) {
+ setImageSuggestions([]);
+ return undefined;
+ }
+ let active = true;
+ const timer = window.setTimeout(async () => {
+ const { data } = await supabase.from('drug_image_library').select('id,generic_name,brand_hint,image_url').ilike('generic_name', `%${query}%`).limit(8);
+ if (active) setImageSuggestions(data || []);
+ }, 250);
+ return () => {
+ active = false;
+ window.clearTimeout(timer);
+ };
+ }, [form.generic_name, form.drug_name]);
+
+ const uploadImage = async event => {
+ const file = event.target.files?.[0];
+ if (!file) return;
+ setImageUploading(true);
+ try {
+ const image = await createImageBitmap(file);
+ const scale = Math.min(1, 240 / Math.max(image.width, image.height));
+ const canvas = document.createElement('canvas');
+ canvas.width = Math.max(1, Math.round(image.width * scale));
+ canvas.height = Math.max(1, Math.round(image.height * scale));
+ canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+ const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/webp', 0.8));
+ if (!blob) throw new Error('Unable to process this image.');
+ const fileName = `hmis-${globalThis.crypto?.randomUUID?.() || Date.now()}.webp`;
+ const { error } = await supabase.storage.from('drug-images').upload(fileName, blob, { contentType: 'image/webp', upsert: false, cacheControl: '31536000' });
+ if (error) throw error;
+ const { data } = supabase.storage.from('drug-images').getPublicUrl(fileName);
+ setForm(current => ({ ...current, image_url: data.publicUrl, image_source: 'uploaded' }));
+ } catch (error) {
+ notifyError(`Image upload failed: ${error.message || 'Unable to upload image.'}`);
+ } finally {
+ setImageUploading(false);
+ event.target.value = '';
+ }
+ };
+
+ const packMargin = Number(form.price_kes || 0) - Number(form.cost_price_kes || 0);
+ const pieceCost = Number(form.cost_price_kes || 0) / Math.max(Number(form.pack_size) || 1, 1);
+ const pieceMargin = Number(form.piece_price_kes || 0) - pieceCost;
 
  return (
  <div style={css.overlay}>
  <div style={css.modal}>
  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'16px'}}>
  <div style={css.modalH}>{editing ? ' Edit Drug' : ' Add New Drug'}</div>
- <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={onClose}></button>
+ <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={onClose} aria-label="Close" title="Close">✕</button>
  </div>
 
  <label style={css.lbl}>Drug Name *</label>
@@ -207,6 +302,11 @@ function DrugModal({ drug, onClose, onSave }) {
 
  <label style={css.lbl}>Generic Name</label>
  <input style={css.input} placeholder="e.g. Amoxicillin" value={form.generic_name} onChange={set('generic_name')} />
+
+ <div style={css.row2}>
+ <div><label style={css.lbl}>Item Code</label><input style={css.input} placeholder="Hospital formulary code" value={form.item_code} onChange={set('item_code')} /></div>
+ <div><label style={css.lbl}>Barcode</label><input style={css.input} placeholder="Scan or enter barcode" value={form.barcode} onChange={set('barcode')} /></div>
+ </div>
 
  <div style={css.row2}>
  <div>
@@ -225,6 +325,20 @@ function DrugModal({ drug, onClose, onSave }) {
  </div>
  </div>
 
+ <div style={css.row3}>
+ <div><label style={css.lbl}>Minimum Stock</label><input style={css.input} type="number" min="0" value={form.minimum_stock_level} onChange={set('minimum_stock_level')} /></div>
+ <div><label style={css.lbl}>Maximum Stock</label><input style={css.input} type="number" min="0" value={form.maximum_stock_level} onChange={set('maximum_stock_level')} /></div>
+ <div><label style={css.lbl}>Lead Time (days)</label><input style={css.input} type="number" min="0" value={form.reorder_lead_days} onChange={set('reorder_lead_days')} /></div>
+ </div>
+ <div style={css.row2}>
+ <div><label style={css.lbl}>Average Daily Use</label><input style={css.input} type="number" min="0" step="0.001" value={form.average_daily_usage} onChange={set('average_daily_usage')} /></div>
+ <div><label style={css.lbl}>Safety Stock</label><input style={css.input} type="number" min="0" step="0.001" value={form.safety_stock} onChange={set('safety_stock')} /></div>
+ </div>
+ <div style={{display:'flex',gap:'18px',marginBottom:'12px',fontSize:'12px',color:C.text}}>
+ <label><input type="checkbox" checked={form.controlled_drug} onChange={e=>setForm(f=>({...f,controlled_drug:e.target.checked}))} /> Controlled medicine</label>
+ <label><input type="checkbox" checked={form.requires_cold_chain} onChange={e=>setForm(f=>({...f,requires_cold_chain:e.target.checked}))} /> Cold chain</label>
+ </div>
+
  <div style={css.row2}>
  <div>
  <label style={css.lbl}>Strength</label>
@@ -237,10 +351,12 @@ function DrugModal({ drug, onClose, onSave }) {
  </div>
 
  <div style={css.row3}>
- <div>
- <label style={css.lbl}>Qty in Stock *</label>
- <input style={css.input} type="number" placeholder="0" value={form.quantity_in_stock} onChange={set('quantity_in_stock')} />
+ <div><label style={css.lbl}>Whole Packs in Stock *</label><input style={css.input} type="number" min="0" step="1" placeholder="0" value={form.stock_wholes} onChange={set('stock_wholes')} /></div>
+ <div><label style={css.lbl}>Loose Pieces in Stock</label><input style={css.input} type="number" min="0" step="0.001" placeholder="0" value={form.stock_pieces} onChange={set('stock_pieces')} /></div>
+ <div><label style={css.lbl}>Pieces per Pack</label><input style={css.input} type="number" min="1" step="1" value={form.pack_size} onChange={set('pack_size')} /></div>
  </div>
+
+ <div style={css.row3}>
  <div>
  <label style={css.lbl}>Reorder Level</label>
  <input style={css.input} type="number" placeholder="10" value={form.reorder_level} onChange={set('reorder_level')} />
@@ -251,22 +367,24 @@ function DrugModal({ drug, onClose, onSave }) {
  </div>
  </div>
 
- <div style={css.row2}>
- <div>
- <label style={css.lbl}>Unit Cost (KES) *</label>
- <input style={css.input} type="number" placeholder="0" value={form.unit_cost} onChange={set('unit_cost')} />
- </div>
- <div>
- <label style={css.lbl}>Selling Price (KES) *</label>
- <input style={css.input} type="number" placeholder="0" value={form.selling_price} onChange={set('selling_price')} />
- </div>
+ <div style={css.row3}>
+ <div><label style={css.lbl}>Whole-Pack Selling Price (KES) *</label><input style={css.input} type="number" min="0" step="0.01" value={form.price_kes} onChange={set('price_kes')} /></div>
+ <div><label style={css.lbl}>Piece Selling Price (KES) *</label><input style={css.input} type="number" min="0" step="0.01" value={form.piece_price_kes} onChange={set('piece_price_kes')} /></div>
+ <div><label style={css.lbl}>Whole-Pack Cost (KES)</label><input style={css.input} type="number" min="0" step="0.01" value={form.cost_price_kes} onChange={set('cost_price_kes')} /></div>
  </div>
 
- {form.unit_cost && form.selling_price && (
- <div style={{background:C.primaryL,borderRadius:'7px',padding:'8px 12px',fontSize:'12px',color:C.primary,marginBottom:'12px',fontWeight:600}}>
- 💰 Margin: KES {(Number(form.selling_price)-Number(form.unit_cost)).toLocaleString()} ({form.unit_cost>0?((((form.selling_price-form.unit_cost)/form.unit_cost)*100).toFixed(1)):'0'}%)
+ <div style={{background:C.primaryL,borderRadius:'7px',padding:'9px 12px',fontSize:'12px',color:C.primary,marginBottom:'12px',fontWeight:600}}>
+ Whole-pack margin: {formatCurrency(packMargin)} ({Number(form.price_kes) > 0 ? `${((packMargin / Number(form.price_kes)) * 100).toFixed(1)}%` : '0%'})
+ {' · '}Piece margin: {formatCurrency(pieceMargin)} ({Number(form.piece_price_kes) > 0 ? `${((pieceMargin / Number(form.piece_price_kes)) * 100).toFixed(1)}%` : '0%'})
  </div>
- )}
+
+ <label style={css.lbl}>Drug Pack Photo</label>
+ <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:12}}>
+ {form.image_url ? <img src={form.image_url} alt={`${form.drug_name || 'Drug'} pack`} style={{width:64,height:64,objectFit:'contain',border:`1px solid ${C.border}`,borderRadius:7,background:'#fff'}} /> : <div style={{width:64,height:64,display:'grid',placeItems:'center',border:`1px dashed ${C.border}`,borderRadius:7,color:C.muted,fontSize:11}}>No photo</div>}
+ <label style={{...css.btn,...css.btnGhost,display:'inline-flex',alignItems:'center',cursor:'pointer'}}>{imageUploading ? 'Uploading...' : 'Upload photo'}<input type="file" accept="image/*" onChange={uploadImage} disabled={imageUploading} style={{display:'none'}} /></label>
+ {form.image_url && <button type="button" style={{...css.btn,...css.btnGhost}} onClick={() => setForm(current => ({...current,image_url:'',image_source:''}))}>Remove photo</button>}
+ </div>
+ {imageSuggestions.length > 0 && <div style={{display:'flex',alignItems:'center',gap:8,flexWrap:'wrap',marginBottom:12}}><span style={{fontSize:11,color:C.sub}}>Library matches:</span>{imageSuggestions.map(image => <button type="button" key={image.id} title={`${image.generic_name}${image.brand_hint ? ` · ${image.brand_hint}` : ''}`} onClick={() => setForm(current => ({...current,image_url:image.image_url,image_source:'library'}))} style={{padding:3,border:`1px solid ${C.border}`,borderRadius:6,background:'#fff',cursor:'pointer'}}><img src={image.image_url} alt={image.generic_name} style={{width:40,height:40,objectFit:'contain'}} /></button>)}</div>}
 
  <div style={{display:'flex',gap:'8px',marginTop:'4px'}}>
  <button style={{...css.btn,...css.btnGhost,flex:1,padding:'10px'}} onClick={onClose}>Cancel</button>
@@ -283,7 +401,10 @@ export default function DrugInventory() {
  const { hospitalId, userRole } = useHospital();
  const isAdmin = ['Admin','admin'].includes(userRole || '')
  const [inventory, setInventory] = useState([]);
+ const [inventoryTotal, setInventoryTotal] = useState(0);
+ const [inventoryPage, setInventoryPage] = useState(1);
  const [recentSales, setRecentSales] = useState([]);
+ const [recentMovements, setRecentMovements] = useState([]);
  const [search, setSearch] = useState('');
  const [category, setCategory] = useState('All Categories');
  const [statusFilter, setStatusFilter] = useState('all');
@@ -296,6 +417,7 @@ export default function DrugInventory() {
  if (!hospitalId) return;
  loadInventory();
  loadRecentSales();
+ loadRecentMovements();
  }, [hospitalId]);
 
  useEffect(() => {
@@ -303,6 +425,7 @@ export default function DrugInventory() {
   if (!hospitalId) return;
   loadInventory();
   loadRecentSales();
+  loadRecentMovements();
  }
  window.addEventListener('remedacare:workflow_changed', refresh)
  window.addEventListener('remedacare:prescriptions_changed', refresh)
@@ -313,7 +436,9 @@ export default function DrugInventory() {
  }, [hospitalId]);
 
  const loadInventory = async () => {
- const { data, error } = await supabase
+ if (!hospitalId) return;
+ const from = (inventoryPage - 1) * INVENTORY_PAGE_SIZE;
+ let query = supabase
  .from('pharmacy_inventory')
  .select('*')
  .eq('hospital_id', hospitalId) // ✅ scoped to this hospital only
@@ -331,6 +456,17 @@ export default function DrugInventory() {
  .order('sold_at', { ascending: false })
  .limit(36);
  if (!error) setRecentSales(data || []);
+ };
+
+ const loadRecentMovements = async () => {
+ if (!hospitalId) return;
+ const { data, error } = await supabase
+ .from('pharmacy_stock_movements')
+ .select('id,inventory_id,movement_type,quantity_delta,quantity_before,quantity_after,reason,performed_by,created_at')
+ .eq('hospital_id', hospitalId)
+ .order('created_at', { ascending: false })
+ .limit(12);
+ if (!error) setRecentMovements(data || []);
  };
 
  const seedPharmacyInventory = async () => {
@@ -353,6 +489,12 @@ export default function DrugInventory() {
  unit_cost,
  selling_price,
  quantity_in_stock,
+ stock_wholes: quantity_in_stock,
+ stock_pieces: 0,
+ pack_size: 1,
+ price_kes: selling_price,
+ piece_price_kes: selling_price,
+ cost_price_kes: unit_cost,
  reorder_level,
  supplier: SUPPLIERS[index % SUPPLIERS.length],
  location: LOCATIONS[index % LOCATIONS.length],
@@ -360,14 +502,14 @@ export default function DrugInventory() {
  };
  });
  if (payload.length === 0) {
- window.notifyFromLegacyAlert('Sample pharmacy inventory has already been added.');
+ notifyWarning('Sample pharmacy inventory has already been added.');
  return;
  }
  setSeeding(true);
  const { error } = await supabase.from('pharmacy_inventory').insert(payload);
  setSeeding(false);
  if (error) {
- window.notifyFromLegacyAlert('Error seeding pharmacy inventory: ' + error.message);
+ notifyError('Error seeding pharmacy inventory: ' + error.message);
  return;
  }
  loadInventory();
@@ -375,9 +517,11 @@ export default function DrugInventory() {
  };
 
  // ── Derived stats ──
- const lowStock = inventory.filter(i => (i.quantity_in_stock??0) <= (i.reorder_level??10) && (i.quantity_in_stock??0) > 0);
+ const lowStock = inventory.filter(i => (i.quantity_in_stock??0) <= (i.minimum_stock_level ?? i.reorder_level ?? 10) && (i.quantity_in_stock??0) > 0);
  const outOfStock = inventory.filter(i => (i.quantity_in_stock??0) === 0);
- const expiringSoon = []; // hook up batch table later
+ const controlledItems = inventory.filter(i => i.controlled_drug);
+ const coldChainItems = inventory.filter(i => i.requires_cold_chain);
+ const reorderValue = inventory.reduce((sum, item) => sum + getSuggestedOrder(item) * Number(item.unit_cost || 0), 0);
 
  // ── Filtered list ──
  const filtered = inventory.filter(item => {
@@ -388,7 +532,10 @@ export default function DrugInventory() {
   || item.location?.toLowerCase().includes(q.toLowerCase());
  const matchCat = category === 'All Categories' || item.category === category;
  const status = getStatus(item);
- const matchStatus = statusFilter === 'all' || status.label.toLowerCase().replace(' ','_') === statusFilter;
+ const matchStatus = statusFilter === 'all'
+  || status.label.toLowerCase().replace(' ','_') === statusFilter
+  || (statusFilter === 'controlled' && item.controlled_drug)
+  || (statusFilter === 'cold_chain' && item.requires_cold_chain);
  return matchSearch && matchCat && matchStatus;
  });
 
@@ -416,8 +563,18 @@ export default function DrugInventory() {
 
  // ── Save drug (add or edit) ──
  const handleSave = async (form, id) => {
- if (!form.drug_name || !form.quantity_in_stock || !form.selling_price)
- return window.notifyFromLegacyAlert('Fill in: Drug Name, Quantity, Selling Price');
+ if (!form.drug_name.trim()) return notifyWarning('Enter the drug name.');
+
+ const packSize = Math.max(parseInt(form.pack_size, 10) || 1, 1);
+ const stockWholes = Math.max(parseInt(form.stock_wholes, 10) || 0, 0);
+ const stockPieces = Math.max(Number(form.stock_pieces) || 0, 0);
+ const normalizedWholes = stockWholes + Math.floor(stockPieces / packSize);
+ const normalizedPieces = Number((stockPieces % packSize).toFixed(3));
+ const wholePrice = Number(form.price_kes);
+ const piecePrice = Number(form.piece_price_kes);
+ const wholeCost = Number(form.cost_price_kes) || 0;
+ if (!Number.isFinite(wholePrice) || wholePrice <= 0 || !Number.isFinite(piecePrice) || piecePrice <= 0)
+ return notifyWarning('Enter both a whole-pack price and a piece price greater than zero.');
 
  setLoading(true);
  const payload = {
@@ -427,10 +584,28 @@ export default function DrugInventory() {
  category: form.category || null,
  dosage_form: form.dosage_form || null,
  strength: form.strength || null,
- unit_cost: Number(form.unit_cost) || 0,
- selling_price: Number(form.selling_price),
- quantity_in_stock: Number(form.quantity_in_stock),
+ unit_cost: wholeCost / packSize,
+ selling_price: piecePrice,
+ quantity_in_stock: (normalizedWholes * packSize) + normalizedPieces,
+ stock_wholes: normalizedWholes,
+ stock_pieces: normalizedPieces,
+ pack_size: packSize,
+ price_kes: wholePrice,
+ piece_price_kes: piecePrice,
+ cost_price_kes: wholeCost || null,
+ image_url: form.image_url || null,
+ image_source: form.image_url ? (form.image_source || 'uploaded') : null,
  reorder_level: Number(form.reorder_level) || 10,
+ minimum_stock_level: Number(form.minimum_stock_level) || Number(form.reorder_level) || 10,
+ maximum_stock_level: Number(form.maximum_stock_level) || null,
+ reorder_lead_days: Number(form.reorder_lead_days) || 0,
+ average_daily_usage: Number(form.average_daily_usage) || 0,
+ safety_stock: Number(form.safety_stock) || 0,
+ item_code: form.item_code.trim() || null,
+ barcode: form.barcode.trim() || null,
+ controlled_drug: Boolean(form.controlled_drug),
+ requires_cold_chain: Boolean(form.requires_cold_chain),
+ active: true,
  supplier: form.supplier || null,
  location: form.location || null,
  is_active: true,
@@ -440,7 +615,7 @@ export default function DrugInventory() {
  ? await supabase.from('pharmacy_inventory').update(payload).eq('id', id).eq('hospital_id', hospitalId)
  : await supabase.from('pharmacy_inventory').insert(payload);
 
- if (error) { window.notifyFromLegacyAlert('Error: ' + error.message); }
+ if (error) { notifyError('Error: ' + error.message); }
  else {
  setShowModal(false);
  setEditDrug(null);
@@ -453,7 +628,7 @@ export default function DrugInventory() {
  // ── Deactivate (soft delete) ──
  const handleDeactivate = async (id) => {
  if (!isAdmin) {
- window.notifyFromLegacyAlert('Only Admin users can remove drugs from inventory.')
+ notifyWarning('Only Admin users can remove drugs from inventory.')
  return
  }
  if (!await window.openConfirmDialog('Remove this drug from inventory?')) return;
@@ -467,11 +642,14 @@ export default function DrugInventory() {
 
  // ── Export CSV ──
  const exportCSV = () => {
- const headers = ['Drug Name','Generic','Category','Form','Strength','Qty','Reorder Level','Unit Cost','Selling Price','Supplier','Location','Status'];
+ const headers = ['Drug Name','Generic','Category','Form','Strength','Whole Packs','Loose Pieces','Pack Size','Total Pieces','Whole-Pack Price','Piece Price','Whole-Pack Cost','Gross Margin','Reorder Level','Supplier','Location','Status','Photo'];
  const rows = inventory.map(i => [
  i.drug_name, i.generic_name||'', i.category||'', i.dosage_form||'', i.strength||'',
- i.quantity_in_stock, i.reorder_level||10, i.unit_cost||0, i.selling_price,
- i.supplier||'', i.location||'', getStatus(i).label
+ getStockWholes(i), getStockPieces(i), getPackSize(i), i.quantity_in_stock,
+ i.price_kes ?? Number(i.selling_price || 0) * getPackSize(i), i.piece_price_kes ?? i.selling_price,
+ i.cost_price_kes ?? Number(i.unit_cost || 0) * getPackSize(i),
+ i.cost_price_kes != null ? `${(((Number(i.price_kes || 0) - Number(i.cost_price_kes || 0)) / Math.max(Number(i.price_kes || 0), 1)) * 100).toFixed(1)}%` : '',
+ i.reorder_level||10, i.supplier||'', i.location||'', getStatus(i).label, i.image_url||''
  ]);
  const csv = [headers, ...rows].map(r => r.join(',')).join('\n');
  const a = document.createElement('a');
@@ -505,7 +683,7 @@ export default function DrugInventory() {
  { lbl:'Total Drugs', val:inventory.length, sub:'in formulary', color:C.text },
  { lbl:'Low Stock', val:lowStock.length, sub:'need reorder', color:C.warn },
  { lbl:'Out of Stock', val:outOfStock.length, sub:'unavailable', color:C.danger },
- { lbl:'Categories', val:[...new Set(inventory.map(i=>i.category).filter(Boolean))].length, sub:'drug classes', color:C.purple },
+ { lbl:'Reorder Value', val:`KES ${Math.round(reorderValue).toLocaleString()}`, sub:'suggested replenishment', color:C.purple },
  ].map(({lbl,val,sub,color})=>(
  <div key={lbl} style={css.stat}>
  <div style={css.statLbl}>{lbl}</div>
@@ -529,6 +707,8 @@ export default function DrugInventory() {
  <option value="in_stock">In Stock</option>
  <option value="low_stock">Low Stock</option>
  <option value="out_of_stock">Out of Stock</option>
+ <option value="controlled">Controlled Medicines</option>
+ <option value="cold_chain">Cold Chain</option>
  </select>
  </div>
 
@@ -538,14 +718,14 @@ export default function DrugInventory() {
  <table style={css.table}>
  <thead>
  <tr>
- {['Drug Name','Category','Form','Qty','Reorder Lvl','Unit Cost','Selling Price','Supplier','Location','Status',''].map(h=>(
+ {['Photo','Drug Name','Category','Safety','Stock','Pack','W Price','P Price','Margin','Suggested Order','Supplier','Location','Status',''].map(h=>(
  <th key={h} style={css.th}>{h}</th>
  ))}
  </tr>
  </thead>
  <tbody>
  {filtered.length===0 && (
- <tr><td colSpan={11} style={{...css.td,textAlign:'center',color:C.muted,padding:'40px'}}>No drugs found</td></tr>
+ <tr><td colSpan={14} style={{...css.td,textAlign:'center',color:C.muted,padding:'40px'}}>No drugs found</td></tr>
  )}
  {filtered.map(item => {
  const status = getStatus(item);
@@ -554,21 +734,34 @@ export default function DrugInventory() {
  onMouseEnter={e=>e.currentTarget.style.background='#FAFBFD'}
  onMouseLeave={e=>e.currentTarget.style.background=''}
  >
+ <td style={css.td}>{item.image_url ? <img src={item.image_url} alt={`${item.drug_name} pack`} style={{width:40,height:40,objectFit:'contain',borderRadius:5,background:'#fff'}} /> : <div style={{width:40,height:40,display:'grid',placeItems:'center',border:`1px dashed ${C.border}`,borderRadius:5,color:C.muted,fontSize:9}}>No photo</div>}</td>
  <td style={css.td}>
  <div style={{fontWeight:600,fontSize:'13px'}}>{item.drug_name}</div>
  {item.generic_name && <div style={{fontSize:'11px',color:C.muted}}>{item.generic_name}</div>}
  {item.strength && <div style={{fontSize:'11px',color:C.sub}}>{item.strength}</div>}
  </td>
  <td style={css.td}>{item.category ? <Badge color="blue" label={item.category}/> : '—'}</td>
- <td style={css.td}>{item.dosage_form ? <Badge color="gray" label={item.dosage_form}/> : '—'}</td>
  <td style={css.td}>
- <span style={{fontWeight:700,color: (item.quantity_in_stock??0)===0 ? C.danger : (item.quantity_in_stock??0)<=(item.reorder_level??10) ? C.warn : C.text}}>
- {item.quantity_in_stock ?? 0}
- </span>
+ {item.dosage_form ? <Badge color="gray" label={item.dosage_form}/> : '—'}
+ <div style={{display:'flex',gap:'4px',marginTop:'5px',flexWrap:'wrap'}}>
+ {item.controlled_drug && <Badge color="red" label="Controlled"/>}
+ {item.requires_cold_chain && <Badge color="blue" label="Cold chain"/>}
+ </div>
  </td>
- <td style={{...css.td,color:C.sub}}>{item.reorder_level ?? 10}</td>
- <td style={css.td}>{item.unit_cost ? `KES ${Number(item.unit_cost).toLocaleString()}` : '—'}</td>
- <td style={{...css.td,fontWeight:600,color:C.success}}>KES {Number(item.selling_price||0).toLocaleString()}</td>
+ <td style={css.td}>
+ <span style={{fontWeight:700,color: (item.quantity_in_stock??0)===0 ? C.danger : (item.quantity_in_stock??0)<=(item.reorder_level??10) ? C.warn : C.text}}>{getStockWholes(item)}W {getStockPieces(item)}P</span>
+ <div style={{fontSize:'11px',color:C.sub}}>{Number(item.quantity_in_stock ?? 0)} pieces total</div>
+ </td>
+ <td style={css.td}>{getPackSize(item)} pcs</td>
+ <td style={css.td}>{formatCurrency(item.price_kes ?? Number(item.selling_price || 0) * getPackSize(item))}</td>
+ <td style={css.td}>{formatCurrency(item.piece_price_kes ?? item.selling_price)}</td>
+ <td style={css.td}>
+ {item.cost_price_kes != null ? <><strong>{formatCurrency(Number(item.price_kes || 0) - Number(item.cost_price_kes || 0))}</strong><div style={{fontSize:11,color:C.sub}}>{Number(item.price_kes || 0) > 0 ? `${(((Number(item.price_kes || 0) - Number(item.cost_price_kes || 0)) / Number(item.price_kes || 0)) * 100).toFixed(1)}% gross margin` : '—'}</div></> : '—'}
+ </td>
+ <td style={{...css.td,color:C.sub}}>
+ <div>Min {item.minimum_stock_level ?? item.reorder_level ?? 10}</div>
+ <div style={{fontSize:'11px',marginTop:'4px',color:getSuggestedOrder(item)>0?C.warn:C.success}}>Order {getSuggestedOrder(item)}</div>
+ </td>
  <td style={{...css.td,fontSize:'12px',color:C.sub}}>{item.supplier||'—'}</td>
  <td style={{...css.td,fontSize:'12px',color:C.sub}}>{item.location||'—'}</td>
  <td style={css.td}><Badge color={status.color} label={status.label}/></td>
@@ -582,6 +775,34 @@ export default function DrugInventory() {
  </td>
  </tr>
  );
+ })}
+ </tbody>
+ </table>
+ </div>
+ </div>
+
+ <div style={{...css.card, marginTop:'16px'}}>
+ <div style={{padding:'12px 16px', borderBottom:`1px solid ${C.border}`, background:'#FAFBFD', fontSize:'13px', fontWeight:700}}>
+ Recent Stock Movements
+ </div>
+ <div style={{overflowX:'auto'}}>
+ <table style={css.table}>
+ <thead><tr>{['Medicine','Movement','Change','Before','After','Reason','By','Time'].map(h => <th key={h} style={css.th}>{h}</th>)}</tr></thead>
+ <tbody>
+ {recentMovements.length === 0 && <tr><td colSpan={8} style={{...css.td,textAlign:'center',color:C.muted,padding:'26px'}}>Apply the pharmacy inventory upgrade migration to start recording stock movements.</td></tr>}
+ {recentMovements.map(movement => {
+ const drug = inventory.find(item => String(item.id) === String(movement.inventory_id));
+ const incoming = Number(movement.quantity_delta || 0) > 0;
+ return <tr key={movement.id}>
+ <td style={css.td}><strong>{drug?.drug_name || 'Medicine'}</strong></td>
+ <td style={css.td}><Badge color={incoming ? 'green' : 'yellow'} label={movement.movement_type}/></td>
+ <td style={{...css.td,fontWeight:700,color:incoming ? C.success : C.danger}}>{incoming ? '+' : ''}{Number(movement.quantity_delta || 0)}</td>
+ <td style={css.td}>{movement.quantity_before ?? '—'}</td>
+ <td style={css.td}>{movement.quantity_after ?? '—'}</td>
+ <td style={{...css.td,color:C.sub}}>{movement.reason || '—'}</td>
+ <td style={{...css.td,color:C.sub}}>{movement.performed_by || 'System'}</td>
+ <td style={{...css.td,color:C.sub,whiteSpace:'nowrap'}}>{movement.created_at ? new Date(movement.created_at).toLocaleString('en-KE') : '—'}</td>
+ </tr>
  })}
  </tbody>
  </table>

@@ -48,8 +48,9 @@ export default function PharmacyStockPanel({
           Each patient card keeps pending, approved, rejected, and released lines together so pharmacy can see the whole medication story, then search stock by name or abbreviation before adding drugs to the POS cart.
         </div>
         <div style={{ minWidth: '280px', flex: 1 }}>
-          <label style={css.label}>Pharmacist Handling Queue</label>
+          <label style={css.label} htmlFor="pharmacy-queue-pharmacist">Pharmacist Handling Queue</label>
           <select
+            id="pharmacy-queue-pharmacist"
             style={{ ...css.input, cursor: 'pointer' }}
             value={pharmacistName}
             onChange={e => setPharmacistName(e.target.value)}

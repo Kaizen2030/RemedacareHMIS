@@ -1,0 +1,8 @@
+Patient Name,Organism Identified,Sample Type,Collection Date,Ward,Gram Stain,Growth,Colony Count,ESBL,MRSA,VRE,Carbapenem R,Ampicillin,Amox-Clav,Pip-Tazo,Cefuroxime,Ceftriaxone,Ceftazidime,Cefepime,Ertapenem,Meropenem,Amikacin,Gentamicin,Ciprofloxacin,Cotrimoxazole,Nitrofurantoin,Fosfomycin,Imipenem,Colistin,Benzylpenicillin,Oxacillin,Erythromycin,Clindamycin,Linezolid,Vancomycin,Tetracycline,Fusidic Acid,Rifampicin,Tobramycin,Levofloxacin,Gentamicin High Level (synergy),Teicoplanin
+TEST PATIENT 01,Escherichia coli,Urine,2026-11-10,Medical Ward 2,Gram-negative rods,Heavy,>10^5 CFU/ml,true,false,false,false,R,R,R,R,R,R,R,S,S,S,R,R,R,S,S,,,,,,,,,,,,,,,
+TEST PATIENT 02,Klebsiella pneumoniae ssp pneumoniae,Blood,2026-11-10,ICU,Gram-negative rods,Positive culture,n/a,true,false,false,true,R,R,R,,R,R,R,R,R,R,R,R,R,,,R,S,,,,,,,,,,,,,
+TEST PATIENT 03,Staphylococcus aureus,Wound Swab,2026-11-11,Surgical Ward,Gram-positive cocci in clusters,Moderate,n/a,false,true,false,false,,,,,,,,,,,S,R,S,,,,,R,R,R,S,S,S,S,S,S,,,,
+TEST PATIENT 04,Pseudomonas aeruginosa,Sputum,2026-11-11,ICU,Gram-negative rods,Heavy,>10^6 CFU/ml,false,false,false,false,,,I,,,I,I,,I,S,,I,,,,I,S,,,,,,,,,,S,I,,
+TEST PATIENT 05,Klebsiella pneumoniae ssp pneumoniae,Urine,2026-11-12,OPD,Gram-negative rods,Heavy,>10^5 CFU/ml,false,false,false,false,R,S,S,,S,S,S,S,S,S,S,S,S,,,,,,,,,,,,,,,,,
+TEST PATIENT 06,Acinetobacter baumannii complex,Blood,2026-11-12,ICU,Gram-negative coccobacilli,Positive culture,n/a,false,false,false,true,,,,,,,,,R,R,R,R,R,,,R,S,,,,,,,,,,R,R,,
+TEST PATIENT 07,Enterococcus faecalis,Urine,2026-11-13,Maternity,Gram-positive cocci in chains,Moderate,10^4–10^5 CFU/ml,false,false,false,false,S,,,,,,,,,,,,,S,,,,,,,,S,S,,,,,,S,S

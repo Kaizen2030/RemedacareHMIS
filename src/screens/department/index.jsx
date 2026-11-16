@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState, useCallback } from 'react'
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react'
+import { useLocation, useNavigate } from 'react-router-dom'
 import supabase from '../../supabase'
-import { canPerformAction } from '../../access'
+import { canPerformAction, resolveRole } from '../../access'
 import { useHospital } from '../../context'
 import { canonicalizePrescriptionDrug, findInventoryMatch } from '../../utils/pharmacy'
 import { getLabTestsForCategory, LAB_TEST_CATEGORIES } from '../../utils/labCatalog'
@@ -9,6 +10,32 @@ import DepartmentBeds from './DepartmentBeds'
 import DepartmentHeader from './DepartmentHeader'
 import DepartmentMetrics from './DepartmentMetrics'
 import DepartmentStaff from './DepartmentStaff'
+import DepartmentResources from './DepartmentResources'
+import DepartmentClinicDiary from './DepartmentClinicDiary'
+import DepartmentReferrals from './DepartmentReferrals'
+import DepartmentResults from './DepartmentResults'
+import DepartmentInpatients from './DepartmentInpatients'
+import DepartmentDuty from './DepartmentDuty'
+import DepartmentReport from './DepartmentReport'
+import DepartmentTabs from './DepartmentTabs'
+import DepartmentRoster from './DepartmentRoster'
+import DepartmentLeave from './DepartmentLeave'
+import DepartmentMyLeave from './DepartmentMyLeave'
+import DepartmentProtocols from './DepartmentProtocols'
+import { ROLE_GROUPS, staffRoleGroup } from '../../utils/staffRoles'
+import DepartmentServices, { billableServices, billDepartmentServices, loadDepartmentServices, ServicePicker } from './DepartmentServices'
+import SpecialtyAssessment from '../consultation/SpecialtyAssessment'
+import { friendlyScheduleError } from '../../utils/scheduling'
+import HospitalWorkflowBoard from '../HospitalWorkflowBoard'
+import { HOSPITAL_WORKFLOW_MODULES } from '../hospitalWorkflowModules'
+import { isSelfPayMethod, unpaidInvoiceFields } from '../../utils/payments/invoices'
+import { notifyError, notifyFromLegacyAlert, notifyWarning } from '../../notifications'
+import { priceForPayer } from '../../utils/hospitalConfig'
+import SupportDesk from '../support/SupportDesk'
+import RecordsDesk from '../support/RecordsDesk'
+import VisitorPasses from '../support/VisitorPasses'
+import { SUPPORT_DEPARTMENTS } from '../support/supportConfig'
+import { canonicalDepartmentName } from '../../utils/departmentNames'
 
 // ─────────────────────────────────────────────────────────────
 // DEPARTMENTS NOW STORED IN DATABASE
@@ -45,8 +72,8 @@ export const DEPARTMENT_CONFIG = {
   'Inpatient / Wards': {
     type: 'clinical',
     icon: '🛏️',
-    color: '#7C3AED',
-    bg: '#F5F3FF',
+    color: '#0A9272',
+    bg: '#EAF5EF',
     dataSources: ['visits', 'admissions', 'staff'],
     uiSections: ['admitted_patients', 'visit_queue', 'staff'],
     canRefer: true,
@@ -118,7 +145,7 @@ export const DEPARTMENT_CONFIG = {
     type: 'clinical',
     icon: '🦾',
     color: '#9333EA',
-    bg: '#F5F3FF',
+    bg: '#EAF5EF',
     dataSources: ['visits', 'consultations', 'staff'],
     uiSections: ['visit_queue', 'consultations', 'staff'],
     canRefer: true,
@@ -141,7 +168,7 @@ export const DEPARTMENT_CONFIG = {
   'Mental Health & Psychiatry': {
     type: 'clinical',
     icon: '🧠',
-    color: '#7C3AED',
+    color: '#0A9272',
     bg: '#EEF2FF',
     dataSources: ['visits', 'consultations', 'staff'],
     uiSections: ['visit_queue', 'consultations', 'staff'],
@@ -249,8 +276,8 @@ export const DEPARTMENT_CONFIG = {
   'Neurology': {
     type: 'clinical',
     icon: '🧠',
-    color: '#7C3AED',
-    bg: '#F5F3FF',
+    color: '#0A9272',
+    bg: '#EAF5EF',
     dataSources: ['visits', 'consultations', 'staff'],
     uiSections: ['visit_queue', 'consultations', 'staff'],
     canRefer: true,
@@ -467,6 +494,23 @@ export const DEPARTMENT_CONFIG = {
   },
 }
 
+// Workflows are tools used by a department, not replacement departments.
+const DEPARTMENT_WORKFLOW_LINKS = {
+  'OPD / Outpatient': [{ target: 'chronic-disease', label: 'Chronic care' }, { target: 'telemedicine', label: 'Telemedicine' }],
+  'Emergency': [{ target: 'ed', label: 'Emergency department (triage & pathways)' }, { target: 'emergency', label: 'Old emergency board' }],
+  'Inpatient / Wards': [{ target: 'wards', label: 'Wards and beds' }],
+  'ICU / HDU': [{ target: 'icu', label: 'ICU / HDU chart (ventilator, infusions, SOFA, daily goals)' }],
+  'Theatre / Surgery': [{ target: 'theatre-suite', label: 'Theatre (WHO checklist, op notes, recovery)' }, { target: 'theatre', label: 'Old theatre board' }],
+  'Maternity': [{ target: 'maternity', label: 'Maternity board' }],
+  'Laboratory': [{ target: 'lab', label: 'Laboratory' }, { target: 'blood-bank', label: 'Blood bank' }, { target: 'antibiogram', label: 'Antibiogram' }],
+  'Radiology & Imaging': [{ target: 'radiology', label: 'Radiology' }],
+  'Pharmacy': [{ target: 'pharmacy', label: 'Pharmacy' }],
+  'Nutrition & Dietetics': [{ target: 'nutrition', label: 'Nutrition' }],
+  'Human Resources': [{ target: 'hr', label: 'HR and staff' }],
+  'Finance & Billing': [{ target: 'billing', label: 'Billing' }],
+  'Mortuary': [{ target: 'morgue', label: 'Mortuary register' }],
+}
+
 const aliasMap = {
   'outpatient (opd)': 'OPD / Outpatient',
   'emergency & casualty': 'Emergency',
@@ -487,20 +531,20 @@ const aliasMap = {
   'dentistry': 'Dental',
   'eye clinic': 'Eye Clinic',
   'eye / optical': 'Eye Clinic',
-  'ophthalmology': 'Ophthalmology',
+  'ophthalmology': 'Eye Clinic',
   'physiotherapy': 'Physiotherapy',
   'general medicine': 'General Medicine',
-  'surgery': 'Surgery',
+  'surgery': 'Theatre / Surgery',
   'orthopaedics': 'Orthopaedics',
   'ent': 'ENT',
   'dermatology': 'Dermatology',
   'neurology': 'Neurology',
-  'psychiatry': 'Psychiatry',
+  'psychiatry': 'Mental Health & Psychiatry',
   'oncology': 'Oncology',
   'urology': 'Urology',
-  'obstetrics & gynaecology': 'Obstetrics & Gynaecology',
-  'obs & gynae': 'Obstetrics & Gynaecology',
-  'obstetrics and gynaecology': 'Obstetrics & Gynaecology',
+  'obstetrics & gynaecology': 'Maternity',
+  'obs & gynae': 'Maternity',
+  'obstetrics and gynaecology': 'Maternity',
 }
 
 const reverseAliasMap = {
@@ -508,7 +552,10 @@ const reverseAliasMap = {
   'Emergency': ['Emergency & Casualty'],
   'Inpatient / Wards': ['Inpatient — Medical Ward', 'Inpatient — Surgical Ward', 'ICU / HDU'],
   'Paediatrics': ['Inpatient — Paediatric Ward'],
-  'Maternity': ['Maternity & Labour Ward'],
+  'Eye Clinic': ['Ophthalmology'],
+  'Theatre / Surgery': ['Surgery'],
+  'Mental Health & Psychiatry': ['Psychiatry'],
+  'Maternity': ['Maternity & Labour Ward', 'Obstetrics & Gynaecology'],
   'Finance & Billing': ['Finance & Accounts'],
   'Kitchen / Catering': ['Kitchen & Catering'],
   'Housekeeping': ['Housekeeping & Laundry'],
@@ -516,7 +563,9 @@ const reverseAliasMap = {
 
 function normalizeDepartment(department) {
   if (!department) return department
-  return aliasMap[department.trim().toLowerCase()] || department
+  // the local map first (it also groups some units, e.g. Obs & Gynae with Maternity), then the shared synonym table
+  const canon = canonicalDepartmentName(department)
+  return aliasMap[department.trim().toLowerCase()] || aliasMap[canon.toLowerCase()] || canon
 }
 
 function getDepartmentSearchKeys(department) {
@@ -540,7 +589,7 @@ function isVisitForDepartment(department, visit) {
   if (dept === 'maternity') return status === 'maternity' || speciality === 'maternity'
   if (dept === 'paediatrics') return status === 'paediatrics' || speciality === 'paediatrics'
   if (dept === 'laboratory') return status === 'lab' || speciality === 'laboratory'
-  if (dept === 'radiology & imaging') return speciality === 'radiology' || (status === 'referred' && speciality === 'radiology & imaging')
+  if (dept === 'radiology & imaging') return status === 'radiology' || speciality === 'radiology' || (status === 'referred' && speciality === 'radiology & imaging')
   if (dept === 'pharmacy') return status === 'pharmacy' || speciality === 'pharmacy'
   if (['human resources', 'finance & billing', 'administration', 'security', 'it & systems', 'mortuary', 'transport', 'kitchen / catering', 'housekeeping'].includes(dept)) return false
 
@@ -554,29 +603,33 @@ function isVisitForDepartment(department, visit) {
 // STYLES
 // ─────────────────────────────────────────────────────────────
 const css = {
-  page: { minHeight: '100vh', background: '#F4F6FB', fontFamily: "'DM Sans','Segoe UI',sans-serif", color: '#111827' },
+  page: { background: '#F9FAFB', fontFamily: "'DM Sans','Segoe UI',sans-serif", color: '#101828' },
   wrap: { padding: '20px 24px', maxWidth: '1300px', margin: '0 auto' },
-  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '20px', gap: '12px', flexWrap: 'wrap' },
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px', gap: '12px', flexWrap: 'wrap' },
   titleRow: { display: 'flex', alignItems: 'center', gap: '12px' },
   iconBox: (bg, color) => ({ width: '48px', height: '48px', borderRadius: '12px', background: bg, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px', border: `1.5px solid ${color}20` }),
   h1: { fontSize: '22px', fontWeight: 700, margin: 0 },
-  subtext: { fontSize: '12px', color: '#6B7280', marginTop: '4px' },
-  typeBadge: (bg, color) => ({ display: 'inline-block', padding: '2px 10px', borderRadius: '999px', background: bg, color: color, fontSize: '11px', fontWeight: 600, marginTop: '6px', textTransform: 'uppercase', letterSpacing: '.5px' }),
-  backBtn: { padding: '8px 16px', borderRadius: '8px', border: '1.5px solid #E5E7EB', background: '#fff', color: '#374151', fontSize: '13px', fontWeight: 600, cursor: 'pointer' },
-  statRow: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: '12px', marginBottom: '20px' },
-  statCard: (accent) => ({ background: '#fff', border: `1.5px solid ${accent}30`, borderRadius: '12px', padding: '16px 18px', borderLeft: `4px solid ${accent}` }),
-  statNum: { fontSize: '28px', fontWeight: 800, lineHeight: 1.1 },
-  statLbl: { fontSize: '11px', color: '#6B7280', textTransform: 'uppercase', letterSpacing: '.5px', marginTop: '4px' },
-  card: { background: '#fff', border: '1px solid #E8ECF2', borderRadius: '12px', padding: '18px 20px', marginBottom: '16px' },
-  sectionTitle: { fontWeight: 700, fontSize: '14px', marginBottom: '4px' },
-  sectionNote: { fontSize: '12px', color: '#6B7280', marginBottom: '14px' },
+  subtext: { fontSize: '13.5px', color: '#344054', marginTop: '4px' },
+  typeBadge: () => ({ display: 'inline-block', padding: '1px 8px', borderRadius: '4px', background: '#F2F4F7', color: '#344054', fontSize: '11.5px', fontWeight: 700, marginTop: '6px', textTransform: 'capitalize' }),
+  backBtn: { padding: '8px 14px', borderRadius: '8px', border: '1px solid #D0D5DD', background: '#fff', color: '#101828', fontSize: '13px', fontWeight: 600, cursor: 'pointer' },
+  dangerBtn: { padding: '8px 14px', borderRadius: '8px', border: '1px solid #B42318', background: '#fff', color: '#B42318', fontSize: '13px', fontWeight: 700, cursor: 'pointer' },
+  statRow: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(160px,1fr))', gap: '10px', marginBottom: '14px' },
+  statCard: () => ({ background: '#fff', border: '1px solid #D0D5DD', borderRadius: '10px', padding: '12px 14px' }),
+  statNum: { fontSize: '24px', fontWeight: 800, lineHeight: 1.1, color: '#101828' },
+  statLbl: { fontSize: '12.5px', color: '#344054', fontWeight: 700, marginTop: '2px' },
+  statSub: { fontSize: '11.5px', color: '#475467', marginTop: '1px' },
+  card: { background: '#fff', border: '1px solid #D0D5DD', borderRadius: '10px', padding: '14px 16px', marginBottom: '12px', minWidth: 0 },
+  sectionTitle: { fontWeight: 800, fontSize: '15px', color: '#101828', display: 'flex', alignItems: 'center', gap: '8px' },
+  sectionCount: { fontSize: '11.5px', fontWeight: 700, background: '#F2F4F7', color: '#344054', borderRadius: '999px', padding: '1px 8px' },
+  sectionNote: { fontSize: '12.5px', color: '#475467', margin: '2px 0 10px' },
   table: { width: '100%', borderCollapse: 'collapse' },
-  th: { padding: '9px 14px', textAlign: 'left', fontSize: '11px', fontWeight: 700, color: '#6B7280', textTransform: 'uppercase', borderBottom: '2px solid #E8ECF2', background: '#F8FAFC' },
-  td: { padding: '11px 14px', borderBottom: '1px solid #F3F4F6', fontSize: '13px' },
-  statusPill: (color, bg) => ({ display: 'inline-block', padding: '3px 10px', borderRadius: '999px', background: bg, color: color, fontSize: '11px', fontWeight: 600 }),
-  emptyBox: { textAlign: 'center', padding: '40px 20px', color: '#9CA3AF' },
-  emptyIcon: { fontSize: '36px', marginBottom: '8px' },
-  emptyText: { fontSize: '13px' },
+  th: { padding: '8px 12px', textAlign: 'left', fontSize: '12px', fontWeight: 800, color: '#344054', borderBottom: '1px solid #D0D5DD', background: '#F9FAFB', whiteSpace: 'nowrap' },
+  td: { padding: '9px 12px', borderBottom: '1px solid #EAECF0', fontSize: '13px', color: '#101828', verticalAlign: 'top' },
+  statusPill: (color) => ({ display: 'inline-flex', alignItems: 'center', gap: '6px', padding: '2px 8px', borderRadius: '4px', background: '#F2F4F7', color: '#101828', fontSize: '12px', fontWeight: 700, '--dot': color }),
+  emptyBox: { padding: '10px 12px', background: '#F9FAFB', border: '1px dashed #D0D5DD', borderRadius: '8px' },
+  emptyText: { fontSize: '13px', color: '#344054' },
+  twoCol: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))', gap: '12px', alignItems: 'start' },
+  resource: { display: 'inline-block', padding: '6px 10px', borderRadius: '6px', border: '1px solid #D0D5DD', background: '#fff', color: '#0F6E56', fontSize: '12.5px', fontWeight: 700, textDecoration: 'none', cursor: 'pointer' },
   divider: { borderBottom: '1px solid #F3F4F6', margin: '16px 0' },
   roleRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #F9FAFB' },
   infoGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(200px,1fr))', gap: '10px' },
@@ -590,7 +643,7 @@ function StatusPill({ status }) {
     'Active': ['#16A34A', '#F0FDF4'],
     'Pending': ['#D97706', '#FFFBEB'],
     'Completed': ['#2563EB', '#EFF6FF'],
-    'Released': ['#7C3AED', '#F5F3FF'],
+    'Released': ['#0A9272', '#EAF5EF'],
     'Admitted': ['#0891B2', '#ECFEFF'],
     'Referred': ['#6366F1', '#EEF2FF'],
     'Lab': ['#D97706', '#FFFBEB'],
@@ -598,25 +651,26 @@ function StatusPill({ status }) {
     'Doctor': ['#374151', '#F3F4F6'],
   }
   const [color, bg] = map[status] || ['#6B7280', '#F3F4F6']
-  return <span style={css.statusPill(color, bg)}>{status || '—'}</span>
+  void bg
+  return <span style={css.statusPill(color)}><span aria-hidden="true" style={{ width: 7, height: 7, borderRadius: 4, background: color }} />{status || '—'}</span>
 }
 
-function EmptyState({ icon, message }) {
+function EmptyState({ message }) {
   return (
     <div style={css.emptyBox}>
-      <div style={css.emptyIcon}>{icon}</div>
       <div style={css.emptyText}>{message}</div>
     </div>
   )
 }
 
-function SectionCard({ title, note, children }) {
+function SectionCard({ title, note, count, children }) {
   return (
-    <div style={css.card}>
-      <div style={css.sectionTitle}>{title}</div>
+    <section style={css.card} aria-label={title}>
+      <div style={css.sectionTitle}>{title}{count != null && <span style={css.sectionCount}>{count}</span>}</div>
       {note && <div style={css.sectionNote}>{note}</div>}
+      {!note && <div style={{ height: 8 }} />}
       {children}
-    </div>
+    </section>
   )
 }
 
@@ -624,73 +678,69 @@ function SectionCard({ title, note, children }) {
 // SECTION COMPONENTS
 // ─────────────────────────────────────────────────────────────
 
+// Staff list that scales to large departments: role filter with counts, name search, 25 per page.
+const STAFF_PAGE = 25
+const ROW = { padding: '6px 12px', verticalAlign: 'middle' } // compact rows for long staff lists
 function StaffSection({ staff, full = false }) {
-  const roles = useMemo(() => {
-    const map = {}
-    staff.forEach(s => {
-      const r = s.role_category || 'Unassigned'
-      if (!map[r]) map[r] = []
-      map[r].push(s)
-    })
-    return map
+  const [q, setQ] = useState('')
+  const [role, setRole] = useState('')
+  const [page, setPage] = useState(0)
+  const counts = useMemo(() => {
+    const c = {}
+    staff.forEach(s => { const g = staffRoleGroup(s); c[g] = (c[g] || 0) + 1 })
+    return ROLE_GROUPS.filter(g => c[g]).map(g => [g, c[g]])
   }, [staff])
+  const filtered = useMemo(() => {
+    const words = q.trim().toLowerCase().split(/\s+/).filter(Boolean)
+    return staff
+      .filter(s => !role || staffRoleGroup(s) === role)
+      .filter(s => words.every(w => `${s.full_name || ''} ${s.job_title || ''} ${s.role || ''}`.toLowerCase().includes(w)))
+      .sort((a, b) => ROLE_GROUPS.indexOf(staffRoleGroup(a)) - ROLE_GROUPS.indexOf(staffRoleGroup(b)) || String(a.full_name || '').localeCompare(String(b.full_name || '')))
+  }, [staff, q, role])
+  useEffect(() => { setPage(0) }, [q, role])
 
-  if (staff.length === 0) return <EmptyState icon="👥" message="No staff assigned to this department." />
-
-  if (!full) {
-    return (
-      <table style={css.table}>
-        <thead>
-          <tr>
-            <th style={css.th}>Name</th>
-            <th style={css.th}>Role</th>
-            <th style={css.th}>Status</th>
-            <th style={css.th}>Shift</th>
-          </tr>
-        </thead>
-        <tbody>
-          {staff.map(s => (
-            <tr key={s.id}>
-              <td style={css.td}>{s.full_name}</td>
-              <td style={css.td}>{s.job_title || s.role || '—'}</td>
-              <td style={css.td}><StatusPill status={s.status} /></td>
-              <td style={css.td}>{s.current_shift || '—'}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    )
-  }
-
+  if (staff.length === 0) return <EmptyState message="No staff assigned to this department." />
+  const pages = Math.max(1, Math.ceil(filtered.length / STAFF_PAGE))
+  const shown = filtered.slice(page * STAFF_PAGE, page * STAFF_PAGE + STAFF_PAGE)
   return (
     <>
-      {Object.entries(roles).map(([role, members]) => (
-        <div key={role} style={{ marginBottom: '16px' }}>
-          <div style={{ fontSize: '12px', fontWeight: 700, color: '#6B7280', textTransform: 'uppercase', marginBottom: '6px' }}>{role} ({members.length})</div>
+      {(staff.length > 12 || counts.length > 1) && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
+          <div role="group" aria-label="Filter staff by role" style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {[['', staff.length], ...counts].map(([g, n]) => (
+              <button key={g || 'all'} type="button" aria-pressed={role === g} onClick={() => setRole(g)}
+                style={{ ...css.backBtn, padding: '4px 10px', fontSize: 12.5, ...(role === g ? { background: '#0F6E56', color: '#fff', borderColor: '#0F6E56' } : {}) }}>{g || 'All'} ({n})</button>
+            ))}
+          </div>
+          {staff.length > 12 && <input type="search" aria-label="Search staff" placeholder="Search name or title" value={q} onChange={e => setQ(e.target.value)}
+            style={{ marginLeft: 'auto', padding: '6px 10px', border: '1px solid #D0D5DD', borderRadius: 8, fontSize: 13, minWidth: 200 }} />}
+        </div>
+      )}
+      {filtered.length === 0 ? <EmptyState message="No staff match this search." /> : (
+        <div style={{ overflowX: 'auto' }}>
           <table style={css.table}>
-            <thead>
-              <tr>
-                <th style={css.th}>Name</th>
-                <th style={css.th}>Job Title</th>
-                <th style={css.th}>Status</th>
-                <th style={css.th}>Shift</th>
-                <th style={css.th}>Phone</th>
-              </tr>
-            </thead>
+            <thead><tr>{['Name', 'Role', 'Status', 'Shift', ...(full ? ['Phone'] : [])].map(h => <th key={h} style={css.th}>{h}</th>)}</tr></thead>
             <tbody>
-              {members.map(s => (
+              {shown.map(s => (
                 <tr key={s.id}>
-                  <td style={css.td}>{s.full_name}</td>
-                  <td style={css.td}>{s.job_title || '—'}</td>
-                  <td style={css.td}><StatusPill status={s.status} /></td>
-                  <td style={css.td}>{s.current_shift || '—'}</td>
-                  <td style={css.td}>{s.phone || '—'}</td>
+                  <td style={{ ...css.td, ...ROW, fontWeight: 700 }}>{s.full_name}</td>
+                  <td style={{ ...css.td, ...ROW }}>{s.job_title || s.role || '—'}</td>
+                  <td style={{ ...css.td, ...ROW }}><StatusPill status={s.status} /></td>
+                  <td style={{ ...css.td, ...ROW }}>{s.current_shift || '—'}</td>
+                  {full && <td style={{ ...css.td, ...ROW }}>{s.phone || '—'}</td>}
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
-      ))}
+      )}
+      {pages > 1 && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, fontSize: 13 }}>
+          <button type="button" style={{ ...css.backBtn, padding: '4px 10px' }} disabled={page === 0} onClick={() => setPage(p => p - 1)}>‹ Previous</button>
+          <span>{page * STAFF_PAGE + 1}–{Math.min(filtered.length, (page + 1) * STAFF_PAGE)} of {filtered.length}</span>
+          <button type="button" style={{ ...css.backBtn, padding: '4px 10px' }} disabled={page >= pages - 1} onClick={() => setPage(p => p + 1)}>Next ›</button>
+        </div>
+      )}
     </>
   )
 }
@@ -733,8 +783,11 @@ function VisitQueueSection({ visits, invoices, department }) {
 }
 
 function ConsultationsSection({ consultations }) {
-  if (consultations.length === 0) return <EmptyState icon="🩺" message="No consultations recorded." />
+  const [all, setAll] = useState(false)
+  if (consultations.length === 0) return <EmptyState message="No consultations recorded yet." />
+  const shown = all ? consultations : consultations.slice(0, 8)
   return (
+    <>
     <table style={css.table}>
       <thead>
         <tr>
@@ -746,17 +799,19 @@ function ConsultationsSection({ consultations }) {
         </tr>
       </thead>
       <tbody>
-        {consultations.map(c => (
+        {shown.map(c => (
           <tr key={c.id}>
-            <td style={css.td}>{c.patient_name || c.patient_id || '—'}</td>
+            <td style={{ ...css.td, fontWeight: 700 }}>{c.patient_name || c.patient_id || '—'}</td>
             <td style={css.td}>{c.doctor_name || '—'}</td>
             <td style={css.td}><StatusPill status={c.disposition} /></td>
             <td style={css.td}>{c.refer_to || '—'}</td>
-            <td style={{ ...css.td, color: '#9CA3AF', fontSize: '12px' }}>{c.created_at ? new Date(c.created_at).toLocaleDateString() : '—'}</td>
+            <td style={{ ...css.td, color: '#344054', fontSize: '12.5px', whiteSpace: 'nowrap' }}>{c.created_at ? new Date(c.created_at).toLocaleDateString('en-KE') : '—'}</td>
           </tr>
         ))}
       </tbody>
     </table>
+    {consultations.length > 8 && <button type="button" style={{ ...css.backBtn, marginTop: 8 }} onClick={() => setAll(v => !v)}>{all ? 'Show latest 8' : `Show all ${consultations.length}`}</button>}
+    </>
   )
 }
 
@@ -972,8 +1027,8 @@ function CleaningTasksSection({ tasks }) {
 // ─────────────────────────────────────────────────────────────
 const REFERRAL_DEPARTMENTS = [
   { group: 'General & Emergency', options: ['General Medicine', 'OPD / Outpatient', 'Emergency'] },
-  { group: 'Medical Specialties', options: ['Cardiology', 'Neurology', 'Dermatology', 'Psychiatry', 'Mental Health & Psychiatry', 'Oncology', 'Urology', 'Paediatrics'] },
-  { group: 'Surgical Specialties', options: ['Surgery', 'Orthopaedics', 'ENT', 'Ophthalmology', 'Eye Clinic', 'Theatre / Surgery'] },
+  { group: 'Medical Specialties', options: ['Cardiology', 'Neurology', 'Dermatology', 'Mental Health & Psychiatry', 'Oncology', 'Urology', 'Paediatrics'] },
+  { group: 'Surgical Specialties', options: ['Surgery', 'Orthopaedics', 'ENT', 'Eye Clinic', 'Theatre / Surgery'] },
   { group: 'Women & Children', options: ['Obstetrics & Gynaecology', 'Maternity', 'Paediatrics'] },
   { group: 'Allied Health', options: ['Physiotherapy', 'Nutrition & Dietetics', 'Community Health', 'Dental'] },
   { group: 'Diagnostic', options: ['Laboratory', 'Radiology & Imaging'] },
@@ -989,18 +1044,22 @@ const DEPT_DISPOSITIONS = ['Send Home','Admit - Inpatient','Refer to Specialist'
 // ─────────────────────────────────────────────────────────────
 function SpecialistConsultationPanel({ visit, hospitalId, department, config, referralGroups, onComplete }) {
   const { userRole } = useHospital()
-  const accentColor = config.color || '#0F6E56'
-  const accentBg = config.bg || '#E1F5EE'
+  const accentColor = '#0F6E56' // one brand colour across departments
+  const accentBg = '#E6F4EE'
   const canWriteDiagnosis = canPerformAction(userRole, 'write_diagnosis')
 
   const [tab, setTab] = useState('consult')
   const [saving, setSaving] = useState(false)
+  const { hospitalName } = useHospital()
+  const [deptServices, setDeptServices] = useState([])
+  const [pickedServices, setPickedServices] = useState({})
+  useEffect(() => { let live = true; void loadDepartmentServices(hospitalId, department).then((rows) => { if (live) setDeptServices(billableServices(rows)) }); return () => { live = false } }, [hospitalId, department])
 
   const emptyForm = {
     doctor_name: '', speciality: department,
     presenting_complaint: '', history: '', examination_findings: '',
     diagnosis: '', icd_code: '', treatment_plan: '', notes: '',
-    disposition: '', refer_department: '', refer_to: '', follow_up_date: '',
+    disposition: '', refer_department: '', refer_to: '', follow_up_date: '', follow_up_time: '09:00', book_follow_up: true,
   }
   const [form, setForm] = useState(emptyForm)
   const [showRx, setShowRx] = useState(false)
@@ -1124,13 +1183,12 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
         .eq('code', chargeCode)
         .maybeSingle()
 
-      const amount = cc?.unit_price_kes || 0
+      const { amount } = await priceForPayer(supabase, hospitalId, chargeCode, cc?.unit_price_kes || 0, {
+        paymentMethod: visit.admission_payment_method,
+        insurer: visit.patients?.insurer_name || visit.patients?.insurance,
+      })
       const serviceLabel = cc?.name || `${department} Consultation`
-      const NON_INSURANCE = ['Cash', 'M-Pesa']
       const payMethod = visit.admission_payment_method || 'Cash'
-      const alreadyPaid = 0 // specialist visits don't have upfront admission_fee
-      const balance = Math.max(0, amount - alreadyPaid)
-      const status = amount === 0 ? 'Pending' : (balance <= 0 ? 'Paid' : 'Pending')
 
       await supabase.from('invoices').insert({
         hospital_id: hospitalId,
@@ -1148,19 +1206,15 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
           visitId: visit.id,
           meta: { speciality: department, charge_code: chargeCode },
         })]),
-        amount_kes: amount,
-        paid_kes: alreadyPaid,
-        balance_kes: balance,
+        ...unpaidInvoiceFields(amount),
         payment_method: payMethod,
-        insurer: !NON_INSURANCE.includes(payMethod) ? payMethod : null,
-        status,
+        insurer: !isSelfPayMethod(payMethod) ? payMethod : null,
         notes: buildWorkflowInvoiceNote({
           source: SERVICE_SOURCES.CONSULTATION,
           sourceId: consultationId,
           visitId: visit.id,
           summary: serviceLabel,
         }),
-        paid_at: status === 'Paid' ? new Date().toISOString() : null,
       })
 
       try {
@@ -1175,14 +1229,14 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
 
   async function handleSave() {
     if (!canWriteDiagnosis) {
-      window.notifyFromLegacyAlert('Only doctors and clinical officers can open specialist consultations')
+      notifyWarning('Only doctors and clinical officers can open specialist consultations')
       return
     }
-    if (!form.diagnosis) { window.notifyFromLegacyAlert('Diagnosis is required.'); return }
-    if (!form.disposition) { window.notifyFromLegacyAlert('Select a disposition.'); return }
-    if (!form.doctor_name) { window.notifyFromLegacyAlert('Enter doctor/specialist name.'); return }
+    if (!form.diagnosis) { notifyWarning('Diagnosis is required.'); return }
+    if (!form.disposition) { notifyWarning('Select a disposition.'); return }
+    if (!form.doctor_name) { notifyWarning('Enter doctor/specialist name.'); return }
     if (form.disposition === 'Refer to Specialist' && !form.refer_department) {
-      window.notifyFromLegacyAlert('Select a department to refer to.'); return
+      notifyWarning('Select a department to refer to.'); return
     }
     setSaving(true)
     try {
@@ -1205,7 +1259,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
         follow_up_date: form.follow_up_date || null,
         created_at: new Date().toISOString(),
       })
-      if (cErr) { window.notifyFromLegacyAlert('Error saving consultation: ' + cErr.message); setSaving(false); return }
+      if (cErr) { notifyError('Error saving consultation: ' + cErr.message); setSaving(false); return }
 
       // 1b. Auto-create specialist consultation invoice
       const { data: newConsult } = await supabase
@@ -1219,6 +1273,8 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
         .maybeSingle()
 
       await autoCreateSpecialistInvoice({ consultationId: newConsult?.id || null })
+      // procedures and services done in this visit → unpaid invoice for the cashier
+      await billDepartmentServices({ hospitalId, visit, department, services: deptServices, picked: pickedServices, consultationId: newConsult?.id || null })
 
       // 2. Save prescriptions (if any)
       const validRx = rxList
@@ -1235,7 +1291,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
             created_at: new Date().toISOString(),
           }))
         )
-        if (rxErr) { window.notifyFromLegacyAlert('Error saving prescriptions: ' + rxErr.message); setSaving(false); return }
+        if (rxErr) { notifyError('Error saving prescriptions: ' + rxErr.message); setSaving(false); return }
         try { window.dispatchEvent(new CustomEvent('remedacare:prescriptions_changed', { detail: { visit_id: visit.id } })) } catch (e) {}
       }
 
@@ -1252,7 +1308,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
             ordered_by: form.doctor_name, ordered_at: new Date().toISOString(),
           }))
         )
-        if (labErr) { window.notifyFromLegacyAlert('Error saving lab orders: ' + labErr.message); setSaving(false); return }
+        if (labErr) { notifyError('Error saving lab orders: ' + labErr.message); setSaving(false); return }
         try { window.dispatchEvent(new CustomEvent('remedacare:workflow_changed', { detail: { visit_id: visit.id } })) } catch (e) {}
       }
 
@@ -1278,13 +1334,50 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
         ...(validLabs.length > 0 ? { lab_requested: true } : {}),
       }).eq('id', visit.id).eq('hospital_id', hospitalId)
 
-      if (vErr) { window.notifyFromLegacyAlert('Error updating visit: ' + vErr.message); setSaving(false); return }
+      if (vErr) { notifyError('Error updating visit: ' + vErr.message); setSaving(false); return }
+
+      const nowIso = new Date().toISOString()
+      if (isRefer) {
+        const pp = visit.patients || {}
+        const { error: rErr } = await supabase.from('referrals').insert({
+          hospital_id: hospitalId, visit_id: visit.id, patient_id: visit.patient_id,
+          patient_name: pp.full_name || visit.patient_name || '', patient_age: String(pp.age || ''), patient_gender: pp.gender || '',
+          referring_doctor: form.doctor_name, referring_facility: hospitalName || '', receiving_facility: hospitalName || '',
+          referring_department: department, receiving_department: form.refer_department,
+          referral_reason: (form.notes || '').trim() || form.diagnosis, diagnosis_label: form.diagnosis || null, diagnosis_icd10: form.icd_code || null,
+          clinical_summary: [form.presenting_complaint && `Complaint: ${form.presenting_complaint}`, form.examination_findings && `Examination: ${form.examination_findings}`,
+            form.treatment_plan && `Plan so far: ${form.treatment_plan}`].filter(Boolean).join('\n'),
+          urgency: 'Routine', status: 'Sent', referral_date: nowIso.slice(0, 10),
+          status_notes: [{ status: 'Sent', note: `Referred from ${department}${form.refer_to ? ` to ${form.refer_to}` : ''}`, author: form.doctor_name, at: nowIso }],
+        })
+        if (rErr) notifyWarning(`Patient moved to ${form.refer_department}, but the referral record was not saved: ${rErr.message}`)
+      } else {
+        // this department has now seen the patient: close any open referral to it for this visit
+        const { data: open } = await supabase.from('referrals').select('id,receiving_department,status').eq('hospital_id', hospitalId).eq('visit_id', visit.id).in('status', ['Sent', 'Received'])
+        for (const r of (open || []).filter((x) => normalizeDepartment(x.receiving_department) === normalizeDepartment(department))) {
+          await supabase.from('referrals').update({ status: 'Completed', completed_at: nowIso, updated_at: nowIso }).eq('id', r.id).eq('hospital_id', hospitalId)
+        }
+      }
+
+      // Book the follow-up as a real appointment (the scheduling rules refuse clashes and out-of-hours slots).
+      if (form.follow_up_date && form.book_follow_up) {
+        const [hh, mm] = String(form.follow_up_time || '09:00').split(':').map(Number)
+        const endMinutes = hh * 60 + mm + 30
+        const end = `${String(Math.floor(endMinutes / 60) % 24).padStart(2, '0')}:${String(endMinutes % 60).padStart(2, '0')}`
+        const { error: aErr } = await supabase.from('appointments').insert({
+          hospital_id: hospitalId, patient_id: visit.patient_id, doctor_name: form.doctor_name, department,
+          appointment_type: 'Follow-up', appointment_date: form.follow_up_date, start_time: form.follow_up_time || '09:00', end_time: end,
+          duration_minutes: 30, status: 'Scheduled', visit_id: visit.id, created_at: new Date().toISOString(),
+          notes: `Follow-up after ${department} consultation${form.diagnosis ? `: ${form.diagnosis}` : ''}`,
+        })
+        if (aErr) notifyWarning(`Consultation saved, but the follow-up was not booked: ${friendlyScheduleError(aErr.message).message} Book it from the clinic diary.`)
+      }
 
       try { window.dispatchEvent(new CustomEvent('remedacare:workflow_changed', { detail: { visit_id: visit.id, status: newStatus } })) } catch (e) {}
 
       onComplete?.()
     } catch (e) {
-      window.notifyFromLegacyAlert('Error: ' + e.message)
+      notifyError('Error: ' + e.message)
     }
     setSaving(false)
   }
@@ -1308,17 +1401,17 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
           <div style={{ fontWeight: 700, fontSize: 15, color: '#111' }}>{p.full_name || visit.patient_name || 'Patient'}</div>
           <div style={{ fontSize: 12, color: '#666', marginTop: 2 }}>
             {p.age && `${p.age}y`}{p.gender ? ` • ${p.gender}` : ''} • {visit.visit_number || visit.id?.slice(0,8)} • {visit.visit_type || 'Visit'}
-            {visit.chief_complaint ? ` • 💬 ${visit.chief_complaint}` : ''}
+            {visit.chief_complaint ? ` • ${visit.chief_complaint}` : ''}
           </div>
         </div>
         {completedLabs.length > 0 && (
           <div style={{ ...sp, background: '#E1F5EE', color: '#0F6E56', cursor: 'pointer' }} onClick={() => setTab('labs')}>
-            🔬 {completedLabs.length} lab{completedLabs.length > 1 ? 's' : ''} ready
+            {completedLabs.length} lab{completedLabs.length > 1 ? 's' : ''} ready
           </div>
         )}
         {pendingLabs.length > 0 && (
           <div style={{ ...sp, background: '#FFF3DC', color: '#C07000' }}>
-            ⏳ {pendingLabs.length} pending
+            {pendingLabs.length} pending
           </div>
         )}
       </div>
@@ -1326,10 +1419,10 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
       {/* Tabs */}
       <div style={{ display: 'flex', borderBottom: '2px solid #f0f0f0', padding: '0 18px' }}>
         {[
-          ['consult', `${config.icon || '🩺'} Consultation`],
-          ['vitals', '📊 Vitals'],
-          ['labs', `🔬 Lab Results${thisVisitLabs.length > 0 ? ` (${thisVisitLabs.length})` : ''}`],
-          ['history', `📁 History${patientConsults.length > 0 ? ` (${patientConsults.length})` : ''}`],
+          ['consult', 'Consultation'],
+          ['vitals', 'Vitals'],
+          ['labs', `Lab Results${thisVisitLabs.length > 0 ? ` (${thisVisitLabs.length})` : ''}`],
+          ['history', `History${patientConsults.length > 0 ? ` (${patientConsults.length})` : ''}`],
         ].map(([k, label]) => (
           <button key={k} onClick={() => setTab(k)} style={{
             padding: '10px 14px', border: 'none', background: 'none', cursor: 'pointer',
@@ -1353,20 +1446,19 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
           <div>
             {!vitals ? (
               <div style={{ textAlign: 'center', padding: '30px', color: '#999' }}>
-                <div style={{ fontSize: 28 }}>📊</div>
                 <div style={{ marginTop: 8, fontSize: 13 }}>No vitals recorded for this visit</div>
               </div>
             ) : (
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10 }}>
                 {[
-                  ['⚖ Weight', vitals.weight_kg ? `${vitals.weight_kg} kg` : '—'],
-                  ['📏 Height', vitals.height_cm ? `${vitals.height_cm} cm` : '—'],
-                  ['📐 BMI', vitals.bmi || '—'],
-                  ['❤ BP', vitals.bp_systolic ? `${vitals.bp_systolic}/${vitals.bp_diastolic} mmHg` : '—'],
-                  ['💓 Pulse', vitals.pulse_bpm ? `${vitals.pulse_bpm} bpm` : '—'],
-                  ['🌡 Temp', vitals.temperature_c ? `${vitals.temperature_c}°C` : '—'],
-                  ['🫁 SpO2', vitals.oxygen_sat ? `${vitals.oxygen_sat}%` : '—'],
-                  ['🫀 RR', vitals.respiratory_rate ? `${vitals.respiratory_rate}/min` : '—'],
+                  ['Weight', vitals.weight_kg ? `${vitals.weight_kg} kg` : '—'],
+                  ['Height', vitals.height_cm ? `${vitals.height_cm} cm` : '—'],
+                  ['BMI', vitals.bmi || '—'],
+                  ['BP', vitals.bp_systolic ? `${vitals.bp_systolic}/${vitals.bp_diastolic} mmHg` : '—'],
+                  ['Pulse', vitals.pulse_bpm ? `${vitals.pulse_bpm} bpm` : '—'],
+                  ['Temp', vitals.temperature_c ? `${vitals.temperature_c}°C` : '—'],
+                  ['SpO2', vitals.oxygen_sat ? `${vitals.oxygen_sat}%` : '—'],
+                  ['RR', vitals.respiratory_rate ? `${vitals.respiratory_rate}/min` : '—'],
                   [' Sugar', vitals.blood_sugar ? `${vitals.blood_sugar} mmol/L` : '—'],
                 ].map(([label, val]) => (
                   <div key={label} style={{ background: accentBg, borderRadius: 10, padding: '12px', textAlign: 'center', border: `1px solid ${accentColor}20` }}>
@@ -1384,7 +1476,6 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
           <div>
             {thisVisitLabs.length === 0 ? (
               <div style={{ textAlign: 'center', padding: '30px', color: '#999' }}>
-                <div style={{ fontSize: 28 }}>🔬</div>
                 <div style={{ marginTop: 8, fontSize: 13 }}>No lab tests for this visit yet</div>
               </div>
             ) : (
@@ -1407,7 +1498,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
                       </div>
                     ) : (
                       <div style={{ fontSize: 13, color: '#aaa', fontStyle: 'italic' }}>
-                        {lab.status === 'In Progress' ? '🔄 Processing...' : '⏳ Awaiting processing'}
+                        {lab.status === 'In Progress' ? 'Processing...' : 'Awaiting processing'}
                       </div>
                     )}
                   </div>
@@ -1422,7 +1513,6 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
           <div>
             {patientConsults.length === 0 ? (
               <div style={{ textAlign: 'center', padding: '30px', color: '#999' }}>
-                <div style={{ fontSize: 28 }}>📁</div>
                 <div style={{ marginTop: 8, fontSize: 13 }}>No previous consultations found</div>
               </div>
             ) : (
@@ -1453,7 +1543,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
             {completedLabs.length > 0 && (
               <div style={{ background: `linear-gradient(135deg, ${accentBg}, #f0f8ff)`, border: `1.5px solid ${accentColor}40`, borderRadius: 10, padding: '10px 14px', marginBottom: 14, display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}
                 onClick={() => setTab('labs')}>
-                <span style={{ fontSize: 18 }}>🔬</span>
+                <span style={{ fontSize: 18 }}></span>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontWeight: 700, fontSize: 13, color: accentColor }}>Lab Results Ready — {completedLabs.length} test(s) completed</div>
                   <div style={{ fontSize: 11, color: '#555', marginTop: 1 }}>{completedLabs.map(l => l.test_type).join(', ')}</div>
@@ -1463,7 +1553,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
             )}
             {pendingLabs.length > 0 && (
               <div style={{ background: '#FFF3DC', border: '1px solid #FAC775', borderRadius: 10, padding: '8px 12px', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span style={{ fontSize: 14 }}>⏳</span>
+                <span style={{ fontSize: 14 }}></span>
                 <div style={{ fontSize: 12, color: '#C07000', fontWeight: 600 }}>{pendingLabs.length} lab test(s) still pending: {pendingLabs.map(l => l.test_type).join(', ')}</div>
               </div>
             )}
@@ -1472,7 +1562,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
             {(visit.assigned_doctor_name || visit.doctor_notes || visit.chief_complaint) && (
               <div style={{ background: '#F0F4FF', border: '1.5px solid #C7D7FD', borderRadius: 12, padding: '14px 16px', marginBottom: 16 }}>
                 <div style={{ fontWeight: 700, fontSize: 12, color: '#3B4FD8', textTransform: 'uppercase', letterSpacing: '0.6px', marginBottom: 10 }}>
-                  📋 Referral from Consultant
+                  Referral from Consultant
                 </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
                   {visit.assigned_doctor_name && (
@@ -1491,7 +1581,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
                 {visit.chief_complaint && (
                   <div style={{ marginTop: 8, background: '#fff', borderRadius: 8, padding: '8px 12px', border: '1px solid #E0E7FF' }}>
                     <div style={{ fontSize: 11, color: '#9CA3AF', textTransform: 'uppercase', letterSpacing: '.4px', marginBottom: 2 }}>Chief Complaint</div>
-                    <div style={{ fontSize: 13, color: '#111' }}>💬 {visit.chief_complaint}</div>
+                    <div style={{ fontSize: 13, color: '#111' }}>{visit.chief_complaint}</div>
                   </div>
                 )}
                 {visit.doctor_notes && (
@@ -1530,6 +1620,12 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
               <label style={lbl}>Examination Findings</label>
               <textarea style={{ ...inp, height: 70, resize: 'vertical' }} placeholder="Specialist examination findings specific to this department..." value={form.examination_findings} onChange={e => setForm({ ...form, examination_findings: e.target.value })} />
             </div>
+            {hospitalId && visit.patient_id && (
+              <div style={{ marginBottom: 12 }}>
+                <SpecialtyAssessment hospitalId={hospitalId} patientId={visit.patient_id} visitId={visit.id} speciality={form.speciality || department} doctorName={form.doctor_name}
+                  onInsertSummary={(text) => setForm((f) => ({ ...f, examination_findings: [f.examination_findings, text].filter(Boolean).join('\n\n') }))} />
+              </div>
+            )}
 
             {/* Diagnosis */}
             <div style={slbl}>Diagnosis</div>
@@ -1611,7 +1707,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
             {config.canOrderLab !== false && (
               <>
                 <div style={{ ...slbl, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span>🔬 Lab / Imaging Orders</span>
+                  <span>Lab / Imaging Orders</span>
                   <button onClick={() => setShowLab(!showLab)} style={{ fontSize: 12, padding: '3px 10px', border: `1px solid ${accentColor}`, borderRadius: 6, background: '#fff', color: accentColor, cursor: 'pointer', fontWeight: 600 }}>
                     {showLab ? '− Hide' : '+ Order Tests'}
                   </button>
@@ -1619,7 +1715,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
                 {showLab && (
                   <div style={{ marginBottom: 14 }}>
                     <div style={{ background: '#E3F0FB', border: '1px solid #93C5FD', borderRadius: 8, padding: '8px 12px', fontSize: 12, color: '#1e40af', marginBottom: 10 }}>
-                      💡 Lab results ordered from this department will return to this department's queue — not just OPD.
+                      Lab results ordered from this department will return to this department's queue — not just OPD.
                     </div>
                     {labOrders.map((lab, i) => (
                       <div key={i} style={{ background: '#f9fafb', borderRadius: 8, padding: 12, border: '1px solid #eee', marginBottom: 8 }}>
@@ -1662,36 +1758,35 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
             )}
 
             {/* Disposition */}
+            <div style={slbl}>Services done today (billed to the cashier)</div>
+            <div style={{ marginBottom: 14 }}><ServicePicker services={deptServices} picked={pickedServices} onChange={setPickedServices} /></div>
+
             <div style={slbl}>Disposition *</div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8, marginBottom: 14 }}>
+            <div role="group" aria-label="Disposition" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 8, marginBottom: 14 }}>
               {DEPT_DISPOSITIONS.map(d => (
-                <div key={d} onClick={() => {
+                <button key={d} type="button" aria-pressed={form.disposition === d} onClick={() => {
                   setForm({ ...form, disposition: d })
                   if (d.includes('Lab')) setShowLab(true)
                   if (d.includes('Pharmacy') || d.includes('Admit')) setShowRx(true)
                 }} style={{
-                  display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4,
-                  padding: '10px 6px', borderRadius: 10, cursor: 'pointer', textAlign: 'center',
-                  border: form.disposition === d ? `2px solid ${accentColor}` : '2px solid #eee',
-                  background: form.disposition === d ? accentBg : '#fafafa',
-                  fontSize: 12, fontWeight: 500,
+                  padding: '10px 8px', borderRadius: 8, cursor: 'pointer', textAlign: 'center', fontFamily: 'inherit',
+                  border: form.disposition === d ? '2px solid #0F6E56' : '1px solid #D0D5DD',
+                  background: form.disposition === d ? '#E6F4EE' : '#fff',
+                  color: '#101828', fontSize: 13, fontWeight: form.disposition === d ? 800 : 600,
                 }}>
-                  <span style={{ fontSize: 15 }}>
-                    {d.includes('Home') ? '🏠' : d.includes('Admit') ? '' : d.includes('Refer') ? '↗' : d.includes('Lab') ? '🔬' : d.includes('Pharmacy') ? '' : '🚨'}
-                  </span>
                   {d}
-                </div>
+                </button>
               ))}
             </div>
 
             {/* Referral details */}
             {form.disposition === 'Refer to Specialist' && (
-              <div style={{ background: '#F0EAFC', border: '1.5px solid #C4B5FD', borderRadius: 12, padding: 14, marginBottom: 14 }}>
-                <div style={{ fontWeight: 700, fontSize: 13, color: '#7B5EA7', marginBottom: 10 }}>↗ Referral Details</div>
+              <div style={{ background: '#EAF5EF', border: '1.5px solid #B4E5D0', borderRadius: 12, padding: 14, marginBottom: 14 }}>
+                <div style={{ fontWeight: 700, fontSize: 13, color: '#7B5EA7', marginBottom: 10 }}>Referral Details</div>
                 <div style={g2}>
                   <div style={fg}>
-                    <label style={lbl}>Refer to Department *</label>
-                    <select style={{ ...inp, borderColor: '#C4B5FD' }} value={form.refer_department}
+                    <label style={lbl} htmlFor="dept-refer-department">Refer to Department *</label>
+                    <select id="dept-refer-department" style={{ ...inp, borderColor: '#B4E5D0' }} value={form.refer_department}
                       onChange={e => setForm({ ...form, refer_department: e.target.value })}>
                       <option value="">-- Select Department --</option>
                       {referralGroups.map(group => (
@@ -1703,7 +1798,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
                   </div>
                   <div style={fg}>
                     <label style={lbl}>Ward / Unit (optional)</label>
-                    <select style={{ ...inp, borderColor: '#C4B5FD' }} value={referWard} onChange={e => setReferWard(e.target.value)}>
+                    <select style={{ ...inp, borderColor: '#B4E5D0' }} value={referWard} onChange={e => setReferWard(e.target.value)}>
                       <option value="">-- Select Ward --</option>
                       {wardsList.length > 0
                         ? wardsList.map(w => <option key={w.id} value={w.name}>{w.name}{w.ward_type ? ` (${w.ward_type})` : ''}</option>)
@@ -1714,16 +1809,26 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
                 </div>
                 <div style={fg}>
                   <label style={lbl}>Attention / Specialist Name (optional)</label>
-                  <input style={{ ...inp, borderColor: '#C4B5FD' }} placeholder="e.g. Dr. Otieno — Neurology"
+                  <input style={{ ...inp, borderColor: '#B4E5D0' }} placeholder="e.g. Dr. Otieno — Neurology"
                     value={form.refer_to} onChange={e => setForm({ ...form, refer_to: e.target.value })} />
                   {form.refer_department && <div style={{ fontSize: 11, color: '#7B5EA7', marginTop: 4 }}>Patient will appear in the {form.refer_department} department queue.</div>}
                 </div>
               </div>
             )}
 
-            <div style={fg}>
-              <label style={lbl}>Follow-up Date (if applicable)</label>
-              <input style={inp} type="date" value={form.follow_up_date} onChange={e => setForm({ ...form, follow_up_date: e.target.value })} />
+            <div style={{ ...fg, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, alignItems: 'end' }}>
+              <div>
+                <label style={lbl} htmlFor="dept-followup-date">Follow-up date (if needed)</label>
+                <input id="dept-followup-date" style={inp} type="date" value={form.follow_up_date} onChange={e => setForm({ ...form, follow_up_date: e.target.value })} />
+              </div>
+              <div>
+                <label style={lbl} htmlFor="dept-followup-time">Time</label>
+                <input id="dept-followup-time" style={inp} type="time" value={form.follow_up_time} disabled={!form.follow_up_date} onChange={e => setForm({ ...form, follow_up_time: e.target.value })} />
+              </div>
+              <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, fontWeight: 600, color: '#101828', paddingBottom: 9 }}>
+                <input type="checkbox" checked={form.book_follow_up} disabled={!form.follow_up_date} onChange={e => setForm({ ...form, book_follow_up: e.target.checked })} />
+                Book it in the {department} clinic diary
+              </label>
             </div>
 
             <div style={{ display: 'flex', gap: 10, marginTop: 6 }}>
@@ -1731,7 +1836,7 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
                 onClick={() => onComplete?.()}>Cancel</button>
               <button style={{ flex: 1, padding: '10px 20px', border: 'none', borderRadius: 8, background: accentColor, color: '#fff', cursor: 'pointer', fontSize: 14, fontWeight: 600 }}
                 onClick={handleSave} disabled={saving || !canWriteDiagnosis}>
-                {saving ? 'Saving...' : `${config.icon || '🩺'} Complete Specialist Consultation`}
+                {saving ? 'Saving…' : 'Complete specialist consultation'}
               </button>
             </div>
           </div>
@@ -1745,8 +1850,15 @@ function SpecialistConsultationPanel({ visit, hospitalId, department, config, re
 // MAIN COMPONENT
 // ─────────────────────────────────────────────────────────────
 export default function DepartmentDetail({ department, onBack }) {
-  const { hospitalId, userRole, departments: configuredDepartments = [], refreshDepartments } = useHospital()
+  const { hospitalId, hospitalName, userRole, departments: configuredDepartments = [], refreshDepartments, navigate } = useHospital()
+  const location = useLocation()
+  const routerNavigate = useNavigate()
   const normalizedDepartment = normalizeDepartment(department)
+  // appointments and other records may use any spelling of the department name
+  const matchesDepartment = useCallback((name) => Boolean(name) && normalizeDepartment(name) === normalizedDepartment, [normalizedDepartment])
+  const moduleLinks = DEPARTMENT_WORKFLOW_LINKS[normalizedDepartment] || []
+  const requestedModule = new URLSearchParams(location.search).get('module')
+  const workflowModule = requestedModule ? HOSPITAL_WORKFLOW_MODULES[requestedModule] : null
   const [, setDepartmentConfig] = useState(null)
   const departmentRecord = useMemo(
     () => configuredDepartments.find(dept => dept?.name === department || normalizeDepartment(dept?.name) === normalizedDepartment) || null,
@@ -1849,26 +1961,30 @@ export default function DepartmentDetail({ department, onBack }) {
 
   async function handleDeleteDepartment() {
     if (!departmentRecord) {
-      window.notifyFromLegacyAlert('This department is not stored in HR departments yet.')
+      notifyWarning('This department is not stored in HR departments yet.')
       return
     }
     if (!['Admin', 'admin'].includes(userRole || '')) {
-      window.notifyFromLegacyAlert('Only Admin users can delete departments.')
+      notifyWarning('Only Admin users can delete departments.')
       return
     }
     if (!await window.openConfirmDialog(`Delete department '${departmentRecord.name}'? This will not remove existing staff assignments.`)) return
     const { error } = await supabase.from('departments').delete().eq('hospital_id', hospitalId).eq('id', departmentRecord.id)
     if (error) {
-      window.notifyFromLegacyAlert(error.message)
+      notifyFromLegacyAlert(error.message)
       return
     }
     await refreshDepartments?.()
     onBack?.()
   }
 
+  // the loading screen only on the first load of a department: later refreshes (a booking, a referral accepted) update in place,
+  // so tabs keep what people are typing
+  const loadedFor = useRef('')
   const loadData = useCallback(async () => {
     if (!hospitalId || !department) return
-    setLoading(true)
+    const loadKey = `${hospitalId}|${normalizedDepartment}`
+    if (loadedFor.current !== loadKey) setLoading(true)
     const { dataSources } = config
     const dept = normalizedDepartment.toLowerCase()
 
@@ -1941,6 +2057,7 @@ export default function DepartmentDetail({ department, onBack }) {
       setPharmacyOrders([])
     }
 
+    loadedFor.current = `${hospitalId}|${normalizedDepartment}`
     setLoading(false)
   }, [hospitalId, department, normalizedDepartment, config])
 
@@ -1957,14 +2074,63 @@ export default function DepartmentDetail({ department, onBack }) {
     }
   }, [loadData])
 
+  // ── sections as tabs: one at a time, remembered in the address (?tab=queue) ──
+  const [counts, setCounts] = useState({})
+  const onCount = useMemo(() => Object.fromEntries(['referrals', 'results', 'inpatients', 'diary', 'duty', 'leave', 'services', 'protocols']
+    .map((k) => [k, (n) => setCounts((c) => (c[k] === n ? c : { ...c, [k]: n }))])), [])
+  const waitingNow = visits.filter(v => !['Completed', 'Discharged', 'Released', 'Closed', 'Cancelled'].includes(v.status)).length
+  const tabList = useMemo(() => (config.type === 'clinical' ? [
+    { id: 'overview', label: 'Overview' },
+    { id: 'queue', label: 'Queue', count: waitingNow },
+    { id: 'referrals', label: 'Referrals', count: counts.referrals, alert: counts.referrals > 0 },
+    { id: 'results', label: 'Results', count: counts.results, alert: counts.results > 0 },
+    { id: 'inpatients', label: 'Inpatients', count: counts.inpatients },
+    { id: 'diary', label: 'Clinic diary', count: counts.diary },
+    { id: 'roster', label: 'Duty roster', count: counts.duty },
+    { id: 'leave', label: 'Leave', count: counts.leave, alert: counts.leave > 0 },
+    { id: 'staff', label: 'Staff', count: staff.length },
+    { id: 'services', label: 'Services', count: counts.services },
+    { id: 'protocols', label: 'Protocols', count: counts.protocols, alert: counts.protocols > 0 },
+    { id: 'report', label: 'Report' },
+  ] : [
+    { id: 'overview', label: 'Overview' },
+    { id: 'work', label: config.type === 'diagnostic' ? 'Work queue' : config.type === 'pharmacy' ? 'Prescriptions' : 'Work' },
+    ...(config.type === 'diagnostic' ? [{ id: 'diary', label: 'Clinic diary', count: counts.diary }] : []),
+    { id: 'roster', label: 'Duty roster', count: counts.duty },
+    { id: 'leave', label: 'Leave', count: counts.leave, alert: counts.leave > 0 },
+    { id: 'staff', label: 'Staff', count: staff.length },
+    { id: 'protocols', label: 'Protocols', count: counts.protocols, alert: counts.protocols > 0 },
+  ]), [config.type, waitingNow, counts, staff.length])
+  const requestedTab = new URLSearchParams(location.search).get('tab')
+  const activeTab = tabList.some((t) => t.id === requestedTab) ? requestedTab : 'overview'
+  const selectTab = useCallback((id) => {
+    const params = new URLSearchParams(location.search)
+    if (id === 'overview') params.delete('tab'); else params.set('tab', id)
+    const qs = params.toString()
+    routerNavigate({ pathname: location.pathname, search: qs ? `?${qs}` : '' }, { replace: true })
+  }, [location.pathname, location.search, routerNavigate])
+  const attention = [
+    { tab: 'queue', n: waitingNow, label: waitingNow === 1 ? 'patient waiting' : 'patients waiting' },
+    { tab: 'referrals', n: counts.referrals || 0, label: 'referrals to accept', alert: true },
+    { tab: 'results', n: counts.results || 0, label: 'patients with results to review', alert: true },
+    { tab: 'leave', n: counts.leave || 0, label: 'leave requests to decide', alert: true },
+    { tab: 'diary', n: counts.diary || 0, label: 'booked in the diary today' },
+    { tab: 'protocols', n: counts.protocols || 0, label: 'protocols for you to read', alert: true },
+  ].filter((x) => x.n > 0 && tabList.some((t) => t.id === x.tab))
+
   const stats = useMemo(() => {
-    const base = [
-      { label: 'Staff assigned', value: staff.length, color: config.color },
-      { label: 'Active staff', value: staff.filter(s => s.status === 'Active').length, color: '#16A34A' },
-    ]
+    // Counts that say what is happening now; staff as "active / total" in one tile.
+    const activeStaff = staff.filter(s => s.status === 'Active').length
+    const base = [{ label: 'Staff active', value: `${activeStaff} / ${staff.length}`, sub: staff.length ? (staff.length - activeStaff ? `${staff.length - activeStaff} not active` : 'All active') : 'No staff assigned yet' }]
     if (config.type === 'clinical') {
-      base.push({ label: 'Visit queue', value: visits.length, color: '#2563EB' })
-      base.push({ label: 'Consultations', value: consultations.length, color: '#7C3AED' })
+      const today = new Date().toDateString()
+      const monthAgo = Date.now() - 30 * 86400000
+      const waiting = visits.filter(v => !['Completed', 'Discharged', 'Released', 'Closed', 'Cancelled'].includes(v.status)).length
+      base.unshift(
+        { label: 'Waiting now', value: waiting, sub: 'Patients routed here' },
+        { label: 'Seen today', value: consultations.filter(c => c.created_at && new Date(c.created_at).toDateString() === today).length, sub: 'Consultations today' },
+        { label: 'Last 30 days', value: consultations.filter(c => c.created_at && new Date(c.created_at).getTime() >= monthAgo).length, sub: 'Consultations' },
+      )
     }
     if (config.type === 'diagnostic') {
       base.push({ label: 'Pending tests', value: labOrders.filter(t => t.status !== 'Completed').length, color: '#D97706' })
@@ -1977,7 +2143,7 @@ export default function DepartmentDetail({ department, onBack }) {
     if (config.type === 'admin' && department === 'Finance & Billing') {
       const balance = invoices.reduce((s, i) => s + (Number(i.balance_kes) || 0), 0)
       base.push({ label: 'Open invoices', value: invoices.filter(i => Number(i.balance_kes) > 0).length, color: '#DC2626' })
-      base.push({ label: 'Outstanding', value: `KES ${balance.toLocaleString()}`, color: '#DC2626' })
+      base.push({ label: 'Outstanding', value: `KES ${balance.toLocaleString()}`, color: '#DC2626', alert: balance > 0 })
     }
     if (config.type === 'support' && department === 'Transport') {
       base.push({ label: 'Active requests', value: transportRequests.filter(r => r.status !== 'Completed').length, color: '#0891B2' })
@@ -2003,6 +2169,33 @@ export default function DepartmentDetail({ department, onBack }) {
     )
   }
 
+  if (workflowModule) {
+    return (
+      <div style={css.page}>
+        <div style={css.wrap}>
+          <DepartmentHeader
+            css={css}
+            config={config}
+            department={department}
+            userRole={userRole}
+            departmentRecord={departmentRecord}
+            moduleLinks={moduleLinks}
+            onOpenModule={(target) => {
+              if (HOSPITAL_WORKFLOW_MODULES[target]) {
+                routerNavigate(`/departments/${encodeURIComponent(normalizedDepartment)}?module=${target}`)
+              } else {
+                navigate?.(target)
+              }
+            }}
+            onBack={onBack}
+            onDelete={handleDeleteDepartment}
+          />
+          <HospitalWorkflowBoard config={workflowModule} />
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div style={css.page}>
       <div style={css.wrap}>
@@ -2013,174 +2206,246 @@ export default function DepartmentDetail({ department, onBack }) {
           department={department}
           userRole={userRole}
           departmentRecord={departmentRecord}
+          moduleLinks={moduleLinks}
+          onOpenModule={(target) => {
+            if (HOSPITAL_WORKFLOW_MODULES[target]) {
+              routerNavigate(`/departments/${encodeURIComponent(normalizedDepartment)}?module=${target}`)
+            } else {
+              navigate?.(target)
+            }
+          }}
           onBack={onBack}
           onDelete={handleDeleteDepartment}
         />
-
-        <DepartmentMetrics css={css} stats={stats} />
+        <DepartmentTabs tabs={tabList} active={activeTab} onChange={selectTab} />
 
         {loading ? (
-          <div style={css.card}><EmptyState icon="⏳" message="Loading department data…" /></div>
+          <div style={css.card} role="status"><EmptyState message="Loading department data…" /></div>
         ) : (
           <>
-            {/* ── CLINICAL SECTIONS ───────────────────────── */}
+            <div role="tabpanel" id="dept-panel-overview" aria-labelledby="dept-tab-overview" hidden={activeTab !== 'overview'}>
+              <DepartmentMetrics css={css} stats={stats} />
+              <SectionCard title="Needs attention">
+                {attention.length === 0 ? <EmptyState message="Nothing is waiting for this department right now." /> : (
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    {attention.map((x) => (
+                      <button key={x.tab} type="button" onClick={() => selectTab(x.tab)}
+                        style={{ ...css.backBtn, display: 'inline-flex', gap: 8, alignItems: 'center' }}>
+                        <span style={{ fontSize: 18, fontWeight: 800, color: x.alert ? '#912018' : '#101828' }}>{x.n}</span>{x.label} ›
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </SectionCard>
+              {config.type === 'clinical' && <DepartmentResources department={normalizedDepartment} navigate={navigate} css={css} />}
+            </div>
             {config.type === 'clinical' && (
               <>
-                {/* Active specialist consultation */}
-                {activeSpecialistVisit && (
-                  <SpecialistConsultationPanel
-                    visit={activeSpecialistVisit}
-                    hospitalId={hospitalId}
-                    department={normalizedDepartment}
+            <div role="tabpanel" id="dept-panel-queue" aria-labelledby="dept-tab-queue" hidden={activeTab !== 'queue'}>
+                  {/* Active specialist consultation */}
+                  {activeSpecialistVisit && (
+                    <SpecialistConsultationPanel
+                      visit={activeSpecialistVisit}
+                      hospitalId={hospitalId}
+                      department={normalizedDepartment}
+                      config={config}
+                      referralGroups={referralGroups}
+                      onComplete={() => { setActiveSpecialistVisit(null); loadData() }}
+                    />
+                  )}
+  
+                  {config.uiSections.includes('visit_queue') && (
+                    <SectionCard title="Patient queue" count={visits.length} note={visits.length ? 'Use Review patient to open the specialist consultation.' : null}>
+                      {visits.length === 0 ? (
+                        <EmptyState icon="🏥" message="No patients currently in this department's queue." />
+                      ) : (
+                        <div style={{ overflowX: 'auto' }}><table style={css.table}>
+                          <thead>
+                            <tr>
+                              <th style={css.th}>Patient</th>
+                              <th style={css.th}>Visit #</th>
+                              <th style={css.th}>Status</th>
+                              <th style={css.th}>Speciality</th>
+                              <th style={css.th}>Doctor</th>
+                              <th style={css.th}>Billing Balance</th>
+                              <th style={css.th}>Action</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {visits.map(v => {
+                              const vid = v.visit_id || v.id
+                              const inv = invoices.filter(i => i.visit_id === vid)
+                              const balance = inv.reduce((s, i) => s + (Number(i.balance_kes) || 0), 0)
+                              const isActive = activeSpecialistVisit?.id === v.id
+                              return (
+                                <tr key={v.id} style={{ background: isActive ? `${config.bg}` : 'transparent', transition: 'background 0.15s' }}>
+                                  <td style={css.td}>
+                                    <div style={{ fontWeight: 700 }}>{v.patients?.full_name || v.patient_name || '—'}</div>
+                                    <div style={{ fontSize: 12, color: '#475467', marginTop: 1 }}>
+                                      {v.patients?.age ? `${v.patients.age}y` : ''}{v.patients?.gender ? ` • ${v.patients.gender}` : ''}
+                                    </div>
+                                    {v.chief_complaint && <div style={{ fontSize: 12, color: '#344054', marginTop: 2 }}>Complaint: {v.chief_complaint}</div>}
+                                  </td>
+                                  <td style={{ ...css.td, fontFamily: 'monospace', fontSize: 12 }}>{v.visit_number || vid?.slice(0,8)}</td>
+                                  <td style={css.td}><StatusPill status={v.status} /></td>
+                                  <td style={css.td}>
+                                    <div style={{ fontWeight: 500 }}>{v.speciality || '—'}</div>
+                                    {v.assigned_doctor_name && <div style={{ fontSize: 12, color: '#475467', marginTop: 2 }}>Referred by: {v.assigned_doctor_name}</div>}
+                                    {v.doctor_notes && <div style={{ fontSize: 12, color: '#344054', marginTop: 2, fontStyle: 'italic' }}>"{v.doctor_notes}"</div>}
+                                  </td>
+                                  <td style={css.td}>{v.assigned_doctor_name || '—'}</td>
+                                  <td style={{ ...css.td, fontWeight: 700, color: balance > 0 ? '#912018' : '#101828', whiteSpace: 'nowrap' }}>KES {balance.toLocaleString()}</td>
+                                  <td style={css.td}>
+                                    <button
+                                      onClick={() => setActiveSpecialistVisit(isActive ? null : v)}
+                                      disabled={!canWriteDiagnosis}
+                                      title="Only doctors and clinical officers can open specialist consultations"
+                                      style={{
+                                        padding: '5px 12px', borderRadius: 7, border: 'none', fontSize: 12, fontWeight: 700,
+                                        background: isActive ? '#fff' : '#0F6E56',
+                                        color: isActive ? '#101828' : '#fff',
+                                        border: isActive ? '1px solid #D0D5DD' : '1px solid #0F6E56',
+                                        opacity: canWriteDiagnosis ? 1 : 0.55,
+                                        cursor: canWriteDiagnosis ? 'pointer' : 'not-allowed',
+                                      }}
+                                    >
+                                      {isActive ? 'Close' : 'Review patient'}
+                                    </button>
+                                  </td>
+                                </tr>
+                              )
+                            })}
+                          </tbody>
+                        </table></div>
+                      )}
+                    </SectionCard>
+                  )}
+  
+                    <DepartmentBeds
                     config={config}
-                    referralGroups={referralGroups}
-                    onComplete={() => { setActiveSpecialistVisit(null); loadData() }}
+                    SectionCard={SectionCard}
+                    VisitQueueSection={VisitQueueSection}
+                    visits={visits}
+                    invoices={invoices}
+                    department={department}
                   />
-                )}
-
-                {config.uiSections.includes('visit_queue') && (
-                  <SectionCard
-                    title="Patient Queue"
-                    note={`${visits.length} patient(s) routed to ${department}. Click a row to open the specialist consultation.`}
-                  >
-                    {visits.length === 0 ? (
-                      <EmptyState icon="🏥" message="No patients currently in this department's queue." />
-                    ) : (
-                      <table style={css.table}>
-                        <thead>
-                          <tr>
-                            <th style={css.th}>Patient</th>
-                            <th style={css.th}>Visit #</th>
-                            <th style={css.th}>Status</th>
-                            <th style={css.th}>Speciality</th>
-                            <th style={css.th}>Doctor</th>
-                            <th style={css.th}>Billing Balance</th>
-                            <th style={css.th}>Action</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {visits.map(v => {
-                            const vid = v.visit_id || v.id
-                            const inv = invoices.filter(i => i.visit_id === vid)
-                            const balance = inv.reduce((s, i) => s + (Number(i.balance_kes) || 0), 0)
-                            const isActive = activeSpecialistVisit?.id === v.id
-                            return (
-                              <tr key={v.id} style={{ background: isActive ? `${config.bg}` : 'transparent', transition: 'background 0.15s' }}>
-                                <td style={css.td}>
-                                  <div style={{ fontWeight: 700 }}>{v.patients?.full_name || v.patient_name || '—'}</div>
-                                  <div style={{ fontSize: 11, color: '#888', marginTop: 1 }}>
-                                    {v.patients?.age ? `${v.patients.age}y` : ''}{v.patients?.gender ? ` • ${v.patients.gender}` : ''}
-                                  </div>
-                                  {v.chief_complaint && <div style={{ fontSize: 11, color: '#555', marginTop: 2 }}>💬 {v.chief_complaint}</div>}
-                                </td>
-                                <td style={{ ...css.td, fontFamily: 'monospace', fontSize: 12 }}>{v.visit_number || vid?.slice(0,8)}</td>
-                                <td style={css.td}><StatusPill status={v.status} /></td>
-                                <td style={css.td}>
-                                  <div style={{ fontWeight: 500 }}>{v.speciality || '—'}</div>
-                                  {v.assigned_doctor_name && <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>Referred by: {v.assigned_doctor_name}</div>}
-                                  {v.doctor_notes && <div style={{ fontSize: 11, color: '#0F6E56', marginTop: 2, fontStyle: 'italic' }}>"{v.doctor_notes}"</div>}
-                                </td>
-                                <td style={css.td}>{v.assigned_doctor_name || '—'}</td>
-                                <td style={{ ...css.td, fontWeight: 600, color: balance > 0 ? '#DC2626' : '#16A34A' }}>KES {balance.toLocaleString()}</td>
-                                <td style={css.td}>
-                                  <button
-                                    onClick={() => setActiveSpecialistVisit(isActive ? null : v)}
-                                    disabled={!canWriteDiagnosis}
-                                    title="Only doctors and clinical officers can open specialist consultations"
-                                    style={{
-                                      padding: '5px 12px', borderRadius: 7, border: 'none', fontSize: 12, fontWeight: 700,
-                                      background: isActive ? '#FCEBEB' : config.color,
-                                      color: isActive ? '#A32D2D' : '#fff',
-                                      opacity: canWriteDiagnosis ? 1 : 0.55,
-                                      cursor: canWriteDiagnosis ? 'pointer' : 'not-allowed',
-                                    }}
-                                  >
-                                    {isActive ? '✕ Close' : `👁 Review Patient`}
-                                  </button>
-                                </td>
-                              </tr>
-                            )
-                          })}
-                        </tbody>
-                      </table>
-                    )}
-                  </SectionCard>
-                )}
-
-                <DepartmentBeds
-                  config={config}
-                  SectionCard={SectionCard}
-                  VisitQueueSection={VisitQueueSection}
-                  visits={visits}
-                  invoices={invoices}
-                  department={department}
-                />
-
-                {config.uiSections.includes('consultations') && (
-                  <SectionCard title="Consultation History" note="All consultation records handled by this department.">
-                    <ConsultationsSection consultations={consultations} />
-                  </SectionCard>
-                )}
+  
+              </div>
+            <div role="tabpanel" id="dept-panel-referrals" aria-labelledby="dept-tab-referrals" hidden={activeTab !== 'referrals'}>
+                <DepartmentReferrals hospitalId={hospitalId} department={normalizedDepartment} matchesDepartment={matchesDepartment} canAct={canWriteDiagnosis}
+                  author={userRole} css={css} SectionCard={SectionCard} EmptyState={EmptyState} onChanged={loadData} onCount={onCount.referrals} />
+            </div>
+            <div role="tabpanel" id="dept-panel-results" aria-labelledby="dept-tab-results" hidden={activeTab !== 'results'}>
+                <DepartmentResults hospitalId={hospitalId} visits={visits} consultations={consultations} css={css} SectionCard={SectionCard} EmptyState={EmptyState} navigate={navigate} onCount={onCount.results} />
+            </div>
+            <div role="tabpanel" id="dept-panel-inpatients" aria-labelledby="dept-tab-inpatients" hidden={activeTab !== 'inpatients'}>
+                <DepartmentInpatients hospitalId={hospitalId} department={normalizedDepartment} matchesDepartment={matchesDepartment} navigate={navigate} css={css} SectionCard={SectionCard} EmptyState={EmptyState} onCount={onCount.inpatients} />
+            </div>
+            <div role="tabpanel" id="dept-panel-diary" aria-labelledby="dept-tab-diary" hidden={activeTab !== 'diary'}>
+                <div>
+                  <DepartmentClinicDiary hospitalId={hospitalId} hospitalName={hospitalName} matchesDepartment={matchesDepartment} department={normalizedDepartment} staff={staff} userRole={userRole} navigate={navigate} css={css} SectionCard={SectionCard} EmptyState={EmptyState} onCount={onCount.diary} />
+                  {config.uiSections.includes('consultations') && (
+                    <SectionCard title="Recent consultations" count={consultations.length}>
+                      <div style={{ overflowX: 'auto' }}><ConsultationsSection consultations={consultations} /></div>
+                    </SectionCard>
+                  )}
+                </div>
+            </div>
+            <div role="tabpanel" id="dept-panel-services" aria-labelledby="dept-tab-services" hidden={activeTab !== 'services'}>
+                <DepartmentServices hospitalId={hospitalId} department={normalizedDepartment} isAdmin={resolveRole(userRole) === 'Admin'} navigate={navigate} css={css} SectionCard={SectionCard} EmptyState={EmptyState} onCount={onCount.services} />
+            </div>
+            <div role="tabpanel" id="dept-panel-report" aria-labelledby="dept-tab-report" hidden={activeTab !== 'report'}>
+                <DepartmentReport hospitalId={hospitalId} hospitalName={hospitalName} department={normalizedDepartment} matchesDepartment={matchesDepartment} css={css} SectionCard={SectionCard} />
+            </div>
               </>
             )}
-
-            {/* ── DIAGNOSTIC SECTIONS ─────────────────────── */}
+            {config.type !== 'clinical' && (
+            <div role="tabpanel" id="dept-panel-work" aria-labelledby="dept-tab-work" hidden={activeTab !== 'work'}>
+                {/* ── DIAGNOSTIC SECTIONS ─────────────────────── */}
+                {config.type === 'diagnostic' && (
+                  <>
+                    <SectionCard
+                      title={department === 'Radiology & Imaging' ? 'Imaging Queue' : 'Lab Test Queue'}
+                      note="Requests from doctors that need to be processed and results posted."
+                    >
+                      <LabQueueSection labOrders={labOrders.filter(t => t.status !== 'Completed')} label={department === 'Radiology & Imaging' ? 'Imaging' : 'Lab'} />
+                    </SectionCard>
+                    <SectionCard title="Completed Tests" note="Tests with results already posted.">
+                      <LabQueueSection labOrders={labOrders.filter(t => t.status === 'Completed')} label="Completed" />
+                    </SectionCard>
+                  </>
+                )}
+    
+                {/* ── PHARMACY SECTIONS ───────────────────────── */}
+                {config.type === 'pharmacy' && (
+                  <>
+                    <SectionCard title="Prescription Queue" note="Prescriptions sent to pharmacy awaiting dispensing.">
+                      <PharmacySection orders={pharmacyOrders.filter(r => r.status !== 'Released')} />
+                    </SectionCard>
+                    <SectionCard title="Dispensed Today" note="Prescriptions already released to patients.">
+                      <PharmacySection orders={pharmacyOrders.filter(r => r.status === 'Released')} />
+                    </SectionCard>
+                  </>
+                )}
+    
+                {/* ── FINANCE SECTIONS ────────────────────────── */}
+                {config.type === 'admin' && department === 'Finance & Billing' && (
+                  <SectionCard title="Billing Overview" note="Invoice and payment summary across the hospital.">
+                    <BillingSummarySection invoices={invoices} />
+                  </SectionCard>
+                )}
+    
+                {/* ── SUPPORT DEPARTMENTS: service desk (requests, checklists, registers, log books) ── */}
+                {normalizedDepartment === 'Medical Records' && <RecordsDesk hospitalId={hospitalId} />}
+                {normalizedDepartment === 'Security' && <VisitorPasses hospitalId={hospitalId} />}
+                {SUPPORT_DEPARTMENTS[normalizedDepartment] && (!SUPPORT_DEPARTMENTS[normalizedDepartment].adminOnly || resolveRole(userRole) === 'Admin') && (
+                  <SupportDesk department={normalizedDepartment} hospitalId={hospitalId} />
+                )}
+    
+                {/* ── TRANSPORT SECTIONS ──────────────────────── */}
+                {config.type === 'support' && department === 'Transport' && (
+                  <SectionCard title="Earlier transport requests" note="Requests from before the Transport desk (read-only).">
+                    <TransportSection requests={transportRequests} />
+                  </SectionCard>
+                )}
+    
+                {/* ── KITCHEN SECTIONS ────────────────────────── */}
+                {config.type === 'support' && department === 'Kitchen / Catering' && (
+                  <SectionCard title="Meal orders (list)" note="Patient meal orders from wards and admissions. The production plan above groups them by meal and diet.">
+                    <MealOrdersSection orders={mealOrders} />
+                  </SectionCard>
+                )}
+    
+                {/* ── HOUSEKEEPING SECTIONS ───────────────────── */}
+                {config.type === 'support' && department === 'Housekeeping' && (
+                  <SectionCard title="Earlier cleaning tasks" note="Tasks from before the Housekeeping desk (read-only).">
+                    <CleaningTasksSection tasks={cleaningTasks} />
+                  </SectionCard>
+                )}
+    
+                {/* ── STAFF SECTION (all departments) ─────────── */}
+                </div>
+            )}
             {config.type === 'diagnostic' && (
-              <>
-                <SectionCard
-                  title={department === 'Radiology & Imaging' ? 'Imaging Queue' : 'Lab Test Queue'}
-                  note="Requests from doctors that need to be processed and results posted."
-                >
-                  <LabQueueSection labOrders={labOrders.filter(t => t.status !== 'Completed')} label={department === 'Radiology & Imaging' ? 'Imaging' : 'Lab'} />
-                </SectionCard>
-                <SectionCard title="Completed Tests" note="Tests with results already posted.">
-                  <LabQueueSection labOrders={labOrders.filter(t => t.status === 'Completed')} label="Completed" />
-                </SectionCard>
-              </>
+            <div role="tabpanel" id="dept-panel-diary" aria-labelledby="dept-tab-diary" hidden={activeTab !== 'diary'}>
+              <DepartmentClinicDiary hospitalId={hospitalId} hospitalName={hospitalName} matchesDepartment={matchesDepartment} department={normalizedDepartment} staff={staff} userRole={userRole} navigate={navigate} css={css} SectionCard={SectionCard} EmptyState={EmptyState} onCount={onCount.diary} />
+            </div>
             )}
-
-            {/* ── PHARMACY SECTIONS ───────────────────────── */}
-            {config.type === 'pharmacy' && (
-              <>
-                <SectionCard title="Prescription Queue" note="Prescriptions sent to pharmacy awaiting dispensing.">
-                  <PharmacySection orders={pharmacyOrders.filter(r => r.status !== 'Released')} />
-                </SectionCard>
-                <SectionCard title="Dispensed Today" note="Prescriptions already released to patients.">
-                  <PharmacySection orders={pharmacyOrders.filter(r => r.status === 'Released')} />
-                </SectionCard>
-              </>
-            )}
-
-            {/* ── FINANCE SECTIONS ────────────────────────── */}
-            {config.type === 'admin' && department === 'Finance & Billing' && (
-              <SectionCard title="Billing Overview" note="Invoice and payment summary across the hospital.">
-                <BillingSummarySection invoices={invoices} />
-              </SectionCard>
-            )}
-
-            {/* ── TRANSPORT SECTIONS ──────────────────────── */}
-            {config.type === 'support' && department === 'Transport' && (
-              <SectionCard title="Transport Requests" note="Patient transfers and ambulance dispatch requests.">
-                <TransportSection requests={transportRequests} />
-              </SectionCard>
-            )}
-
-            {/* ── KITCHEN SECTIONS ────────────────────────── */}
-            {config.type === 'support' && department === 'Kitchen / Catering' && (
-              <SectionCard title="Meal Orders" note="Today's patient meal orders from wards and admissions.">
-                <MealOrdersSection orders={mealOrders} />
-              </SectionCard>
-            )}
-
-            {/* ── HOUSEKEEPING SECTIONS ───────────────────── */}
-            {config.type === 'support' && department === 'Housekeeping' && (
-              <SectionCard title="Cleaning Tasks" note="Ward and room cleaning assignments for today.">
-                <CleaningTasksSection tasks={cleaningTasks} />
-              </SectionCard>
-            )}
-
-            {/* ── STAFF SECTION (all departments) ─────────── */}
-            <DepartmentStaff config={config} SectionCard={SectionCard} StaffSection={StaffSection} staff={staff} />
+            <div role="tabpanel" id="dept-panel-protocols" aria-labelledby="dept-tab-protocols" hidden={activeTab !== 'protocols'}>
+              <DepartmentProtocols hospitalId={hospitalId} department={normalizedDepartment} staff={staff} css={css} SectionCard={SectionCard} EmptyState={EmptyState} onCount={onCount.protocols} />
+            </div>
+            <div role="tabpanel" id="dept-panel-roster" aria-labelledby="dept-tab-roster" hidden={activeTab !== 'roster'}>
+              <DepartmentDuty hospitalId={hospitalId} staff={staff} matchesDepartment={matchesDepartment} navigate={navigate} css={css} SectionCard={SectionCard} EmptyState={EmptyState} onCount={onCount.duty} />
+              <div id="dept-roster-grid" style={{ scrollMarginTop: 12 }} />
+              <DepartmentRoster hospitalId={hospitalId} department={normalizedDepartment} staff={staff} matchesDepartment={matchesDepartment} css={css} SectionCard={SectionCard} EmptyState={EmptyState} />
+            </div>
+            <div role="tabpanel" id="dept-panel-leave" aria-labelledby="dept-tab-leave" hidden={activeTab !== 'leave'}>
+              <DepartmentMyLeave hospitalId={hospitalId} department={normalizedDepartment} css={css} SectionCard={SectionCard} EmptyState={EmptyState} />
+              <DepartmentLeave hospitalId={hospitalId} department={normalizedDepartment} staff={staff} css={css} SectionCard={SectionCard} EmptyState={EmptyState} onCount={onCount.leave} />
+            </div>
+            <div role="tabpanel" id="dept-panel-staff" aria-labelledby="dept-tab-staff" hidden={activeTab !== 'staff'}>
+              <DepartmentStaff config={config} SectionCard={SectionCard} StaffSection={StaffSection} staff={staff} />
+            </div>
           </>
         )}
       </div>

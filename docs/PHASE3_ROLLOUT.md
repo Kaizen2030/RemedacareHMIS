@@ -1,6 +1,6 @@
 # Phase 3 Rollout Readiness
 
-Phase 3 turns Brightpath Travel Scholars from a feature-rich HMS into a go-live-ready hospital platform.
+Phase 3 turns RemedacareHMS from a feature-rich HMS into a go-live-ready hospital platform.
 
 ## Objectives
 
@@ -88,7 +88,7 @@ Phase 3 turns Brightpath Travel Scholars from a feature-rich HMS into a go-live-
 
 Phase 3 is considered complete when:
 
-- the pilot site runs daily operations using Brightpath Travel Scholars
+- the pilot site runs daily operations using RemedacareHMS
 - support issues are documented and resolved through the support log
 - backup export is validated
 - no major screen breaks under realistic data volume

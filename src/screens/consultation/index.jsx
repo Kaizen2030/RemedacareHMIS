@@ -29,16 +29,21 @@ import { inferChronicConditionHint } from '../../utils/chronicDisease'
 import ConsultationForm from './ConsultationForm'
 import ConsultationLabResults from './ConsultationLabResults'
 import ConsultationQueue from './ConsultationQueue'
+import { isSelfPayMethod, unpaidInvoiceFields } from '../../utils/payments/invoices'
+import { alertsByRow, loadHospitalInteractions, runCds } from '../../utils/cds'
+import { notifyError, notifySuccess, notifyWarning } from '../../notifications'
+import usePatientAccessLog from '../../hooks/useAccessLog'
+import { priceForPayer } from '../../utils/hospitalConfig'
 
 const DISPOSITIONS = ['OPD - Send Home', 'Admit - Inpatient', 'Refer to Specialist', 'Send to Lab', 'Send to Pharmacy', 'Emergency Admit']
-const SPECIALITIES = ['General Medicine','Paediatrics','Obstetrics & Gynaecology','Surgery','Orthopaedics','Ophthalmology','ENT','Dermatology','Cardiology','Neurology','Psychiatry','Oncology','Urology','Dental','Emergency','Mental Health & Psychiatry','Eye Clinic','Physiotherapy','Nutrition & Dietetics','Community Health','ICU / HDU','Theatre / Surgery','Inpatient / Wards','Maternity','Laboratory','Radiology & Imaging','Pharmacy']
+const SPECIALITIES = ['General Medicine','Paediatrics','Obstetrics & Gynaecology','Surgery','Orthopaedics','ENT','Dermatology','Cardiology','Neurology','Oncology','Urology','Dental','Emergency','Mental Health & Psychiatry','Eye Clinic','Physiotherapy','Nutrition & Dietetics','Community Health','ICU / HDU','Theatre / Surgery','Inpatient / Wards','Maternity','Laboratory','Radiology & Imaging','Pharmacy']
 const CONSULTATION_LOCAL_DRAFT_PREFIX = 'remedacare:consultation-draft:'
 
 // Clinical departments available for specialist referral — grouped by type
 const REFERRAL_DEPARTMENTS = [
   { group: 'General & Emergency', options: ['General Medicine', 'OPD / Outpatient', 'Emergency'] },
-  { group: 'Medical Specialties', options: ['Cardiology', 'Neurology', 'Dermatology', 'Psychiatry', 'Mental Health & Psychiatry', 'Oncology', 'Urology', 'Paediatrics'] },
-  { group: 'Surgical Specialties', options: ['Surgery', 'Orthopaedics', 'ENT', 'Ophthalmology', 'Eye Clinic', 'Theatre / Surgery'] },
+  { group: 'Medical Specialties', options: ['Cardiology', 'Neurology', 'Dermatology', 'Mental Health & Psychiatry', 'Oncology', 'Urology', 'Paediatrics'] },
+  { group: 'Surgical Specialties', options: ['Surgery', 'Orthopaedics', 'ENT', 'Eye Clinic', 'Theatre / Surgery'] },
   { group: 'Women & Children', options: ['Obstetrics & Gynaecology', 'Maternity', 'Paediatrics'] },
   { group: 'Allied Health', options: ['Physiotherapy', 'Nutrition & Dietetics', 'Community Health', 'Dental'] },
   { group: 'Diagnostic', options: ['Laboratory', 'Radiology & Imaging'] },
@@ -218,7 +223,7 @@ const canAcknowledgeDangerAlerts = canPerformAction(userRole, 'override_cds_aler
 
  const openChronicDiseaseFromConsultation = () => {
   if (!selected?.patient_id) {
-   window.notifyFromLegacyAlert('Select a consultation patient first.')
+   notifyWarning('Select a consultation patient first.')
    return
   }
 
@@ -258,7 +263,7 @@ const canAcknowledgeDangerAlerts = canPerformAction(userRole, 'override_cds_aler
 
  const openCarePathwayFromConsultation = () => {
   if (!selected?.patient_id) {
-   window.notifyFromLegacyAlert('Select a consultation patient first.')
+   notifyWarning('Select a consultation patient first.')
    return
   }
 
@@ -268,6 +273,8 @@ const canAcknowledgeDangerAlerts = canPerformAction(userRole, 'override_cds_aler
    patientName: selected?.patients?.full_name || '',
    visitId: selected?.id || null,
    suggestedProtocol: inferCarePathwayProtocol(),
+   // free text lets Care Pathways match any pathway (including ones the hospital wrote) by its diagnosis words
+   diagnosisText: [form.diagnosis, form.icd10_description, form.assessment_notes, selected?.chief_complaint].filter(Boolean).join(' ').slice(0, 1000),
    suggestedCondition: inferChronicConditionHint(
     selected?.patients?.chronic_conditions,
     form.diagnosis,
@@ -280,7 +287,7 @@ const canAcknowledgeDangerAlerts = canPerformAction(userRole, 'override_cds_aler
 
  const openReferralFromConsultation = () => {
   if (!selected?.patient_id) {
-   window.notifyFromLegacyAlert('Select a consultation patient first.')
+   notifyWarning('Select a consultation patient first.')
    return
   }
 
@@ -319,12 +326,13 @@ const canAcknowledgeDangerAlerts = canPerformAction(userRole, 'override_cds_aler
     }
     row.amr_override_reason = ''
     row.cds_acknowledged = false
+    row.cds_override_reason = ''
    }
 
    if (['dosage', 'frequency', 'duration', 'prn'].includes(key) && !String(row.patient_instructions || '').trim()) {
     row.patient_instructions = buildBilingualInstruction(row)
    }
-   if (key === 'dosage') row.cds_acknowledged = false
+   if (key === 'dosage' || key === 'frequency') row.cds_acknowledged = false
 
    next[index] = row
    return next
@@ -367,6 +375,14 @@ const handleRemovePrescriptionRow = index => {
 
  const handleAddPrescriptionRow = () => {
   setRxList(prev => [...prev, createPrescriptionRow()])
+ }
+
+ // Decision support: acknowledgement + written reason for 'danger' alerts (saved to cds_overrides and the audit log).
+ const handleCdsAcknowledge = (index, checked) => {
+  setRxList(prev => prev.map((row, currentIndex) => (currentIndex === index ? { ...row, cds_acknowledged: checked } : row)))
+ }
+ const handleCdsReasonChange = (index, value) => {
+  setRxList(prev => prev.map((row, currentIndex) => (currentIndex === index ? { ...row, cds_override_reason: value } : row)))
  }
 
  const handleOverrideReasonChange = (index, value) => {
@@ -541,7 +557,7 @@ async function selectVisit(visit) {
     if (draftParsed.showRadiologyOrders !== undefined) setShowRadiologyOrders(draftParsed.showRadiologyOrders)
     if (draftParsed.tab) setTab(draftParsed.tab)
     setLastLocalDraftAt(effectiveDraft.saved_at || null)
-    window.notifyFromLegacyAlert('Draft loaded from ' + new Date(effectiveDraft.saved_at).toLocaleString())
+    notifySuccess('Draft loaded from ' + new Date(effectiveDraft.saved_at).toLocaleString())
    } catch (e) {
     console.error('Error loading draft:', e)
    }
@@ -701,7 +717,7 @@ async function selectVisit(visit) {
   setTab('consult')
 
   if (pathwayState.protocolName) {
-   window.notifyFromLegacyAlert(`${pathwayState.protocolName} suggestions loaded into consultation.`)
+   notifySuccess(`${pathwayState.protocolName} suggestions loaded into consultation.`)
   }
  }
 
@@ -755,7 +771,7 @@ async function selectVisit(visit) {
    if (!['Doctor', 'OPD'].includes(blockedVisit.status || '')) {
     const patientName = blockedVisit.patients?.full_name || 'This patient'
     const visitLabel = blockedVisit.visit_number ? ` (${blockedVisit.visit_number})` : ''
-   window.notifyFromLegacyAlert(`${patientName}${visitLabel} is still in ${blockedVisit.status || 'workflow'}. Complete that step before consultation.`)
+   notifyWarning(`${patientName}${visitLabel} is still in ${blockedVisit.status || 'workflow'}. Complete that step before consultation.`)
    }
    clearNavigationState?.()
   }
@@ -905,15 +921,20 @@ async function selectVisit(visit) {
     .maybeSingle()
 
    // Use admission_fee if reception already collected it, otherwise use price list
+   // Payer price list (SHA / insurer / corporate) overrides the base tariff when one is set in Settings
+   const payerPrice = await priceForPayer(supabase, hospitalId, chargeCode, cc?.unit_price_kes || 500, {
+    paymentMethod: visit.admission_payment_method,
+    insurer: visit.patients?.insurer_name || visit.patients?.insurance,
+   })
    const amount = visit.admission_fee
     ? Number(visit.admission_fee)
-    : (cc?.unit_price_kes || 500)
+    : payerPrice.amount
 
    const paymentMethod = visit.admission_payment_method || 'Cash'
-   const NON_INSURANCE = ['Cash', 'M-Pesa']
-   const alreadyPaid = visit.admission_fee ? Number(visit.admission_fee) : 0
-   const balance = Math.max(0, amount - alreadyPaid)
-   const status = balance <= 0 && amount > 0 ? 'Paid' : alreadyPaid > 0 ? 'Partial' : 'Pending'
+   // Bills start unpaid. Money taken at reception is recorded against the registration invoice by
+   // the payment window; never assume a visit fee was paid just because one was entered.
+   const unpaid = unpaidInvoiceFields(amount)
+   const status = unpaid.status
    const serviceLabel = cc?.name || (form.speciality ? `${form.speciality} Consultation` : 'OPD Consultation')
 
    const serviceLine = createServiceLine({
@@ -934,11 +955,9 @@ async function selectVisit(visit) {
     visit_id: visit.id,
     invoice_no: `INV-${Date.now().toString().slice(-6)}`,
     services: stringifyServiceLines([serviceLine]),
-    amount_kes: amount,
-    paid_kes: alreadyPaid,
-    balance_kes: balance,
+    ...unpaid,
     payment_method: paymentMethod,
-    insurer: !NON_INSURANCE.includes(paymentMethod) ? paymentMethod : null,
+    insurer: !isSelfPayMethod(paymentMethod) ? paymentMethod : null,
     sha_member_no: visit.sha_member_no || null,
     status,
     notes: buildWorkflowInvoiceNote({
@@ -947,7 +966,6 @@ async function selectVisit(visit) {
      visitId: visit.id,
      summary: serviceLabel,
     }),
-    paid_at: status === 'Paid' ? new Date().toISOString() : null,
    })
 
    if (invErr) {
@@ -971,16 +989,16 @@ async function handleSave() {
   const diagnosisRows = (form.diagnoses || []).filter(item => String(item?.description || '').trim())
   const primaryDiagnosis = diagnosisRows[0] || null
   const primaryDiagnosisText = primaryDiagnosis?.description || form.diagnosis
-  if (!primaryDiagnosisText) { window.notifyFromLegacyAlert('Diagnosis is required.'); return }
-  if (!form.disposition) { window.notifyFromLegacyAlert('Select a disposition.'); return }
-  if (!form.doctor_name) { window.notifyFromLegacyAlert('Enter doctor name.'); return }
+  if (!primaryDiagnosisText) { notifyWarning('Diagnosis is required.'); return }
+  if (!form.disposition) { notifyWarning('Select a disposition.'); return }
+  if (!form.doctor_name) { notifyWarning('Enter doctor name.'); return }
   if (showPregnancyPrompt && !form.pregnancy_status) {
-   window.notifyFromLegacyAlert('Record pregnancy status for female patients aged 15-49.')
+   notifyWarning('Record pregnancy status for female patients aged 15-49.')
    return
   }
   const isPharmacy = form.disposition.includes('Pharmacy')
   if (form.disposition.includes('Refer')) {
-   if (!form.refer_department) { window.notifyFromLegacyAlert('Select a department to refer the patient to.'); return }
+   if (!form.refer_department) { notifyWarning('Select a department to refer the patient to.'); return }
   }
   const validRx = rxList
    .map((r, index) => {
@@ -1002,20 +1020,20 @@ async function handleSave() {
    .filter(r => r.drug_name)
   const blockingAmr = validRx.find(r => amrAlerts[r.rowIndex]?.alertLevel === 'critical' && !r.amr_override_reason)
   if (blockingAmr) {
-   window.notifyFromLegacyAlert(`Please document justification for prescribing ${blockingAmr.drug_name} given the resistance pattern.`)
+   notifyWarning(`Please document justification for prescribing ${blockingAmr.drug_name} given the resistance pattern.`)
    setAmrOverrideOpen(current => ({ ...current, [blockingAmr.rowIndex]: true }))
    return
   }
   const blockingCdsDanger = validRx.find((r) => {
    const rowAlerts = cdsAlertsByRow[r.rowIndex] || []
-   return rowAlerts.some(alert => alert.severity === 'danger') && !r.cds_acknowledged
+   return rowAlerts.some(alert => alert.severity === 'danger') && (!r.cds_acknowledged || String(rxList[r.rowIndex]?.cds_override_reason || '').trim().length < 5)
   })
   if (blockingCdsDanger) {
    if (!canAcknowledgeDangerAlerts) {
-    window.notifyFromLegacyAlert(`A Doctor or Admin must acknowledge the CDS danger alert for ${blockingCdsDanger.drug_name} before saving.`)
+    notifyWarning(`A Doctor or Admin must acknowledge the CDS danger alert for ${blockingCdsDanger.drug_name} before saving.`)
     return
    }
-   window.notifyFromLegacyAlert(`Please tick "I acknowledge this alert" for ${blockingCdsDanger.drug_name} before saving.`)
+   notifyWarning(`Safety alert for ${blockingCdsDanger.drug_name}: tick "I have reviewed this alert" and write the clinical reason for prescribing anyway, or change the prescription.`)
    return
   }
   setSaving(true)
@@ -1074,7 +1092,7 @@ async function handleSave() {
     }),
    )
 
-   if (cErr) { window.notifyFromLegacyAlert('Error saving consultation: ' + cErr.message); setSaving(false); return }
+   if (cErr) { notifyError('Error saving consultation: ' + cErr.message); setSaving(false); return }
 
    // 1b. Auto-create consultation invoice
    // Get the id of the just-inserted consultation
@@ -1091,7 +1109,7 @@ async function handleSave() {
 
    // 2. Save prescriptions
    if (isPharmacy && validRx.length === 0) {
-    window.notifyFromLegacyAlert('Add at least one prescription before sending this visit to pharmacy.')
+    notifyWarning('Add at least one prescription before sending this visit to pharmacy.')
     setSaving(false)
    return
   }
@@ -1120,7 +1138,7 @@ async function handleSave() {
       prescriptionRows.map(({ prn, patient_instructions, aware_classification, ...row }) => row),
      ),
     )
-    if (rxErr) { window.notifyFromLegacyAlert('Error saving prescriptions: ' + rxErr.message); setSaving(false); return }
+    if (rxErr) { notifyError('Error saving prescriptions: ' + rxErr.message); setSaving(false); return }
     const cdsOverrideRows = validRx.flatMap((r) => {
      const rowAlerts = cdsAlertsByRow[r.rowIndex] || []
      return rowAlerts
@@ -1132,6 +1150,10 @@ async function handleSave() {
        doctor_name: form.doctor_name,
        drug_name: r.drug_name,
        rule: alert.rule,
+       severity: alert.severity,
+       message: alert.message,
+       reason: String(rxList[r.rowIndex]?.cds_override_reason || '').trim() || null,
+       user_role: userRole || null,
        acknowledged_at: new Date().toISOString(),
       }))
     })
@@ -1139,7 +1161,7 @@ async function handleSave() {
      const { error: cdsOverrideError } = await supabase.from('cds_overrides').insert(cdsOverrideRows)
      if (cdsOverrideError) {
       console.error('CDS override logging failed:', cdsOverrideError)
-      window.notifyFromLegacyAlert(`Prescriptions saved, but CDS override audit logging failed: ${cdsOverrideError.message}`)
+      notifyError(`Prescriptions saved, but CDS override audit logging failed: ${cdsOverrideError.message}`)
      }
     }
     validRx
@@ -1185,7 +1207,7 @@ async function handleSave() {
       ordered_at: new Date().toISOString(),
      }))
     )
-    if (labErr) { window.notifyFromLegacyAlert('Error saving lab orders: ' + labErr.message); setSaving(false); return }
+    if (labErr) { notifyError('Error saving lab orders: ' + labErr.message); setSaving(false); return }
     try {
      window.dispatchEvent(new CustomEvent('remedacare:workflow_changed', { detail: { visit_id: selected.id, source: 'consultation-lab-order', count: validLabs.length } }))
     } catch (e) {}
@@ -1210,7 +1232,7 @@ async function handleSave() {
       created_at: new Date().toISOString(),
      })),
     )
-    if (radiologyErr) { window.notifyFromLegacyAlert('Error saving radiology orders: ' + radiologyErr.message); setSaving(false); return }
+    if (radiologyErr) { notifyError('Error saving radiology orders: ' + radiologyErr.message); setSaving(false); return }
     try {
      window.dispatchEvent(new CustomEvent('remedacare:workflow_changed', { detail: { visit_id: selected.id, source: 'consultation-radiology-order', count: validRadiologyOrders.length } }))
     } catch (e) {}
@@ -1222,6 +1244,7 @@ async function handleSave() {
 
    let newStatus = 'Completed'
    if (isLab) newStatus = 'Lab'
+   else if (validRadiologyOrders.length > 0) newStatus = 'Radiology'
    else if (isPharmacy) newStatus = 'Prescription'
    else if (isAdmit) newStatus = 'Admission Requested'
    else if (isRefer) newStatus = 'Doctor' // re-enters doctor queue at new dept
@@ -1236,7 +1259,7 @@ async function handleSave() {
     ...(validLabs.length > 0 ? { lab_requested: true } : {}),
    }).eq('id', selected.id).eq('hospital_id', hospitalId)
 
-   if (vErr) { window.notifyFromLegacyAlert('Error updating visit: ' + vErr.message); setSaving(false); return }
+   if (vErr) { notifyError('Error updating visit: ' + vErr.message); setSaving(false); return }
 
    // 6. Delete draft after successful save
    await supabase.from('consultation_drafts').delete().eq('visit_id', selected.id)
@@ -1266,7 +1289,7 @@ async function handleSave() {
    await fetchVisits()
 
   } catch (e) {
-   window.notifyFromLegacyAlert('Error: ' + e.message)
+   notifyError('Error: ' + e.message)
   }
   setSaving(false)
  }
@@ -1288,9 +1311,9 @@ async function handleSave() {
   if (error) throw error
    writeLocalConsultationDraft(selected.id, { ...JSON.parse(draftData.form_data), hospital_id: hospitalId, visit_id: selected.id, patient_id: selected.patient_id, saved_at: draftData.saved_at })
    setLastLocalDraftAt(draftData.saved_at)
-   window.notifyFromLegacyAlert('Draft saved successfully!')
+   notifySuccess('Draft saved successfully!')
   } catch (e) {
-   window.notifyFromLegacyAlert('Error saving draft: ' + e.message)
+   notifyError('Error saving draft: ' + e.message)
   }
   setSavingDraft(false)
  }
@@ -1323,6 +1346,29 @@ async function handleSave() {
  const vitalAlerts = useMemo(() => getAbnormalVitalAlerts(vitals), [vitals])
  const bmiSummary = useMemo(() => getBmiSummary(vitals), [vitals])
  const interactionWarnings = useMemo(() => detectPrescriptionInteractions(rxList), [rxList])
+ const latestLabValues = useMemo(() => {
+  const out = {}
+  for (const lab of allPatientLabs || []) {
+   const values = lab?.result_json && typeof lab.result_json === 'object' ? lab.result_json : {}
+   for (const key of ['egfr', 'creatinine', 'potassium']) {
+    const n = Number(values[key])
+    if (out[key] == null && values[key] !== '' && values[key] != null && Number.isFinite(n)) out[key] = n
+   }
+  }
+  return out
+ }, [allPatientLabs])
+ const cdsAlerts = useMemo(() => runCds({
+  rows: rxList,
+  patient: { ...(selected?.patients || {}), weight_kg: vitals?.weight_kg || selected?.patients?.weight_kg, pregnancy_status: form.pregnancy_status },
+  // still taking: not yet dispensed, or dispensed in the last 30 days
+  activeMeds: (activePatientPrescriptions || [])
+   .filter(row => row.status !== 'Released' || Date.now() - new Date(row.dispensed_at || row.created_at || 0).getTime() < 30 * 86400000)
+   .map(row => row.drug_name).filter(Boolean),
+  labs: latestLabValues,
+ }), [rxList, selected?.patients, vitals?.weight_kg, form.pregnancy_status, activePatientPrescriptions, latestLabValues])
+ useEffect(() => { setCdsAlertsByRow(alertsByRow(cdsAlerts)) }, [cdsAlerts])
+ useEffect(() => { void loadHospitalInteractions(supabase, hospitalId) }, [hospitalId])
+ const recordAccessAllowed = usePatientAccessLog(hospitalId, selected?.patient_id, 'consultation')
  const patientCdsContext = useMemo(() => ([
   ...activePatientPrescriptions,
   {
@@ -1345,19 +1391,19 @@ async function handleSave() {
 
  async function handleStewardshipDecision(item, decision) {
   if (!stewardshipSchemaReady || !item.latestIntervention?.id) {
-   window.notifyFromLegacyAlert('Run next_upgrade_relations_and_stewardship.sql to enable prescriber acknowledgement inside consultation.')
+   notifyWarning('Run next_upgrade_relations_and_stewardship.sql to enable prescriber acknowledgement inside consultation.')
    return
   }
 
   const prescriberName = (form.doctor_name || selected?.assigned_doctor_name || '').trim()
   if (!prescriberName) {
-   window.notifyFromLegacyAlert('Enter the doctor name before acknowledging stewardship recommendations.')
+   notifyWarning('Enter the doctor name before acknowledging stewardship recommendations.')
    return
   }
 
   const response = String(stewardshipDrafts[item.id] || '').trim()
   if (['Rejected', 'Actioned'].includes(decision) && !response) {
-   window.notifyFromLegacyAlert('Add the prescriber response or action taken before saving this decision.')
+   notifyWarning('Add the prescriber response or action taken before saving this decision.')
    return
   }
 
@@ -1392,7 +1438,7 @@ async function handleSave() {
   setStewardshipSaving(false)
 
   if (result.error) {
-   window.notifyFromLegacyAlert('Could not save stewardship decision: ' + result.error.message)
+   notifyError('Could not save stewardship decision: ' + result.error.message)
    return
   }
 
@@ -1409,12 +1455,12 @@ async function handleSave() {
   if (!interp) return null
   const lower = interp.toLowerCase()
   if (lower.includes('abnormal') || lower.includes('positive')) return { bg: '#FCEBEB', color: '#A32D2D' }
-  if (lower.includes('normal') || lower.includes('negative')) return { bg: '#F3E8FF', color: '#5B21B6' }
+  if (lower.includes('normal') || lower.includes('negative')) return { bg: '#E1F5EE', color: '#0F6E56' }
   return { bg: '#FFF3DC', color: '#C07000' }
  }
 
  if (queueLoading && !selected) return (
-  <div style={s.loadWrap}><div style={s.spinner}></div><p style={{ color: '#5B21B6', marginTop: '12px' }}>Loading...</p></div>
+  <div style={s.loadWrap}><div style={s.spinner}></div><p style={{ color: '#0F6E56', marginTop: '12px' }}>Loading...</p></div>
  )
 
  return (
@@ -1459,10 +1505,10 @@ async function handleSave() {
           }}
           latestVitals={vitals}
           badges={[
-           { label: selected.status || 'Doctor', bg: '#F0EAFC', color: '#7B5EA7' },
+           { label: selected.status || 'Doctor', bg: '#EAF5EF', color: '#7B5EA7' },
            ...(selected.priority === 'Emergency' ? [{ label: 'Emergency', bg: '#FCEBEB', color: '#A32D2D' }] : []),
           ]}
-         accentColor="#5B21B6"
+         accentColor="#0F6E56"
          background="#EAF6F1"
          >
           {lastLocalDraftAt && (
@@ -1534,7 +1580,7 @@ async function handleSave() {
              borderRadius: 10,
              border: '1px solid #CDE5DD',
              background: '#FFFFFF',
-             color: '#5B21B6',
+             color: '#0F6E56',
              fontSize: 12,
              fontWeight: 700,
              cursor: 'pointer',
@@ -1545,23 +1591,23 @@ async function handleSave() {
           </div>
          </PatientWorkflowCard>
         </div>
-        <button style={s.closePatBtn} onClick={() => setSelected(null)}></button>
+        <button style={s.closePatBtn} onClick={() => setSelected(null)} aria-label="Close" title="Close">✕</button>
        </div>
 
        {/* Lab results alert banner */}
        {hasLabResults && (
-        <div style={{ margin: '0 20px', marginTop: 12, background: 'linear-gradient(135deg, #F3E8FF, #D4EEE6)', border: '1.5px solid #D8B4FE', borderRadius: 10, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' }}
+        <div style={{ margin: '0 20px', marginTop: 12, background: 'linear-gradient(135deg, #E1F5EE, #D4EEE6)', border: '1.5px solid #B4E5D0', borderRadius: 10, padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 12, cursor: 'pointer' }}
          onClick={() => setTab('labs')}>
          <span style={{ fontSize: 20 }}>🔬</span>
          <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 700, fontSize: 13, color: '#5B21B6' }}>
+          <div style={{ fontWeight: 700, fontSize: 13, color: '#0F6E56' }}>
            Lab Results Ready — {completedLabsThisVisit.length} test(s) completed
           </div>
           <div style={{ fontSize: 11, color: '#555', marginTop: 2 }}>
            {completedLabsThisVisit.map(l => l.test_type).join(', ')}
           </div>
          </div>
-         <span style={{ fontSize: 12, color: '#5B21B6', fontWeight: 600 }}>View →</span>
+         <span style={{ fontSize: 12, color: '#0F6E56', fontWeight: 600 }}>View →</span>
         </div>
        )}
 
@@ -1579,8 +1625,8 @@ async function handleSave() {
        {billingStatus && (
         <div style={{
          margin: '8px 20px 0',
-         background: billingStatus.ok ? '#F3E8FF' : '#FCEBEB',
-         border: `1px solid ${billingStatus.ok ? '#D8B4FE' : '#F09595'}`,
+         background: billingStatus.ok ? '#E1F5EE' : '#FCEBEB',
+         border: `1px solid ${billingStatus.ok ? '#B4E5D0' : '#F09595'}`,
          borderRadius: 10,
          padding: '8px 14px',
          display: 'flex',
@@ -1588,7 +1634,7 @@ async function handleSave() {
          gap: 10,
         }}>
          <span style={{ fontSize: 16 }}>{billingStatus.ok ? '🧾' : '⚠️'}</span>
-         <div style={{ fontSize: 12, color: billingStatus.ok ? '#5B21B6' : '#A32D2D', fontWeight: 600 }}>
+         <div style={{ fontSize: 12, color: billingStatus.ok ? '#0F6E56' : '#A32D2D', fontWeight: 600 }}>
           {billingStatus.ok ? 'Invoice created: ' : ''}{billingStatus.message}
          </div>
         </div>
@@ -1605,10 +1651,10 @@ async function handleSave() {
          <button key={key} style={{ ...s.tabBtn, ...(tab === key ? s.tabBtnActive : {}) }} onClick={() => setTab(key)}>
           {label}
           {key === 'history' && prevConsultations.length > 0 && (
-           <span style={{ ...s.pill, background: '#F0EAFC', color: '#7B5EA7', marginLeft: '6px', fontSize: '10px' }}>{prevConsultations.length}</span>
+           <span style={{ ...s.pill, background: '#EAF5EF', color: '#7B5EA7', marginLeft: '6px', fontSize: '10px' }}>{prevConsultations.length}</span>
           )}
           {key === 'labs' && completedLabsThisVisit.length > 0 && (
-           <span style={{ ...s.pill, background: '#F3E8FF', color: '#5B21B6', marginLeft: '4px', fontSize: '10px' }}> {completedLabsThisVisit.length}</span>
+           <span style={{ ...s.pill, background: '#E1F5EE', color: '#0F6E56', marginLeft: '4px', fontSize: '10px' }}> {completedLabsThisVisit.length}</span>
           )}
          </button>
         ))}
@@ -1678,7 +1724,7 @@ async function handleSave() {
                <div style={{ fontWeight: '700', color: '#111', fontSize: '14px' }}>
                 {c.diagnosis || 'No diagnosis'}
                 {(c.icd10_code || c.icd_code) && (
-                  <span style={{ marginLeft: 8, color: '#5B21B6', fontSize: 12 }}>
+                  <span style={{ marginLeft: 8, color: '#0F6E56', fontSize: 12 }}>
                     {c.icd10_code || c.icd_code}
                   </span>
                 )}
@@ -1687,7 +1733,7 @@ async function handleSave() {
                 Dr. {c.doctor_name || '—'} • {c.speciality || '—'} • {c.created_at ? new Date(c.created_at).toLocaleDateString('en-KE') : '—'}
                </div>
               </div>
-              <span style={{ ...s.pill, background: '#F3E8FF', color: '#5B21B6', fontSize: '11px' }}>{c.disposition || '—'}</span>
+              <span style={{ ...s.pill, background: '#E1F5EE', color: '#0F6E56', fontSize: '11px' }}>{c.disposition || '—'}</span>
              </div>
              {c.presenting_complaint && <div style={s.historyRow}><span style={s.historyLabel}>Complaint</span><span>{c.presenting_complaint}</span></div>}
              {c.examination_findings && <div style={s.historyRow}><span style={s.historyLabel}>Findings</span><span>{c.examination_findings}</span></div>}
@@ -1702,8 +1748,29 @@ async function handleSave() {
         {/* ---- CONSULTATION TAB ---- */}
         {tab === 'consult' && (
          <ConsultationForm
+           accessBlocked={!recordAccessAllowed}
+           hospitalId={hospitalId}
+           patientId={selected?.patient_id || null}
+           visitId={selected?.id || null}
            form={form}
            setForm={setForm}
+           onBookFollowUp={selected?.patient_id ? async ({ inDays, date }) => {
+             const ok = window.openConfirmDialog
+               ? await window.openConfirmDialog('Open the booking screen now? Save the consultation (or a draft) first — unsaved notes on this screen are lost when you leave.')
+               : true
+             if (!ok) return
+             navigate?.('appointments', {
+               patientId: selected.patient_id,
+               patientName: selected?.patients?.full_name || '',
+               followUpDate: date || null,
+               followUpInDays: inDays || null,
+               doctorName: selected?.assigned_doctor_name || '',
+               department: selected?.speciality || '',
+               appointmentType: 'Follow-up',
+               notes: [form.diagnosis || form.icd10_description, 'Follow-up booked from consultation'].filter(Boolean).join(' — '),
+               source: 'consultation',
+             })
+           } : null}
            vitals={vitals}
            saving={saving}
            savingDraft={savingDraft}
@@ -1740,7 +1807,7 @@ async function handleSave() {
            setRadiologyOrders={setRadiologyOrders}
            recentRadiologyReports={recentRadiologyReports}
            previousConsultations={prevConsultations.slice(0, 3)}
-           hospitalName={hospitalName || 'Brightpath Travel Scholars'}
+           hospitalName={hospitalName || 'RemedacareHMS'}
            onOpenCarePathway={openCarePathwayFromConsultation}
            onOpenReferral={openReferralFromConsultation}
            getLabTestsForCategory={getLabTestsForCategory}
@@ -1754,6 +1821,9 @@ async function handleSave() {
            patientAllergies={selected.patients?.allergies || ''}
            activePatientPrescriptions={patientCdsContext}
            onSafetyAlertsChange={setCdsAlertsByRow}
+           cdsAlertsByRow={cdsAlertsByRow}
+           onCdsAcknowledge={handleCdsAcknowledge}
+           onCdsReasonChange={handleCdsReasonChange}
            canAcknowledgeDanger={canAcknowledgeDangerAlerts}
            showPregnancyPrompt={showPregnancyPrompt}
            malariaPrompt={malariaPrompt}
@@ -1773,27 +1843,27 @@ async function handleSave() {
  )
 }
 
-const AVATAR_COLORS = ['#F3E8FF', '#E3F0FB', '#F0EAFC', '#FFF3DC', '#FCEBEB', '#EAF3DE']
+const AVATAR_COLORS = ['#E1F5EE', '#E3F0FB', '#EAF5EF', '#FFF3DC', '#FCEBEB', '#EAF3DE']
 
 const s = {
  page: { padding: '20px 24px', flex: 1, overflowY: 'auto', background: '#f7f8f7', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', height: '100%', boxSizing: 'border-box' },
  loadWrap: { height: '80vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
- spinner: { width: '36px', height: '36px', border: '3px solid #e8ebe8', borderTop: '3px solid #5B21B6', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
+ spinner: { width: '36px', height: '36px', border: '3px solid #e8ebe8', borderTop: '3px solid #0F6E56', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
  layout: { display: 'flex', gap: '16px', height: 'calc(100vh - 80px)', minHeight: 0 },
  leftPanel: { width: '280px', flexShrink: 0, background: '#fff', borderRadius: '12px', border: '1px solid #eee', padding: '16px', overflowY: 'auto', display: 'flex', flexDirection: 'column' },
  panelHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' },
  panelTitle: { fontSize: '15px', fontWeight: '700', color: '#111' },
  panelSub: { fontSize: '12px', color: '#888', marginTop: '2px' },
- refreshBtn: { background: '#f0f2f0', border: 'none', borderRadius: '6px', padding: '6px 10px', cursor: 'pointer', fontSize: '14px', color: '#5B21B6', fontWeight: '700' },
+ refreshBtn: { background: '#f0f2f0', border: 'none', borderRadius: '6px', padding: '6px 10px', cursor: 'pointer', fontSize: '14px', color: '#0F6E56', fontWeight: '700' },
  rightPanel: { flex: 1, background: '#fff', borderRadius: '12px', border: '1px solid #eee', overflowY: 'auto', display: 'flex', flexDirection: 'column', minWidth: 0 },
  noSelection: { flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', color: '#bbb' },
  patHeader: { padding: '16px 20px', borderBottom: '1px solid #f0f0f0', display: 'flex', alignItems: 'flex-start', gap: '12px', background: '#fafafa', borderRadius: '12px 12px 0 0' },
  closePatBtn: { background: 'none', border: 'none', fontSize: '18px', cursor: 'pointer', color: '#aaa', padding: '4px', flexShrink: 0 },
  tabRow: { display: 'flex', gap: '0', borderBottom: '2px solid #f0f0f0', padding: '0 20px' },
  tabBtn: { padding: '12px 16px', border: 'none', background: 'none', cursor: 'pointer', fontSize: '13px', fontWeight: '500', color: '#888', borderBottom: '2px solid transparent', marginBottom: '-2px', display: 'flex', alignItems: 'center' },
- tabBtnActive: { color: '#5B21B6', fontWeight: '700', borderBottom: '2px solid #5B21B6' },
+ tabBtnActive: { color: '#0F6E56', fontWeight: '700', borderBottom: '2px solid #0F6E56' },
  consultBody: { padding: '20px', flex: 1, overflowY: 'auto' },
- sectionLabel: { fontSize: '11px', fontWeight: '700', color: '#5B21B6', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: '12px', marginTop: '4px', paddingBottom: '6px', borderBottom: '1px solid #F3E8FF' },
+ sectionLabel: { fontSize: '11px', fontWeight: '700', color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: '12px', marginTop: '4px', paddingBottom: '6px', borderBottom: '1px solid #E1F5EE' },
  formGrid2: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px' },
  formGroup: { marginBottom: '14px' },
  label: { fontSize: '12px', color: '#666', display: 'block', marginBottom: '5px', fontWeight: '500' },
@@ -1801,28 +1871,27 @@ const s = {
  vitalsGrid: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px' },
  vitalCard: { background: '#f9fafb', borderRadius: '10px', padding: '14px', border: '1px solid #eee', textAlign: 'center' },
  vitalLabel: { fontSize: '12px', color: '#888', marginBottom: '6px' },
- vitalVal: { fontSize: '20px', fontWeight: '800', color: '#5B21B6' },
+ vitalVal: { fontSize: '20px', fontWeight: '800', color: '#0F6E56' },
  historyCard: { background: '#f9fafb', borderRadius: '10px', padding: '16px', border: '1px solid #eee', marginBottom: '12px' },
  historyRow: { fontSize: '13px', color: '#444', marginTop: '6px', display: 'flex', gap: '8px' },
  historyLabel: { fontWeight: '600', color: '#888', fontSize: '11px', textTransform: 'uppercase', minWidth: '70px', marginTop: '1px' },
  dispositionGrid: { display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '8px', marginBottom: '16px' },
  dispOption: { display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px', padding: '12px 8px', borderRadius: '10px', border: '2px solid #eee', cursor: 'pointer', textAlign: 'center', background: '#fafafa', transition: 'all 0.15s' },
- dispOptionActive: { border: '2px solid #5B21B6', background: '#F3E8FF' },
+ dispOptionActive: { border: '2px solid #0F6E56', background: '#E1F5EE' },
  rxRow: { background: '#f9fafb', borderRadius: '8px', padding: '14px', marginBottom: '10px', border: '1px solid #eee' },
- toggleBtn: { fontSize: '12px', padding: '4px 10px', border: '1px solid #5B21B6', borderRadius: '6px', background: '#fff', color: '#5B21B6', cursor: 'pointer', fontWeight: '600' },
- addRowBtn: { fontSize: '13px', padding: '8px 16px', border: '1px dashed #D8B4FE', borderRadius: '8px', background: '#f9fafb', color: '#5B21B6', cursor: 'pointer', fontWeight: '600', width: '100%', marginBottom: '8px' },
+ toggleBtn: { fontSize: '12px', padding: '4px 10px', border: '1px solid #0F6E56', borderRadius: '6px', background: '#fff', color: '#0F6E56', cursor: 'pointer', fontWeight: '600' },
+ addRowBtn: { fontSize: '13px', padding: '8px 16px', border: '1px dashed #B4E5D0', borderRadius: '8px', background: '#f9fafb', color: '#0F6E56', cursor: 'pointer', fontWeight: '600', width: '100%', marginBottom: '8px' },
  removeBtn: { fontSize: '12px', padding: '4px 10px', border: '1px solid #F09595', borderRadius: '6px', background: '#fff', color: '#A32D2D', cursor: 'pointer' },
  queueItem: { padding: '12px', borderRadius: '10px', border: '1px solid #f0f0f0', marginBottom: '8px', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', transition: 'all 0.15s' },
- queueItemActive: { border: '2px solid #5B21B6', background: '#f0faf7' },
- avatar: { width: '36px', height: '36px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: '700', color: '#5B21B6' },
+ queueItemActive: { border: '2px solid #0F6E56', background: '#f0faf7' },
+ avatar: { width: '36px', height: '36px', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '14px', fontWeight: '700', color: '#0F6E56' },
  chip: { fontSize: '11px', padding: '4px 10px', borderRadius: '99px', border: '1px solid #e0e0e0', background: '#fff', cursor: 'pointer', fontWeight: '500', color: '#555' },
- chipActive: { background: '#5B21B6', color: '#fff', border: '1px solid #5B21B6' },
+ chipActive: { background: '#0F6E56', color: '#fff', border: '1px solid #0F6E56' },
  pill: { fontSize: '11px', fontWeight: '600', padding: '3px 8px', borderRadius: '99px' },
  viewLabel: { fontSize: '11px', color: '#667085', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.04em', marginBottom: 4 },
  viewVal: { fontSize: '13px', color: '#111827', fontWeight: 600 },
  emptyQueue: { textAlign: 'center', padding: '40px 0', color: '#ccc' },
  cancelBtn: { padding: '10px 20px', border: '1px solid #ddd', borderRadius: '8px', background: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '500', color: '#555' },
- submitBtn: { padding: '10px 24px', border: 'none', borderRadius: '8px', background: '#5B21B6', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' },
+ submitBtn: { padding: '10px 24px', border: 'none', borderRadius: '8px', background: '#0F6E56', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' },
 }
-
 

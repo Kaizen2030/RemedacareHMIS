@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { Children, cloneElement, isValidElement, useEffect, useId, useMemo, useState } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import supabase from '../supabase'
@@ -10,6 +10,9 @@ import { buildWorkflowInvoiceNote, createServiceLine, SERVICE_SOURCES, stringify
 import { getLabTestsForCategory, LAB_TEST_CATEGORIES } from '../utils/labCatalog'
 import { generateSampleBarcode } from '../utils/labWorkflow'
 import { openRadiologyReportPrintWindow } from '../utils/radiology'
+import { isSelfPayMethod, notifySentToCashier, unpaidInvoiceFields } from '../utils/payments/invoices'
+import { notifyError, notifySuccess, notifyWarning } from '../notifications'
+import { NetworkPatientImport, PatientNetworkPanel } from './patients/NetworkTools'
 
 /*
  * PATIENT WORKFLOW - WHO DOES WHAT
@@ -27,410 +30,8 @@ import { openRadiologyReportPrintWindow } from '../utils/radiology'
  * All other buttons are visible but disabled with tooltips.
  */
 
-const STEPS = ['Registration', 'Vitals', 'Doctor', 'Lab', 'Pharmacy', 'Admission Requested', 'Completed']
-const STEP_COLORS = {
- Registration: { bg: '#E3F0FB', color: '#1a6fb5' },
- Vitals: { bg: '#FFF3DC', color: '#C07000' },
- Doctor: { bg: '#F0EAFC', color: '#7B5EA7' },
- Lab: { bg: '#FCEBEB', color: '#A32D2D' },
- Pharmacy: { bg: '#F3E8FF', color: '#085041' },
- 'Admission Requested': { bg: '#DBEAFE', color: '#1D4ED8' },
- Completed: { bg: '#f0f0f0', color: '#555' },
- Admitted: { bg: '#EAF3DE', color: '#3B6D11' },
-}
+import { STEPS, STEP_COLORS, AVATAR_COLORS, BLOOD_GROUP_OPTIONS, REGISTRY_FILTER_DEFAULTS, PATIENT_FOLLOW_UP_STORAGE_KEY, DUPLICATE_SCAN_LIMIT, normalizeText, normalizeDigits, getInitials, hashName, getAvatarStyle, formatCurrency, formatDateTime, formatDate, getAgeBucket, parseAllergyTags, stringifyAllergyTags, buildPatientSearchFields, getPatientPhoneForWhatsApp, getRelativeDaysLabel, getAgeRangeMatch, getRegisteredDateMatch, loadLocalFollowUpFlags, saveLocalFollowUpFlags, samePhoneFamily, detectDuplicatePatientGroups, getDateRange, printReceipt, getPatientCardNumber, printPatientIdCard, printPatientSummary } from './patients/patientHelpers'
 
-const AVATAR_COLORS = ['#F3E8FF', '#E3F0FB', '#F0EAFC', '#FFF3DC', '#FCEBEB', '#EAF3DE']
-const BLOOD_GROUP_OPTIONS = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-', 'Unknown']
-const REGISTRY_FILTER_DEFAULTS = {
- workflow: 'All',
- gender: 'All',
- ageRange: 'All',
- registered: 'all',
- shaMember: 'all',
- outstanding: 'all',
-}
-const PATIENT_FOLLOW_UP_STORAGE_KEY = 'remedacare-patient-follow-up'
-const DUPLICATE_SCAN_LIMIT = 400
-
-function normalizeText(value) {
- return String(value || '').trim().toLowerCase()
-}
-
-function normalizeDigits(value) {
- return String(value || '').replace(/\D/g, '')
-}
-
-function getInitials(name) {
- return String(name || '')
-  .split(/\s+/)
-  .filter(Boolean)
-  .slice(0, 2)
-  .map(part => part.charAt(0).toUpperCase())
-  .join('') || 'PT'
-}
-
-function hashName(name) {
- return [...String(name || '')].reduce((hash, char) => ((hash * 31) + char.charCodeAt(0)) >>> 0, 0)
-}
-
-function getAvatarStyle(name) {
- const idx = hashName(name) % AVATAR_COLORS.length
- const background = AVATAR_COLORS[idx]
- const textColors = ['#5B21B6', '#1A6FB5', '#7B5EA7', '#C07000', '#A32D2D', '#3B6D11']
- return { background, color: textColors[idx] || '#5B21B6' }
-}
-
-function formatCurrency(value) {
- return `KES ${Number(value || 0).toLocaleString()}`
-}
-
-function formatDateTime(value) {
- return value ? new Date(value).toLocaleString('en-KE') : '—'
-}
-
-function formatDate(value) {
- return value ? new Date(value).toLocaleDateString('en-KE') : '—'
-}
-
-function getAgeBucket(age) {
- const numericAge = Number(age || 0)
- if (!numericAge && numericAge !== 0) return 'Unknown'
- if (numericAge < 18) return 'Child'
- if (numericAge < 60) return 'Adult'
- return 'Senior'
-}
-
-function parseAllergyTags(value) {
- const tokens = Array.isArray(value) ? value : String(value || '').split(/[,;\n]/)
- return [...new Set(tokens.map(token => String(token || '').trim()).filter(Boolean))]
-}
-
-function stringifyAllergyTags(value) {
- return parseAllergyTags(value).join(', ')
-}
-
-function buildPatientSearchFields(patient = {}) {
- return [
-  patient.full_name,
-  patient.phone,
-  patient.phone2,
-  patient.national_id,
-  patient.huduma_number,
-  patient.patient_number,
-  patient.mrn,
-  patient.guardian_id,
-  patient.next_of_kin_phone,
- ].filter(Boolean).join(' ').toLowerCase()
-}
-
-function getPatientPhoneForWhatsApp(patient = {}) {
- const raw = normalizeDigits(patient.phone || patient.phone2 || patient.next_of_kin_phone)
- if (!raw) return ''
- if (raw.startsWith('254')) return raw
- if (raw.startsWith('0')) return `254${raw.slice(1)}`
- return raw
-}
-
-function getRelativeDaysLabel(value) {
- if (!value) return 'Never'
- const days = Math.floor((Date.now() - new Date(value).getTime()) / (1000 * 60 * 60 * 24))
- if (days <= 0) return 'Today'
- if (days === 1) return '1 day ago'
- return `${days} days ago`
-}
-
-function getAgeRangeMatch(age, ageRange) {
- const numericAge = Number(age || 0)
- if (ageRange === 'All') return true
- if (ageRange === 'Child') return numericAge < 18
- if (ageRange === 'Adult') return numericAge >= 18 && numericAge < 60
- if (ageRange === 'Senior') return numericAge >= 60
- return true
-}
-
-function getRegisteredDateMatch(createdAt, filter) {
- if (filter === 'all') return true
- if (!createdAt) return false
- const created = new Date(createdAt)
- const now = new Date()
- const start = new Date()
- if (filter === 'today') start.setHours(0, 0, 0, 0)
- else if (filter === 'week') start.setDate(now.getDate() - 7)
- else if (filter === 'month') start.setDate(now.getDate() - 30)
- else return true
- return created >= start
-}
-
-function loadLocalFollowUpFlags() {
- try {
-  return JSON.parse(window.localStorage.getItem(PATIENT_FOLLOW_UP_STORAGE_KEY) || '{}')
- } catch (_) {
-  return {}
- }
-}
-
-function saveLocalFollowUpFlags(value) {
- try {
-  window.localStorage.setItem(PATIENT_FOLLOW_UP_STORAGE_KEY, JSON.stringify(value || {}))
- } catch (_) {}
-}
-
-function samePhoneFamily(phoneA, phoneB) {
- const a = normalizeDigits(phoneA).slice(-7)
- const b = normalizeDigits(phoneB).slice(-7)
- return a && b && a === b
-}
-
-function detectDuplicatePatientGroups(patients = []) {
- const groups = new Map()
- patients.forEach((patient) => {
-  const nameKey = normalizeText(patient.full_name)
-  if (!nameKey) return
-  const existing = groups.get(nameKey) || []
-  existing.push(patient)
-  groups.set(nameKey, existing)
- })
-
- return [...groups.values()]
-  .map((group) => group.filter((patient, index, arr) => arr.some(other => other.id !== patient.id && samePhoneFamily(patient.phone, other.phone))))
-  .filter((group) => group.length > 1)
-  .map((group) => {
-   const unique = []
-   const seen = new Set()
-   group.forEach((patient) => {
-    if (seen.has(patient.id)) return
-    seen.add(patient.id)
-    unique.push(patient)
-   })
-   return unique.sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
-  })
-}
-
-
-// ─── Utility ─────────────────────────────────────────────────────────────────
-function getDateRange(range) {
- const now = new Date()
- const start = new Date()
- if (range === 'today') start.setHours(0,0,0,0)
- else if (range === 'week') start.setDate(now.getDate()-7)
- else if (range === '2weeks') start.setDate(now.getDate()-14)
- else if (range === 'month') start.setDate(now.getDate()-30)
- else if (range === '2months') start.setDate(now.getDate()-60)
- else if (range === 'all') start.setFullYear(2000)
- return start.toISOString()
-}
-
-// ─── Receipt printer ─────────────────────────────────────────────────────────
-function printReceipt(hospitalName, hospitalId, patient, visit) {
- const w = window.open('', '_blank')
- w.document.write(`
- <html><head><title>Receipt</title>
- <style>
- body{font-family:Arial,sans-serif;max-width:400px;margin:30px auto;padding:0}
- .box{border:3px solid #5B21B6;border-radius:12px;padding:24px}
- h2{text-align:center;color:#5B21B6;margin:0}
- p{text-align:center;margin:4px 0;font-size:13px;color:#555}
- hr{border:1px solid #5B21B6;margin:14px 0}
- .row{display:flex;justify-content:space-between;margin:6px 0;font-size:14px}
- .total{font-size:18px;font-weight:800;color:#5B21B6}
- .foot{text-align:center;font-size:12px;color:#5B21B6;margin-top:16px}
- @media print{body{margin:0}}
- </style></head><body>
- <div class="box">
- <h2>${hospitalName || 'REMEDACARE HOSPITAL'}</h2>
- <p>Your Health, Our Priority</p>
- <hr>
- <h3 style="text-align:center;margin:10px 0">OFFICIAL RECEIPT</h3>
- <div class="row"><span>Visit No.</span><strong>${visit.visit_number}</strong></div>
- <div class="row"><span>Date/Time</span><span>${new Date().toLocaleString('en-KE')}</span></div>
- <div class="row"><span>Hospital ID</span><span>${hospitalId || '—'}</span></div>
- <div class="row"><span>Patient</span><strong>${patient.full_name}</strong></div>
- <div class="row"><span>Age/Gender</span><span>${patient.age||'-'} yrs / ${patient.gender||'-'}</span></div>
- <div class="row"><span>Phone</span><span>${patient.phone||'-'}</span></div>
- <hr>
- <div class="row"><span>Service</span><span>${visit.visit_type} Consultation</span></div>
- <div class="row"><span>Payment</span><span>${visit.payment_method}</span></div>
- ${visit.mpesa_ref ? `<div class="row"><span>M-Pesa Ref</span><span>${visit.mpesa_ref}</span></div>` : ''}
- <hr>
- <div class="row"><span>TOTAL PAID</span><span class="total">KES ${parseFloat(visit.admission_fee).toLocaleString()}</span></div>
- <div class="foot">Thank you for choosing ${hospitalName||'Brightpath Travel Scholars'}<br><strong>Keep this receipt</strong></div>
- </div>
- <script>setTimeout(()=>{window.print();},500)</script>
- </body></html>
- `)
- w.document.close()
-}
-
-function getPatientCardNumber(patient) {
- const raw =
-  patient?.patient_number ||
-  patient?.mrn ||
-  patient?.national_id ||
-  (patient?.id ? `PT-${String(patient.id).slice(-6).toUpperCase()}` : 'PT-UNKNOWN')
- return String(raw)
-}
-
-function printPatientIdCard(hospitalName, patient) {
- const patientNumber = getPatientCardNumber(patient)
- const qrMarkup = renderToStaticMarkup(
-  <QRCodeSVG
-   value={patientNumber}
-   size={90}
-   marginSize={0}
-   fgColor="#5B21B6"
-   bgColor="#FFFFFF"
-  />
- )
-
- const w = window.open('', '_blank', 'width=500,height=360')
- if (!w) return
- w.document.write(`
-  <html>
-   <head>
-    <title>Patient ID Card</title>
-    <style>
-      @page { size: 85.6mm 54mm; margin: 0; }
-      body { margin: 0; font-family: Arial, sans-serif; background: #fff; }
-      .page { width: 85.6mm; height: 54mm; display: flex; align-items: center; justify-content: center; }
-      .card {
-        width: 85.6mm;
-        height: 54mm;
-        box-sizing: border-box;
-        border: 1px solid #CDE2D9;
-        border-radius: 4mm;
-        overflow: hidden;
-        background: linear-gradient(180deg, #ffffff 0%, #FAF7FF 100%);
-        display: flex;
-        flex-direction: column;
-      }
-      .header { background: #1A6B4A; color: #fff; padding: 4mm 5mm 3mm; }
-      .hospital { font-size: 12px; font-weight: 800; letter-spacing: 0.4px; text-transform: uppercase; }
-      .sub { font-size: 9px; opacity: 0.92; margin-top: 1mm; }
-      .body { display: grid; grid-template-columns: 1fr 24mm; gap: 3mm; padding: 4mm 5mm; flex: 1; }
-      .name { font-size: 14px; font-weight: 800; color: #123B2A; line-height: 1.15; margin-bottom: 2mm; }
-      .meta-row { font-size: 9.5px; color: #2F3D37; margin-bottom: 1.2mm; }
-      .meta-label { color: #597268; font-weight: 700; text-transform: uppercase; letter-spacing: 0.35px; margin-right: 1mm; font-size: 8px; }
-      .blood { display: inline-block; margin-top: 1mm; background: #F3E8FF; color: #5B21B6; border: 1px solid #D8B4FE; border-radius: 999px; padding: 1mm 2.2mm; font-size: 8.5px; font-weight: 800; }
-      .qr-wrap { display: flex; flex-direction: column; align-items: center; justify-content: space-between; }
-      .qr { width: 24mm; height: 24mm; display: flex; align-items: center; justify-content: center; background: #fff; border: 1px solid #D9E8E1; border-radius: 3mm; padding: 2mm; box-sizing: border-box; }
-      .qr svg { width: 100%; height: 100%; }
-      .qr-caption { font-size: 7.5px; color: #5B6C65; text-align: center; word-break: break-word; margin-top: 1mm; }
-      @media print {
-        body * { visibility: hidden; }
-        .page, .page * { visibility: visible; }
-        .page { position: absolute; left: 0; top: 0; }
-      }
-    </style>
-   </head>
-   <body>
-    <div class="page">
-      <div class="card">
-        <div class="header">
-          <div class="hospital">${hospitalName || 'RemaCare Hospital'}</div>
-          <div class="sub">Official patient identification card</div>
-        </div>
-        <div class="body">
-          <div>
-            <div class="name">${patient?.full_name || 'Patient name'}</div>
-            <div class="meta-row"><span class="meta-label">MRN</span>${patientNumber}</div>
-            <div class="meta-row"><span class="meta-label">DOB</span>${patient?.dob || '—'}</div>
-            <div class="meta-row"><span class="meta-label">Gender</span>${patient?.gender || '—'}</div>
-            <div class="meta-row"><span class="meta-label">Emergency</span>${patient?.next_of_kin_name || patient?.next_of_kin || '—'}</div>
-            <div class="meta-row"><span class="meta-label">Phone</span>${patient?.next_of_kin_phone || '—'}</div>
-            <div class="blood">Blood Group: ${patient?.blood_group || 'Not captured'}</div>
-          </div>
-          <div class="qr-wrap">
-            <div class="qr">${qrMarkup}</div>
-            <div class="qr-caption">${patientNumber}</div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <script>setTimeout(() => window.print(), 300)</script>
-   </body>
-  </html>
- `)
- w.document.close()
-}
-
-function printPatientSummary(hospitalName, patient, timeline = []) {
- const patientNumber = getPatientCardNumber(patient)
- const timelineRows = timeline.length === 0
-  ? '<div class="empty">No visit history available.</div>'
-  : timeline.map((entry) => {
-   const prescriptions = (entry.prescriptions || []).map((rx) => `${rx.drug_name || 'Drug'} ${rx.frequency || ''} ${rx.duration || ''}`.trim()).filter(Boolean)
-   const labs = (entry.labTests || []).map((test) => `${test.test_name || test.test_type || 'Lab'}${test.result ? `: ${String(test.result).slice(0, 120)}` : ` (${test.status || 'Pending'})`}`)
-   return `
-    <div class="visit">
-      <div class="visit-head">
-        <div>
-          <div class="visit-title">${entry.visit_number || 'Visit'} - ${entry.visit_type || 'Visit'}</div>
-          <div class="muted">${formatDateTime(entry.created_at)} | ${entry.status || 'Unknown status'}</div>
-        </div>
-        <div class="visit-amount">${formatCurrency(entry.invoice?.amount_kes || entry.admission_fee || 0)}</div>
-      </div>
-      <div class="grid">
-        <div><span class="label">Doctor</span><span>${entry.assigned_doctor_name || '—'}</span></div>
-        <div><span class="label">Diagnosis</span><span>${entry.consultation?.diagnosis || entry.consultation?.icd10_description || entry.doctor_notes || '—'}</span></div>
-        <div><span class="label">Payment</span><span>${entry.invoice?.status || entry.admission_payment_method || '—'}</span></div>
-        <div><span class="label">Balance</span><span>${formatCurrency(entry.invoice?.balance_kes || 0)}</span></div>
-      </div>
-      ${prescriptions.length ? `<div class="block"><div class="label">Prescriptions</div><div>${prescriptions.join('<br/>')}</div></div>` : ''}
-      ${labs.length ? `<div class="block"><div class="label">Lab Results</div><div>${labs.join('<br/>')}</div></div>` : ''}
-    </div>
-   `
-  }).join('')
-
- const w = window.open('', '_blank', 'width=980,height=720')
- if (!w) return
- w.document.write(`
-  <html>
-   <head>
-    <title>Patient Summary</title>
-    <style>
-      body { font-family: Arial, sans-serif; margin: 24px; color: #1F2937; }
-      h1 { margin: 0; color: #5B21B6; font-size: 26px; }
-      .sub { margin-top: 6px; color: #64748B; font-size: 13px; }
-      .hero { border: 2px solid #D9E8E1; border-radius: 14px; padding: 18px 20px; background: linear-gradient(180deg, #FFFFFF 0%, #FAF7FF 100%); margin-bottom: 18px; }
-      .meta { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 18px; }
-      .meta-card { border: 1px solid #E5E7EB; border-radius: 10px; padding: 10px 12px; background: #fff; }
-      .label { display: block; color: #6B7280; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 4px; }
-      .timeline { display: flex; flex-direction: column; gap: 14px; }
-      .visit { border: 1px solid #E5E7EB; border-radius: 12px; padding: 14px 16px; background: #fff; }
-      .visit-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 12px; }
-      .visit-title { font-size: 15px; font-weight: 800; color: #111827; }
-      .visit-amount { font-size: 15px; font-weight: 800; color: #5B21B6; }
-      .muted { color: #64748B; font-size: 12px; }
-      .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 16px; }
-      .block { margin-top: 12px; }
-      .empty { padding: 24px; text-align: center; border: 1px dashed #CBD5E1; border-radius: 12px; color: #64748B; }
-      @media print {
-        body { margin: 0; padding: 14mm; }
-      }
-    </style>
-   </head>
-   <body>
-    <div class="hero">
-      <h1>${hospitalName || 'RemaCare Hospital'}</h1>
-      <div class="sub">Patient Summary</div>
-      <div class="meta">
-        <div class="meta-card"><span class="label">Patient</span>${patient?.full_name || '—'}</div>
-        <div class="meta-card"><span class="label">Patient Number</span>${patientNumber}</div>
-        <div class="meta-card"><span class="label">Printed</span>${formatDateTime(new Date())}</div>
-        <div class="meta-card"><span class="label">Age / Gender</span>${patient?.age || '—'} / ${patient?.gender || '—'}</div>
-        <div class="meta-card"><span class="label">Blood Group</span>${patient?.blood_group || '—'}</div>
-        <div class="meta-card"><span class="label">Allergies</span>${patient?.allergies || 'None recorded'}</div>
-      </div>
-    </div>
-    <div class="timeline">${timelineRows}</div>
-    <script>setTimeout(() => window.print(), 350)</script>
-   </body>
-  </html>
- `)
- w.document.close()
-}
-
-// ─── Main Component ───────────────────────────────────────────────────────────
 export default function Patients() {
  const { hospitalId, userRole, departments: configuredDepartments = [], navigate } = useHospital()
  const isAdmin = ['Admin', 'admin'].includes(userRole || '')
@@ -894,7 +495,7 @@ async function handleSearch(explicitQuery = searchQuery) {
  }
 
 function openNewPatient() {
- if (!canRegister) { window.notifyFromLegacyAlert('Only receptionists, nurses and admins can register patients.'); return }
+ if (!canRegister) { notifyWarning('Only receptionists, nurses and admins can register patients.'); return }
  setShowSearchModal(false); setIsReturning(false); setSelectedPatient(null); setEditingPatient(null)
  setVisitForm(emptyVisit); setRegStep(1); setAllergyInput(''); setRegistrationComplete(null)
  setShowRegister(true)
@@ -905,7 +506,7 @@ function openNewPatient() {
  }
 
 function selectReturningPatient(patient) {
- if (!canRegister) { window.notifyFromLegacyAlert('Only receptionists, nurses and admins can register patients.'); return }
+ if (!canRegister) { notifyWarning('Only receptionists, nurses and admins can register patients.'); return }
  setShowSearchModal(false); setIsReturning(true); setSelectedPatient(patient)
  setEditingPatient(null)
  setRegForm({
@@ -923,7 +524,7 @@ function selectReturningPatient(patient) {
 
  // ── REGISTER ──────────────────────────────────────────────────────────────
 function openEditPatient(patient) {
- if (!canRegister) { window.notifyFromLegacyAlert('Only receptionists, nurses and admins can edit patient records.'); return }
+ if (!canRegister) { notifyWarning('Only receptionists, nurses and admins can edit patient records.'); return }
  setShowSearchModal(false)
  setIsReturning(false)
  setSelectedPatient(patient)
@@ -945,9 +546,9 @@ function openEditPatient(patient) {
 }
 
 async function handleSavePatientProfile() {
- if (!canRegister) { window.notifyFromLegacyAlert('Only receptionists, nurses and admins can edit patient records.'); return }
+ if (!canRegister) { notifyWarning('Only receptionists, nurses and admins can edit patient records.'); return }
  if (!editingPatient?.id) return
- if (!regForm.full_name?.trim()) { window.notifyFromLegacyAlert('Full name required'); return }
+ if (!regForm.full_name?.trim()) { notifyWarning('Full name required'); return }
  setSaving(true)
  const payload = buildPatientPayload({ ...regForm, full_name: regForm.full_name.trim() })
  const { error } = await executeWithFallback(
@@ -963,7 +564,7 @@ async function handleSavePatientProfile() {
    .eq('hospital_id', hospitalId),
  )
  if (error) {
-  window.notifyFromLegacyAlert('Error: ' + error.message)
+  notifyError('Error: ' + error.message)
   setSaving(false)
   return
  }
@@ -976,9 +577,9 @@ async function handleSavePatientProfile() {
 }
 
 async function handleRegister() {
- if (!canRegister) { window.notifyFromLegacyAlert('Only receptionists, nurses and admins can register patients.'); return }
- if (!visitForm.admission_fee || parseFloat(visitForm.admission_fee) <= 0) { window.notifyFromLegacyAlert('Enter a valid fee.'); return }
- if (visitForm.payment_method === 'M-Pesa' && !visitForm.mpesa_ref) { window.notifyFromLegacyAlert('Enter M-Pesa reference.'); return }
+ if (!canRegister) { notifyWarning('Only receptionists, nurses and admins can register patients.'); return }
+ if (!visitForm.admission_fee || parseFloat(visitForm.admission_fee) <= 0) { notifyWarning('Enter a valid fee.'); return }
+ if (visitForm.payment_method === 'M-Pesa' && !visitForm.mpesa_ref) { notifyWarning('Enter M-Pesa reference.'); return }
  setSaving(true)
  try {
  let patientId = selectedPatient?.id
@@ -1003,7 +604,7 @@ async function handleRegister() {
   () => supabase.from('patients').insert(patientPayload).select().single(),
   async () => supabase.from('patients').insert(omitKeys(patientPayload, ['huduma_number', 'insurance_member_number', 'insurer_name', 'sha_member_no'])).select().single(),
  )
- if (error) { window.notifyFromLegacyAlert('Error: ' + error.message); setSaving(false); return }
+ if (error) { notifyError('Error: ' + error.message); setSaving(false); return }
  patientId = np.id
  patientRecord = np
  }
@@ -1024,7 +625,7 @@ async function handleRegister() {
  mpesa_ref: visitForm.mpesa_ref || null,
  status: initialStatus,
  }).select('id, visit_number').single()
- if (vErr) { window.notifyFromLegacyAlert('Error: ' + vErr.message); setSaving(false); return }
+ if (vErr) { notifyError('Error: ' + vErr.message); setSaving(false); return }
 
  // Sales ledger
  const visitLedgerPayload = {
@@ -1047,11 +648,9 @@ async function handleRegister() {
   visitForm.payment_method === 'SHA'
    ? 'SHA (Social Health Authority)'
    : visitForm.payment_method
- const isInsurancePayment = !['Cash', 'M-Pesa'].includes(mappedPaymentMethod)
- const paidAmount = isInsurancePayment ? 0 : consultationAmount
- const balanceAmount = isInsurancePayment ? consultationAmount : 0
+ const isInsurancePayment = !isSelfPayMethod(mappedPaymentMethod)
 
-const { error: invoiceErr } = await supabase.from('invoices').insert({
+const { data: visitInvoice, error: invoiceErr } = await supabase.from('invoices').insert({
   hospital_id: hospitalId,
   patient_id: patientId,
   visit_id: createdVisit?.id || null,
@@ -1068,27 +667,26 @@ const { error: invoiceErr } = await supabase.from('invoices').insert({
     visitId: createdVisit?.id || null,
    }),
   ]),
-  amount_kes: consultationAmount,
-  paid_kes: paidAmount,
-  balance_kes: balanceAmount,
+  ...unpaidInvoiceFields(consultationAmount),
   payment_method: mappedPaymentMethod,
   insurer: mappedPaymentMethod === 'SHA (Social Health Authority)' ? 'SHA' : (isInsurancePayment ? mappedPaymentMethod : null),
   sha_member_no: mappedPaymentMethod === 'SHA (Social Health Authority)' ? (regForm.sha_member_no || regForm.insurance_member_number || regForm.insurance_number || selectedPatient?.sha_member_no || null) : null,
-  status: isInsurancePayment ? 'Pending' : 'Paid',
   notes: buildWorkflowInvoiceNote({
    source: SERVICE_SOURCES.CONSULTATION,
    sourceId: createdVisit?.visit_number || visitNumber,
    visitId: createdVisit?.id || null,
    summary: `Consultation fee for ${createdVisit?.visit_number || visitNumber}`,
   }),
-  paid_at: isInsurancePayment ? null : new Date().toISOString(),
   created_at: new Date().toISOString(),
- })
+ }).select('*').single()
  if (invoiceErr) { console.error('Consultation invoice creation failed', invoiceErr) }
 
- // Print receipt
- if (!canPrint) {
-   window.notifyFromLegacyAlert('Only billing-authorized users can print receipts.')
+ // Self-pay visit fee is paid at the cashier, who prints the official receipt.
+ const feeAtCashier = Boolean(visitInvoice && !isInsurancePayment && consultationAmount > 0)
+ if (feeAtCashier) {
+   notifySentToCashier(visitInvoice, 'Visit created')
+ } else if (!canPrint) {
+   notifyWarning('Only billing-authorized users can print receipts.')
  } else {
    printReceipt(hospitalName, hospitalId, patientRecord || selectedPatient || regForm, {
      visit_number: visitNumber, visit_type: visitForm.visit_type,
@@ -1111,7 +709,7 @@ const { error: invoiceErr } = await supabase.from('invoices').insert({
   window.dispatchEvent(new CustomEvent('remedacare:workflow_changed', { detail: { visit_id: createdVisit?.id, source: 'patient-registration' } }))
  } catch (e) {}
  await Promise.all([fetchData(), fetchPatientPage(patientPage), fetchRecentPatients(), fetchDuplicateGroups()])
-} catch (e) { window.notifyFromLegacyAlert('Error: ' + e.message) }
+} catch (e) { notifyError('Error: ' + e.message) }
  setSaving(false)
  }
 
@@ -1120,7 +718,7 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
  const basePatient = record?.patients || record || null
  const patientId = record?.patient_id || basePatient?.id
  if (!patientId) return
- setShowDetail({ patient_id: patientId, patients: basePatient, loading: true, timeline: [], highlightedVisitId })
+ setShowDetail({ patient_id: patientId, patients: basePatient, loading: true, timeline: [], workflowEvents: [], highlightedVisitId })
  try {
   const { data: patientRow } = await supabase
    .from('patients')
@@ -1142,11 +740,13 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
    prescriptionsResult,
    labTestsResult,
    invoicesResult,
+  workflowEventsResult,
   ] = await Promise.all([
    visitIds.length ? supabase.from('consultations').select('*').eq('hospital_id', hospitalId).in('visit_id', visitIds).order('created_at', { ascending: false }) : Promise.resolve({ data: [] }),
    visitIds.length ? supabase.from('prescriptions').select('*').eq('hospital_id', hospitalId).in('visit_id', visitIds).order('created_at', { ascending: true }) : Promise.resolve({ data: [] }),
    visitIds.length ? supabase.from('lab_tests').select('*').eq('hospital_id', hospitalId).in('visit_id', visitIds).order('created_at', { ascending: true }) : Promise.resolve({ data: [] }),
    visitIds.length ? supabase.from('invoices').select('id, visit_id, invoice_no, amount_kes, paid_kes, balance_kes, status, payment_method, created_at').eq('hospital_id', hospitalId).in('visit_id', visitIds).order('created_at', { ascending: false }) : Promise.resolve({ data: [] }),
+  supabase.from('workflow_events').select('id, patient_id, visit_id, source_module, event_type, record_id, payload, created_at').eq('hospital_id', hospitalId).eq('patient_id', patientId).order('created_at', { ascending: false }).limit(100),
   ])
 
   const consultationsByVisit = Object.fromEntries((consultationsResult.data || []).map(item => [item.visit_id, item]))
@@ -1179,12 +779,13 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
    loading: false,
    highlightedVisitId,
    timeline,
+  workflowEvents: workflowEventsResult.error ? [] : (workflowEventsResult.data || []),
    chronicRecords: chronicPatientMap[patientId]?.latestByCondition || [],
   })
   setDetailTab('overview')
 } catch (error) {
   console.error('openPatientTimeline error:', error)
-  window.notifyFromLegacyAlert(`Could not load patient timeline: ${error.message}`)
+  notifyError(`Could not load patient timeline: ${error.message}`)
   setShowDetail(null)
  }
  }
@@ -1205,7 +806,7 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
  const selectedRows = rows.filter(row => selectedPatientIds.includes(row.id))
  const withPhones = selectedRows.filter(row => getPatientPhoneForWhatsApp(row))
  if (withPhones.length === 0) {
-  window.notifyFromLegacyAlert('Select at least one patient with a phone number.')
+  notifyWarning('Select at least one patient with a phone number.')
   return
  }
  withPhones.forEach((patient) => {
@@ -1218,7 +819,7 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
  async function handleBulkFollowUp(rows) {
  const selectedRows = rows.filter(row => selectedPatientIds.includes(row.id))
  if (selectedRows.length === 0) {
-  window.notifyFromLegacyAlert('Select at least one patient first.')
+  notifyWarning('Select at least one patient first.')
   return
  }
  const nowIso = new Date().toISOString()
@@ -1228,7 +829,7 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
   async () => supabase.from('patients').update({ updated_at: nowIso }).eq('hospital_id', hospitalId).in('id', ids),
  )
  if (result.error) {
-  window.notifyFromLegacyAlert(`Could not mark follow-up patients: ${result.error.message}`)
+  notifyError(`Could not mark follow-up patients: ${result.error.message}`)
   return
  }
  const nextFlags = { ...localFollowUpFlags }
@@ -1240,7 +841,7 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
 
  async function handleMergePatients(primaryPatient, duplicatePatient) {
  if (!isAdmin) {
-  window.notifyFromLegacyAlert('Only Admin users can merge duplicate patients.')
+  notifyWarning('Only Admin users can merge duplicate patients.')
   return
  }
  const confirmed = await window.openConfirmDialog(`Merge ${duplicatePatient.full_name} into ${primaryPatient.full_name}? This will move visits, invoices, labs, claims, and prescriptions to the kept record.`)
@@ -1286,18 +887,18 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
   }
   const { error: deleteError } = await supabase.from('patients').delete().eq('hospital_id', hospitalId).eq('id', source.id)
   if (deleteError) throw deleteError
-  window.notifyFromLegacyAlert(`Merged duplicate patient records into ${keeper.full_name}.`)
+  notifySuccess(`Merged duplicate patient records into ${keeper.full_name}.`)
   await Promise.all([fetchPatientPage(patientPage), fetchRecentPatients(), fetchDuplicateGroups(), fetchData()])
  } catch (error) {
-  window.notifyFromLegacyAlert(`Patient merge failed: ${error.message}`)
+  notifyError(`Patient merge failed: ${error.message}`)
  } finally {
   setSaving(false)
  }
  }
 
  async function handleSaveVitals() {
- if (!canVitals) { window.notifyFromLegacyAlert('Only nurses and admins can record vitals.'); return }
- if (!vitalsForm.weight_kg || !vitalsForm.bp_systolic) { window.notifyFromLegacyAlert('Weight and Systolic BP required.'); return }
+ if (!canVitals) { notifyWarning('Only nurses and admins can record vitals.'); return }
+ if (!vitalsForm.weight_kg || !vitalsForm.bp_systolic) { notifyWarning('Weight and Systolic BP required.'); return }
  setSaving(true)
  const bmi = vitalsForm.weight_kg && vitalsForm.height_cm
  ? parseFloat((parseFloat(vitalsForm.weight_kg) / Math.pow(parseFloat(vitalsForm.height_cm)/100, 2)).toFixed(1))
@@ -1318,10 +919,10 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
 
  // ── DOCTOR ────────────────────────────────────────────────────────────────
  async function handleSaveDoctor(nextStatus) {
- if (!canDoctor) { window.notifyFromLegacyAlert('Only doctors, clinical officers and admins can assess patients.'); return }
- if (nextStatus === 'Lab' && !canLab) { window.notifyFromLegacyAlert('Only doctors can order lab tests.'); return }
- if (nextStatus === 'Admitted' && !canAdmit) { window.notifyFromLegacyAlert('Only doctors and nurses can process admissions.'); return }
- if (!doctorForm.doctor_name) { window.notifyFromLegacyAlert('Enter doctor name.'); return }
+ if (!canDoctor) { notifyWarning('Only doctors, clinical officers and admins can assess patients.'); return }
+ if (nextStatus === 'Lab' && !canLab) { notifyWarning('Only doctors can order lab tests.'); return }
+ if (nextStatus === 'Admitted' && !canAdmit) { notifyWarning('Only doctors and nurses can process admissions.'); return }
+ if (!doctorForm.doctor_name) { notifyWarning('Enter doctor name.'); return }
  setSaving(true)
  const { error } = await supabase.from('visits').update({
  assigned_doctor_name: doctorForm.doctor_name,
@@ -1329,7 +930,7 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
  doctor_notes: doctorForm.notes,
  status: nextStatus,
  }).eq('id', showDoctor.id).eq('hospital_id', hospitalId)
- if (error) { window.notifyFromLegacyAlert('Error: ' + error.message); setSaving(false); return }
+ if (error) { notifyError('Error: ' + error.message); setSaving(false); return }
  setShowDoctor(null)
  setDoctorForm({ doctor_id:'', doctor_name:'', speciality:'', notes:'' })
  try {
@@ -1356,8 +957,8 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
  }
 
  async function handleSaveLab() {
- if (!canLab) { window.notifyFromLegacyAlert('Only doctors can order lab tests.'); return }
- if (labSelectedTests.length === 0) { window.notifyFromLegacyAlert('Select at least one test.'); return }
+ if (!canLab) { notifyWarning('Only doctors can order lab tests.'); return }
+ if (labSelectedTests.length === 0) { notifyWarning('Select at least one test.'); return }
  setSaving(true)
  const visit = showLab
  const p = visit.patients || {}
@@ -1382,7 +983,7 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
  }))
 
  const { error } = await supabase.from('lab_tests').insert(rows)
- if (error) { window.notifyFromLegacyAlert('Error saving tests: ' + error.message); setSaving(false); return }
+ if (error) { notifyError('Error saving tests: ' + error.message); setSaving(false); return }
 
  // Keep visit at 'Lab' — Laboratory.jsx will push it back to 'Doctor' when all tests done
  await supabase.from('visits').update({ status: 'Lab', lab_requested: true })
@@ -1400,22 +1001,27 @@ async function openPatientTimeline(record, highlightedVisitId = null) {
  async function handleSavePharmacy() {
  const activeStatus = showPharmacy?.status
  if (activeStatus === 'Pharmacy' && !canPharmacy) {
-  window.notifyFromLegacyAlert('Only pharmacists and admins can process pharmacy outcomes.')
+  notifyWarning('Only pharmacists and admins can process pharmacy outcomes.')
   return
  }
  if (activeStatus === 'Admission Requested' && !canAdmit) {
-  window.notifyFromLegacyAlert('Only doctors and nurses can process admissions.')
+  notifyWarning('Only doctors and nurses can process admissions.')
   return
  }
  if (activeStatus === 'Admitted' && !canDischarge) {
-  window.notifyFromLegacyAlert('Only doctors, nurses and admins can discharge patients.')
+  notifyWarning('Only doctors, nurses and admins can discharge patients.')
   return
  }
  const { outcome, bed_id, ward_id, refer_department, refer_ward } = pharmaForm
 
  // Validate
- if (outcome === 'Admitted' && !bed_id) { window.notifyFromLegacyAlert('Please select a ward and a free bed to admit the patient.'); return }
- if (outcome === 'Referred' && !refer_department) { window.notifyFromLegacyAlert('Please select the referring department.'); return }
+ if (outcome === 'Admitted' && !bed_id) { notifyWarning('Please select a ward and a free bed to admit the patient.'); return }
+ if (outcome === 'Referred' && !refer_department) { notifyWarning('Please select the referring department.'); return }
+ const undispensed = visitPrescriptions.filter(rx => !['Released', 'Rejected', 'Cancelled'].includes(rx.status || 'Pending'))
+ if (outcome !== 'Admitted' && outcome !== 'Referred' && undispensed.length > 0) {
+  notifyWarning(`${undispensed.length} prescription(s) have not been dispensed yet. Dispense them in the Pharmacy screen first (cash patients pay at the cashier before drugs are released), then close the visit.`)
+  return
+ }
 
  setSaving(true)
  try {
@@ -1454,109 +1060,10 @@ const referWard = wards.find(w => w.id === refer_ward)
 
  const { error } = await supabase.from('visits').update(visitUpdate)
  .eq('id', showPharmacy.id).eq('hospital_id', hospitalId)
- if (error) { window.notifyFromLegacyAlert('Error updating visit: ' + error.message); setSaving(false); return }
+ if (error) { notifyError('Error updating visit: ' + error.message); setSaving(false); return }
 
- // ── 3. Mark related prescriptions as released when pharmacy action is complete ─────────
- if (visitPrescriptions.length > 0) {
- const pendingRx = visitPrescriptions.filter(rx => (rx.status || 'Pending') !== 'Released')
- const prescriptionIds = pendingRx.map(rx => rx.id)
- if (prescriptionIds.length > 0) {
- const { error: rxErr } = await supabase.from('prescriptions').update({
- status: 'Released',
- dispensed_at: new Date().toISOString(),
- }).in('id', prescriptionIds).eq('hospital_id', hospitalId)
- if (rxErr) { window.notifyFromLegacyAlert('Visit saved but prescriptions update failed: ' + rxErr.message) }
- }
-
- // ── 3a. Deduct stock for released prescriptions and log the dispense ───
- const dispensedAt = new Date().toISOString()
- const releasedServiceLines = []
- for (const rx of pendingRx) {
- const quantity = Number(rx.quantity || 1)
- const { data: stockItem, error: stockErr } = await supabase.from('pharmacy_inventory')
- .select('id,drug_name,quantity_in_stock,selling_price')
- .eq('hospital_id', hospitalId)
- .ilike('drug_name', rx.drug_name || '')
- .limit(1)
- .maybeSingle()
- if (stockErr) {
- console.error('Stock lookup failed for', rx.drug_name, stockErr)
- continue
- }
- if (!stockItem) {
- console.warn('No pharmacy inventory match for', rx.drug_name)
- continue
- }
- const unitPrice = Number(stockItem.selling_price || 0)
- const lineTotal = unitPrice * quantity
- const newQty = Math.max(0, Number(stockItem.quantity_in_stock || 0) - quantity)
- await supabase.from('pharmacy_inventory').update({ quantity_in_stock: newQty }).eq('id', stockItem.id)
- const dispenseLedgerPayload = {
- hospital_id: hospitalId,
- visit_id: showPharmacy.id,
- receipt_number: `RX-${rx.id?.slice(-8) || Date.now().toString(36).slice(-8)}`,
- drug_name: rx.drug_name,
- qty_sold: quantity,
- total_kes: lineTotal,
- payment_method: 'Internal Dispense',
- served_by: p.full_name || 'Pharmacy',
- notes: `Prescription dispense — Patient: ${p.full_name || 'patient'} | Visit: ${showPharmacy.visit_number || showPharmacy.id}`,
- sold_at: dispensedAt,
- }
- await executeWithFallback(
-  () => supabase.from('sales_ledger').insert(dispenseLedgerPayload),
-  async () => supabase.from('sales_ledger').insert(omitKeys(dispenseLedgerPayload, ['visit_id'])),
- )
- releasedServiceLines.push(createServiceLine({
-  label: rx.drug_name || stockItem.drug_name || 'Dispensed drug',
-  qty: quantity,
-  unitPrice,
-  total: lineTotal,
-  source: SERVICE_SOURCES.PHARMACY,
-  sourceId: rx.id || stockItem.id,
-  visitId: showPharmacy.id,
-  meta: { prescription_id: rx.id || null },
- }))
- releasedPharmacyAmount += lineTotal
- }
-
- if (releasedServiceLines.length > 0) {
- const mappedPaymentMethod = hasCoverage
-  ? (isShaCoverage ? 'SHA (Social Health Authority)' : coverageName)
-  : 'Cash'
- const invoicePayload = {
-  hospital_id: hospitalId,
-  patient_id: showPharmacy.patient_id,
-  visit_id: showPharmacy.id,
-  patient_name: p.full_name || showPharmacy.patient_name || 'Patient',
-  invoice_no: `INV-${Date.now().toString().slice(-6)}`,
-  services: stringifyServiceLines(releasedServiceLines),
-  amount_kes: releasedPharmacyAmount,
-  paid_kes: 0,
-  balance_kes: releasedPharmacyAmount,
-  payment_method: mappedPaymentMethod,
-  insurer: hasCoverage ? (isShaCoverage ? 'SHA' : coverageName) : null,
-  sha_member_no: isShaCoverage ? (p.insurance_number || p.sha_member_no || null) : null,
-  status: 'Pending',
-  notes: buildWorkflowInvoiceNote({
-   source: SERVICE_SOURCES.PHARMACY,
-   sourceId: showPharmacy.visit_number || showPharmacy.id,
-   visitId: showPharmacy.id,
-   summary: `Pharmacy release for ${showPharmacy.visit_number || showPharmacy.id}`,
-  }),
-  created_at: dispensedAt,
- }
- const { data: pharmacyInvoice, error: invoiceErr } = await supabase.from('invoices')
- .insert(invoicePayload)
- .select('id, invoice_no, amount_kes')
- .single()
- if (invoiceErr) {
-  window.notifyFromLegacyAlert('Visit saved and drugs were dispensed, but billing invoice creation failed: ' + invoiceErr.message)
- } else {
-  createdPharmacyInvoice = pharmacyInvoice
- }
- }
- }
+ // ── 3. Prescriptions are NOT dispensed here. The Pharmacy screen does it, with pharmacist approval,
+ //       allergy / interaction / PPB checks, batch tracking and pay-before-dispense for self-pay patients.
 
  // ── 4. Admitted → free any previous bed, then assign new one ────────────
  if (outcome === 'Admitted' && bed_id) {
@@ -1570,7 +1077,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  status:'Occupied', patient_id:showPharmacy.patient_id,
  visit_id:showPharmacy.id, admitted_at:new Date().toISOString(),
  }).eq('id', bed_id).eq('hospital_id', hospitalId)
- if (bedErr) { window.notifyFromLegacyAlert('Visit saved but bed assignment failed: ' + bedErr.message) }
+ if (bedErr) { notifyError('Visit saved but bed assignment failed: ' + bedErr.message) }
 
  // ── Create admission record (with duplicate guard) ───────────────────
  const { data: existingAdm } = await supabase
@@ -1626,7 +1133,7 @@ const referWard = wards.find(w => w.id === refer_ward)
   }))
  } catch (e) {}
  await fetchData()
-} catch(e) { window.notifyFromLegacyAlert('Unexpected error: ' + e.message) }
+} catch(e) { notifyError('Unexpected error: ' + e.message) }
  setSaving(false)
  }
 
@@ -1676,13 +1183,15 @@ const referWard = wards.find(w => w.id === refer_ward)
  })
 
  const detailPatient = showDetail?.patients || null
+ const [showNetworkImport, setShowNetworkImport] = useState(false)
  const detailTimeline = showDetail?.timeline || []
+ const detailWorkflowEvents = showDetail?.workflowEvents || []
  const detailChronicRecords = showDetail?.chronicRecords || []
  const focusVisit = detailTimeline.find(item => item.id === showDetail?.highlightedVisitId) || detailTimeline[0] || null
 
  // ── loading ───────────────────────────────────────────────────────────────
  if (loading) return (
- <div style={s.loadWrap}><div style={s.spinner}/><p style={{color:'#5B21B6',marginTop:12}}>Loading...</p></div>
+ <div style={s.loadWrap}><div style={s.spinner}/><p style={{color:'#0F6E56',marginTop:12}}>Loading...</p></div>
  )
 
  // ═══════════════════════════════════════════════════════════════════════════
@@ -1691,7 +1200,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <style>{`
  @keyframes spin{to{transform:rotate(360deg)}}
  @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
- .hov-card:hover{border-color:#5B21B6!important;box-shadow:0 4px 16px rgba(15,110,86,.12)!important}
+ .hov-card:hover{border-color:#0F6E56!important;box-shadow:0 4px 16px rgba(15,110,86,.12)!important}
  `}</style>
 
  {/* ── HEADER ─────────────────────────────────────────────────────────── */}
@@ -1704,7 +1213,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  </div>
  <div style={{display:'flex',gap:8,flexWrap:'wrap',alignItems:'center'}}>
  {/* Date range selector */}
- <select style={s.rangeSelect} value={dateRange} onChange={e=>setDateRange(e.target.value)}>
+ <select style={s.rangeSelect} aria-label="Date range" value={dateRange} onChange={e=>setDateRange(e.target.value)}>
  <option value="today">Today</option>
  <option value="week">This Week</option>
  <option value="2weeks">2 Weeks</option>
@@ -1721,8 +1230,20 @@ const referWard = wards.find(w => w.id === refer_ward)
  title="Only receptionists, nurses and admins can register patients">
  + Register Patient
  </button>
+ <button style={{...s.tabToggle}} onClick={()=>setShowNetworkImport(true)} disabled={!canRegister} title="Register a patient already known at one of your organisation's other facilities">🔗 From another facility</button>
  </div>
  </div>
+ {showNetworkImport && (
+  <NetworkPatientImport
+   hospitalId={hospitalId}
+   onClose={()=>setShowNetworkImport(false)}
+   onImported={async (id, src)=>{
+    setShowNetworkImport(false)
+    notifySuccess(`${src.full_name} is now registered here (linked to ${src.hospital_name}).`)
+    await Promise.all([fetchData(), fetchPatientPage(patientPage), fetchRecentPatients()])
+   }}
+  />
+ )}
 
  {/* ── PIPELINE ───────────────────────────────────────────────────────── */}
  {view==='queue' && (
@@ -1809,12 +1330,12 @@ const referWard = wards.find(w => w.id === refer_ward)
  <div key={st} style={{display:'flex',alignItems:'center'}}>
  <div title={st} style={{
  width:10,height:10,borderRadius:'50%',
- background: done||active ? '#5B21B6' : '#e0e0e0',
+ background: done||active ? '#0F6E56' : '#e0e0e0',
  opacity: active ? 1 : done ? 0.6 : 0.3,
- border: active ? '2px solid #5B21B6' : 'none',
+ border: active ? '2px solid #0F6E56' : 'none',
  boxSizing:'border-box'
  }}/>
- {j<STEPS.length-1 && <div style={{width:14,height:1,background:done?'#D8B4FE':'#e0e0e0'}}/>}
+ {j<STEPS.length-1 && <div style={{width:14,height:1,background:done?'#B4E5D0':'#e0e0e0'}}/>}
  </div>
  )
  })}
@@ -2023,7 +1544,7 @@ const referWard = wards.find(w => w.id === refer_ward)
           </div>
          </td>
          <td style={s.td}>
-          <div style={{fontWeight:700,color:meta.hasOutstandingBalance ? '#B42318' : '#5B21B6'}}>
+          <div style={{fontWeight:700,color:meta.hasOutstandingBalance ? '#B42318' : '#0F6E56'}}>
            {formatCurrency(meta.outstandingBalance || 0)}
           </div>
           <div style={{fontSize:11,color:'#667085',marginTop:4}}>
@@ -2114,7 +1635,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <h2 style={s.modalTitle}>Patient Check-In</h2>
  <p style={{fontSize:13,color:'#888',margin:'4px 0 0'}}>Search first to avoid duplicate registration</p>
  </div>
- <button style={s.closeBtn} onClick={()=>setShowSearchModal(false)}></button>
+ <button style={s.closeBtn} onClick={()=>setShowSearchModal(false)} aria-label="Close" title="Close">✕</button>
  </div>
  <div style={s.modalBody}>
  <div style={{display:'flex',gap:10,marginBottom:16}}>
@@ -2147,7 +1668,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  </div>
  </div>
  </div>
- <div style={{fontSize:12,color:'#5B21B6',fontWeight:600}}>Check In</div>
+ <div style={{fontSize:12,color:'#0F6E56',fontWeight:600}}>Check In</div>
  </div>
  ))}
  </div>
@@ -2194,16 +1715,16 @@ const referWard = wards.find(w => w.id === refer_ward)
  </div>
  {p.allergies && <div style={{fontSize:11,color:'#A32D2D',marginTop:3}}> {p.allergies}</div>}
  {p.chronic_conditions && <div style={{fontSize:11,color:'#C07000',marginTop:2}}> {p.chronic_conditions}</div>}
- {(p.insurer_name || p.insurer || p.insurance) && (p.insurer_name || p.insurer || p.insurance)!=='None' && <div style={{fontSize:11,color:'#5B21B6',marginTop:2}}> {p.insurer_name || p.insurer || p.insurance} {(p.insurance_member_number || p.insurance_number)&&`• ${p.insurance_member_number || p.insurance_number}`}</div>}
+ {(p.insurer_name || p.insurer || p.insurance) && (p.insurer_name || p.insurer || p.insurance)!=='None' && <div style={{fontSize:11,color:'#0F6E56',marginTop:2}}> {p.insurer_name || p.insurer || p.insurance} {(p.insurance_member_number || p.insurance_number)&&`• ${p.insurance_member_number || p.insurance_number}`}</div>}
  </div>
  </div>
- <div style={{fontSize:12,color:'#5B21B6',fontWeight:600}}>Check In →</div>
+ <div style={{fontSize:12,color:'#0F6E56',fontWeight:600}}>Check In →</div>
  </div>
  ))}
  </div>
  <div style={{borderTop:'1px solid #f0f0f0',paddingTop:14,textAlign:'center'}}>
  <span style={{fontSize:13,color:'#888'}}>Not the right patient? </span>
- <span style={{fontSize:13,color:'#5B21B6',fontWeight:600,cursor:'pointer'}} onClick={openNewPatient}>Register as New Patient →</span>
+ <span style={{fontSize:13,color:'#0F6E56',fontWeight:600,cursor:'pointer'}} onClick={openNewPatient}>Register as New Patient →</span>
  </div>
  </>
  )}
@@ -2229,17 +1750,17 @@ const referWard = wards.find(w => w.id === refer_ward)
  <div style={{display:'flex',gap:6,marginTop:8}}>
  {['Demographics','Visit & Payment'].map((lbl,i)=>(
  <div key={i} style={{display:'flex',alignItems:'center',gap:6}}>
- <div style={{width:22,height:22,borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:700,background:regStep>i+1?'#5B21B6':regStep===i+1?'#5B21B6':'#e0e0e0',color:regStep>=i+1?'#fff':'#888'}}>
+ <div style={{width:22,height:22,borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:700,background:regStep>i+1?'#0F6E56':regStep===i+1?'#0F6E56':'#e0e0e0',color:regStep>=i+1?'#fff':'#888'}}>
  {regStep>i+1?'':i+1}
  </div>
- <span style={{fontSize:12,color:regStep===i+1?'#5B21B6':'#999',fontWeight:regStep===i+1?600:400}}>{lbl}</span>
+ <span style={{fontSize:12,color:regStep===i+1?'#0F6E56':'#999',fontWeight:regStep===i+1?600:400}}>{lbl}</span>
  {i===0 && <span style={{color:'#ccc'}}>→</span>}
  </div>
  ))}
  </div>
  )}
  </div>
- <button style={s.closeBtn} onClick={()=>setShowRegister(false)}></button>
+ <button style={s.closeBtn} onClick={()=>setShowRegister(false)} aria-label="Close" title="Close">✕</button>
  </div>
 
  <div style={s.modalBody}>
@@ -2365,7 +1886,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  {(regStep===2 || isReturning) && (
  <>
  {/* Patient summary */}
- <div style={{...s.summaryCard,background:isReturning?'#F3E8FF':'#f9fafb',border:isReturning?'1px solid #D8B4FE':'1px solid #eee',marginBottom:16}}>
+ <div style={{...s.summaryCard,background:isReturning?'#E1F5EE':'#f9fafb',border:isReturning?'1px solid #B4E5D0':'1px solid #eee',marginBottom:16}}>
  <div style={{display:'flex',alignItems:'center',gap:12}}>
  <div style={{...s.avatar,...getAvatarStyle(selectedPatient?.full_name||regForm.full_name),width:44,height:44,fontSize:18}}>
  {(selectedPatient?.full_name||regForm.full_name)?.split(' ').map(part => part[0]).join('').slice(0,2).toUpperCase()}
@@ -2379,9 +1900,9 @@ const referWard = wards.find(w => w.id === refer_ward)
  </div>
  <div style={{fontSize:11,color:'#667085',marginTop:4}}>{selectedPatient?.patient_number || regForm.patient_number || 'Pending patient number'}</div>
  {(selectedPatient?.allergies||regForm.allergies) && <div style={{fontSize:11,color:'#A32D2D',marginTop:3}}> {selectedPatient?.allergies||regForm.allergies}</div>}
- {(selectedPatient?.sha_member_no||regForm.sha_member_no) && <div style={{fontSize:11,color:'#5B21B6',marginTop:2}}>SHA: {selectedPatient?.sha_member_no||regForm.sha_member_no}</div>}
- {(selectedPatient?.insurer_name||selectedPatient?.insurer||selectedPatient?.insurance||regForm.insurer_name||regForm.insurance) && ((selectedPatient?.insurer_name||selectedPatient?.insurer||selectedPatient?.insurance||regForm.insurer_name||regForm.insurance)!=='None') && <div style={{fontSize:11,color:'#5B21B6',marginTop:2}}> {selectedPatient?.insurer_name||selectedPatient?.insurer||selectedPatient?.insurance||regForm.insurer_name||regForm.insurance}</div>}
- {isReturning && <span style={{...s.pill,background:'#F3E8FF',color:'#5B21B6',fontSize:10,marginTop:4,display:'inline-block'}}>🔄 Returning Patient</span>}
+ {(selectedPatient?.sha_member_no||regForm.sha_member_no) && <div style={{fontSize:11,color:'#0F6E56',marginTop:2}}>SHA: {selectedPatient?.sha_member_no||regForm.sha_member_no}</div>}
+ {(selectedPatient?.insurer_name||selectedPatient?.insurer||selectedPatient?.insurance||regForm.insurer_name||regForm.insurance) && ((selectedPatient?.insurer_name||selectedPatient?.insurer||selectedPatient?.insurance||regForm.insurer_name||regForm.insurance)!=='None') && <div style={{fontSize:11,color:'#0F6E56',marginTop:2}}> {selectedPatient?.insurer_name||selectedPatient?.insurer||selectedPatient?.insurance||regForm.insurer_name||regForm.insurance}</div>}
+ {isReturning && <span style={{...s.pill,background:'#E1F5EE',color:'#0F6E56',fontSize:10,marginTop:4,display:'inline-block'}}>🔄 Returning Patient</span>}
  </div>
  </div>
  </div>
@@ -2413,7 +1934,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <div style={s.sectionLabel}>Consultation Fee</div>
  <div style={s.grid2}>
  <Fld label="Amount (KES) *">
- <input style={{...s.input,fontSize:18,fontWeight:700,color:'#5B21B6'}} type="number"
+ <input style={{...s.input,fontSize:18,fontWeight:700,color:'#0F6E56'}} type="number"
  value={visitForm.admission_fee} onChange={e=>setVisitForm({...visitForm,admission_fee:e.target.value})}/>
  </Fld>
  <Fld label="Payment Method *">
@@ -2434,7 +1955,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <div style={{display:'flex',justifyContent:'space-between',marginBottom:6}}><span style={{color:'#555'}}>Payment</span><span style={{fontWeight:600}}>{visitForm.payment_method}</span></div>
  <div style={{borderTop:'1px solid #e0e0e0',paddingTop:10,display:'flex',justifyContent:'space-between'}}>
  <span style={{fontWeight:700}}>Total Collected</span>
- <span style={{fontWeight:800,fontSize:18,color:'#5B21B6'}}>KES {parseFloat(visitForm.admission_fee||0).toLocaleString()}</span>
+ <span style={{fontWeight:800,fontSize:18,color:'#0F6E56'}}>KES {parseFloat(visitForm.admission_fee||0).toLocaleString()}</span>
  </div>
  </div>
  </>
@@ -2458,7 +1979,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  {saving?'Saving...':'Save Patient'}
  </button>
  ) : (
- <button style={s.primaryBtn} onClick={()=>{if(!regForm.full_name){window.notifyFromLegacyAlert('Full name required');return}setRegStep(2)}}>
+ <button style={s.primaryBtn} onClick={()=>{if(!regForm.full_name){notifyWarning('Full name required');return}setRegStep(2)}}>
  Next: Visit & Payment →
  </button>
  )}
@@ -2479,7 +2000,7 @@ const referWard = wards.find(w => w.id === refer_ward)
        {registrationComplete.patientName} has been checked in successfully.
       </p>
      </div>
-     <button style={s.closeBtn} onClick={() => setRegistrationComplete(null)}></button>
+     <button style={s.closeBtn} onClick={() => setRegistrationComplete(null)} aria-label="Close" title="Close">✕</button>
     </div>
     <div style={s.modalBody}>
      <div style={s.summaryCard}>
@@ -2510,7 +2031,7 @@ const referWard = wards.find(w => w.id === refer_ward)
         setShowVitals(registrationVisit)
         setVitalsForm({ weight_kg:'', height_cm:'', bp_systolic:'', bp_diastolic:'', pulse_bpm:'', temperature_c:'', oxygen_sat:'', respiratory_rate:'', blood_sugar:'', recorded_by:'' })
        } else {
-        window.notifyFromLegacyAlert(`This patient is still in ${registrationVisitStatus || 'workflow'}. Complete vitals before opening consultation.`)
+        notifyWarning(`This patient is still in ${registrationVisitStatus || 'workflow'}. Complete vitals before opening consultation.`)
        }
        setRegistrationComplete(null)
       }}
@@ -2533,7 +2054,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <h2 style={s.modalTitle}> Record Vitals</h2>
  <p style={{margin:'4px 0 0',fontSize:13,color:'#888'}}>{showVitals.patients?.full_name} — {showVitals.visit_number}</p>
  </div>
- <button style={s.closeBtn} onClick={()=>setShowVitals(null)}></button>
+ <button style={s.closeBtn} onClick={()=>setShowVitals(null)} aria-label="Close" title="Close">✕</button>
  </div>
  <div style={s.modalBody}>
  {/* Patient alert bar */}
@@ -2564,8 +2085,8 @@ const referWard = wards.find(w => w.id === refer_ward)
  {vitalsForm.weight_kg && vitalsForm.height_cm && (()=>{
  const bmi = parseFloat(vitalsForm.weight_kg)/Math.pow(parseFloat(vitalsForm.height_cm)/100,2)
  const cat = bmi<18.5?'Underweight':bmi<25?'Normal':bmi<30?'Overweight':'Obese'
- const col = bmi<18.5||bmi>=30?'#A32D2D':bmi<25?'#5B21B6':'#C07000'
- return <div style={{background:'#F3E8FF',padding:'10px 14px',borderRadius:8,fontSize:13,color:col,marginBottom:12}}>
+ const col = bmi<18.5||bmi>=30?'#A32D2D':bmi<25?'#0F6E56':'#C07000'
+ return <div style={{background:'#E1F5EE',padding:'10px 14px',borderRadius:8,fontSize:13,color:col,marginBottom:12}}>
  BMI: <strong>{bmi.toFixed(1)}</strong> — {cat}
  </div>
  })()}
@@ -2595,7 +2116,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <h2 style={s.modalTitle}>👨‍⚕ Doctor Assessment</h2>
  <p style={{margin:'4px 0 0',fontSize:13,color:'#888'}}>{showDoctor.patients?.full_name} — {showDoctor.visit_number}</p>
  </div>
- <button style={s.closeBtn} onClick={()=>setShowDoctor(null)}></button>
+ <button style={s.closeBtn} onClick={()=>setShowDoctor(null)} aria-label="Close" title="Close">✕</button>
  </div>
  <div style={s.modalBody}>
  {/* vitals summary if available */}
@@ -2628,10 +2149,10 @@ const referWard = wards.find(w => w.id === refer_ward)
  {activeDocs.map(doc => (
  <div key={doc.id} onClick={() => setDoctorForm({...doctorForm, doctor_id: doc.id, doctor_name: doc.full_name})}
  style={{padding:12,borderRadius:8,cursor:'pointer',marginBottom:8,display:'flex',justifyContent:'space-between',alignItems:'center',
- border:doctorForm.doctor_id===doc.id?'2px solid #5B21B6':'1px solid #eee',
- background:doctorForm.doctor_id===doc.id?'#F3E8FF':'#fff'}}>
+ border:doctorForm.doctor_id===doc.id?'2px solid #0F6E56':'1px solid #eee',
+ background:doctorForm.doctor_id===doc.id?'#E1F5EE':'#fff'}}>
  <div><div style={{fontWeight:600}}>Dr. {doc.full_name}</div><div style={{fontSize:12,color:'#888'}}>{doc.speciality}</div></div>
- <span style={{...s.pill,background:'#F3E8FF',color:'#5B21B6',fontSize:10}}>On Shift</span>
+ <span style={{...s.pill,background:'#E1F5EE',color:'#0F6E56',fontSize:10}}>On Shift</span>
  </div>
  ))}
  </div>
@@ -2642,8 +2163,8 @@ const referWard = wards.find(w => w.id === refer_ward)
  {offDocs.map(doc => (
  <div key={doc.id} onClick={() => setDoctorForm({...doctorForm, doctor_id: doc.id, doctor_name: doc.full_name})}
  style={{padding:12,borderRadius:8,cursor:'pointer',marginBottom:8,display:'flex',justifyContent:'space-between',alignItems:'center',
- border:doctorForm.doctor_id===doc.id?'2px solid #5B21B6':'1px solid #eee',
- background:doctorForm.doctor_id===doc.id?'#F3E8FF':'#fff'}}>
+ border:doctorForm.doctor_id===doc.id?'2px solid #0F6E56':'1px solid #eee',
+ background:doctorForm.doctor_id===doc.id?'#E1F5EE':'#fff'}}>
  <div><div style={{fontWeight:600}}>Dr. {doc.full_name}</div><div style={{fontSize:12,color:'#888'}}>{doc.speciality}</div></div>
  <span style={{...s.pill,background:'#F3F4F6',color:'#555',fontSize:10}}>Off Duty</span>
  </div>
@@ -2663,7 +2184,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
  {[
  {label:' Lab Tests', status:'Lab', color:'#A32D2D', bg:'#FCEBEB', disabled:!canLab, title:'Only doctors can order lab tests'},
- {label:' Pharmacy', status:'Pharmacy', color:'#085041', bg:'#F3E8FF'},
+ {label:' Pharmacy', status:'Pharmacy', color:'#085041', bg:'#E1F5EE'},
  {label:' Admit to Ward', status:'Admitted', color:'#3B6D11', bg:'#EAF3DE', disabled:!canAdmit, title:'Only doctors and nurses can process admissions'},
  {label:'✅ Completed (Go Home)', status:'Completed', color:'#555', bg:'#f0f0f0'},
  ].map(opt=>(
@@ -2699,7 +2220,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  {showLab.assigned_doctor_name && ` — Dr. ${showLab.assigned_doctor_name}`}
  </p>
  </div>
- <button style={s.closeBtn} onClick={()=>setShowLab(null)}></button>
+ <button style={s.closeBtn} onClick={()=>setShowLab(null)} aria-label="Close" title="Close">✕</button>
  </div>
  <div style={s.modalBody}>
 
@@ -2724,8 +2245,8 @@ const referWard = wards.find(w => w.id === refer_ward)
  {LAB_TEST_CATEGORIES.map(cat=>(
  <button key={cat}
  style={{padding:'5px 12px',borderRadius:99,border:'1px solid',fontSize:12,cursor:'pointer',fontWeight:500,
- borderColor: labCategory===cat ? '#5B21B6' : '#ddd',
- background: labCategory===cat ? '#5B21B6' : '#fff',
+ borderColor: labCategory===cat ? '#0F6E56' : '#ddd',
+ background: labCategory===cat ? '#0F6E56' : '#fff',
  color: labCategory===cat ? '#fff' : '#555'}}
  onClick={()=>setLabCategory(cat)}>
  {cat}
@@ -2739,8 +2260,8 @@ const referWard = wards.find(w => w.id === refer_ward)
  const checked = !!labSelectedTests.find(t=>t.test_name===test)
  return (
  <div key={test} onClick={()=>toggleLabTest(test)}
- style={{padding:'7px 13px',borderRadius:8,border:`1.5px solid ${checked?'#5B21B6':'#ddd'}`,
- background:checked?'#F3E8FF':'#fff',color:checked?'#5B21B6':'#444',
+ style={{padding:'7px 13px',borderRadius:8,border:`1.5px solid ${checked?'#0F6E56':'#ddd'}`,
+ background:checked?'#E1F5EE':'#fff',color:checked?'#0F6E56':'#444',
  fontSize:12,cursor:'pointer',fontWeight:checked?600:400,transition:'all .15s',
  display:'flex',alignItems:'center',gap:6}}>
  {checked && <span style={{fontSize:10}}></span>}
@@ -2761,12 +2282,12 @@ const referWard = wards.find(w => w.id === refer_ward)
  {/* Selected tests summary */}
  {labSelectedTests.length > 0 && (
  <div style={{background:'#f9fafb',border:'1px solid #eee',borderRadius:10,padding:'12px 14px'}}>
- <div style={{fontSize:11,fontWeight:700,color:'#5B21B6',textTransform:'uppercase',letterSpacing:.6,marginBottom:8}}>
+ <div style={{fontSize:11,fontWeight:700,color:'#0F6E56',textTransform:'uppercase',letterSpacing:.6,marginBottom:8}}>
  {labSelectedTests.length} test{labSelectedTests.length!==1?'s':''} ordered:
  </div>
  <div style={{display:'flex',flexWrap:'wrap',gap:6}}>
  {labSelectedTests.map(t=>(
- <span key={t.test_name} style={{background:'#F3E8FF',color:'#5B21B6',border:'1px solid #D8B4FE',
+ <span key={t.test_name} style={{background:'#E1F5EE',color:'#0F6E56',border:'1px solid #B4E5D0',
  borderRadius:99,padding:'4px 10px',fontSize:12,fontWeight:500,display:'flex',alignItems:'center',gap:6}}>
  {t.test_name}
  <span style={{cursor:'pointer',fontWeight:700,color:'#A32D2D'}}
@@ -2777,7 +2298,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  </div>
  )}
 
- <div style={{background:'#F0EAFC',border:'1px solid #D4B8F4',borderRadius:8,padding:'10px 14px',fontSize:12,color:'#7B5EA7',marginTop:14}}>
+ <div style={{background:'#EAF5EF',border:'1px solid #D4B8F4',borderRadius:8,padding:'10px 14px',fontSize:12,color:'#7B5EA7',marginTop:14}}>
  ⚡ Tests will be sent to <strong>Laboratory</strong>. Patient stays in Lab queue until all results are entered, then auto-returns to Doctor.
  </div>
  </div>
@@ -2803,7 +2324,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <h2 style={s.modalTitle}> Pharmacy & Discharge</h2>
  <p style={{margin:'4px 0 0',fontSize:13,color:'#888'}}>{showPharmacy.patients?.full_name} — {showPharmacy.visit_number}</p>
  </div>
- <button style={s.closeBtn} onClick={()=>setShowPharmacy(null)}></button>
+ <button style={s.closeBtn} onClick={()=>setShowPharmacy(null)} aria-label="Close" title="Close">✕</button>
  </div>
  <div style={s.modalBody}>
  {showPharmacy.patients?.allergies && (
@@ -2816,7 +2337,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <div style={{marginBottom:14,padding:12,borderRadius:10,background:'#f5f7fb',color:'#555',fontSize:13}}>Loading prescriptions...</div>
  ) : visitPrescriptions.length > 0 ? (
  <div style={{marginBottom:14,padding:12,borderRadius:10,border:'1px solid #e0e0e0',background:'#f9fafb'}}>
- <div style={{fontSize:12,fontWeight:700,color:'#5B21B6',marginBottom:10}}>Prescriptions sent from consultation</div>
+ <div style={{fontSize:12,fontWeight:700,color:'#0F6E56',marginBottom:10}}>Prescriptions sent from consultation</div>
  {visitPrescriptions.map(rx => (
  <div key={rx.id} style={{padding:'10px 12px',borderRadius:8,background:'#fff',border:'1px solid #eee',marginBottom:8}}>
  <div style={{display:'flex',justifyContent:'space-between',gap:12,flexWrap:'wrap'}}>
@@ -2826,7 +2347,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <div style={{fontSize:12,color:'#555',marginTop:4}}>{rx.dosage || '—'} • {rx.frequency || '—'} • {rx.duration || '—'}</div>
  <div style={{marginTop:8,display:'flex',gap:8,flexWrap:'wrap'}}>
  <span style={{fontSize:11,color:'#666'}}>{rx.status || 'Pending'}</span>
- {rx.dispensed && <span style={{fontSize:11,color:'#5B21B6'}}>Dispensed</span>}
+ {rx.dispensed && <span style={{fontSize:11,color:'#0F6E56'}}>Dispensed</span>}
  </div>
  </div>
  ))}
@@ -2847,7 +2368,7 @@ const referWard = wards.find(w => w.id === refer_ward)
  <div style={s.sectionLabel}>Patient Outcome</div>
  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:16}}>
  {[
- {label:'🏠 Outpatient', val:'Outpatient', color:'#5B21B6', bg:'#F3E8FF'},
+ {label:'🏠 Outpatient', val:'Outpatient', color:'#0F6E56', bg:'#E1F5EE'},
  {label:' Admit', val:'Admitted', color:'#3B6D11', bg:'#EAF3DE'},
  {label:'🔁 Refer', val:'Referred', color:'#C07000', bg:'#FFF3DC'},
  ].map(opt=>(
@@ -2923,7 +2444,7 @@ const referWard = wards.find(w => w.id === refer_ward)
 
  {/* Insurance notice */}
  {showPharmacy.patients?.insurance && showPharmacy.patients.insurance!=='None' && showPharmacy.patients.insurance!=='' && (
- <div style={{background:'#EAF3DE',border:'1px solid #D8B4FE',borderRadius:8,padding:'10px 14px',fontSize:12,color:'#3B6D11'}}>
+ <div style={{background:'#EAF3DE',border:'1px solid #B4E5D0',borderRadius:8,padding:'10px 14px',fontSize:12,color:'#3B6D11'}}>
  <strong>Insurance Patient ({showPharmacy.patients.insurance})</strong> — A claim will be auto-generated and saved to SHA Claims / Insurance Claims screen
  </div>
  )}
@@ -2951,7 +2472,7 @@ const referWard = wards.find(w => w.id === refer_ward)
    Visit history, prescriptions, lab results, balances, and radiology reports
   </p>
  </div>
- <button style={s.closeBtn} onClick={()=>setShowDetail(null)}></button>
+ <button style={s.closeBtn} onClick={()=>setShowDetail(null)} aria-label="Close" title="Close">✕</button>
  </div>
  <div style={s.modalBody}>
  {showDetail.loading ? (
@@ -2971,7 +2492,7 @@ const referWard = wards.find(w => w.id === refer_ward)
       <div style={{display:'flex',gap:8,flexWrap:'wrap',marginTop:8}}>
        {detailPatient?.blood_group && <span style={{...s.pill,background:'#E3F0FB',color:'#1a6fb5'}}>Blood {detailPatient.blood_group}</span>}
        {detailPatient?.allergies && <span style={{...s.pill,background:'#FCEBEB',color:'#A32D2D'}}>Allergies Recorded</span>}
-       {(detailPatient?.sha_member_no || detailPatient?.insurance === 'SHA' || detailPatient?.insurer === 'SHA') && <span style={{...s.pill,background:'#F3E8FF',color:'#5B21B6'}}>SHA Member</span>}
+       {(detailPatient?.sha_member_no || detailPatient?.insurance === 'SHA' || detailPatient?.insurer === 'SHA') && <span style={{...s.pill,background:'#E1F5EE',color:'#0F6E56'}}>SHA Member</span>}
       </div>
      </div>
     </div>
@@ -3019,6 +2540,49 @@ const referWard = wards.find(w => w.id === refer_ward)
      </div>
     ))}
    </div>
+
+  <PatientNetworkPanel patient={detailPatient} hospitalId={hospitalId} />
+
+  <div style={{...s.sectionLabel,marginTop:18}}>Cross-module activity</div>
+  {detailWorkflowEvents.length === 0 ? (
+   <div style={{padding:'18px 0',color:'#667085'}}>No workflow events recorded for this patient yet.</div>
+  ) : (
+   <div style={s.timelineList}>
+    {detailWorkflowEvents.map(event => {
+    const knownLabels = {
+     'emergency.red_triage': 'Emergency red triage',
+     'theatre.scheduled': 'Theatre case scheduled',
+     'theatre.started': 'Theatre case started',
+     'theatre.completed': 'Theatre case completed',
+    'blood.crossmatch_recorded': 'Blood crossmatch recorded',
+     'blood.issued': 'Blood unit issued',
+     'morgue.death_recorded': 'Mortuary admission recorded',
+     'morgue.release_requested': 'Mortuary release requested',
+     'morgue.released': 'Mortuary release approved',
+     'maternity.delivery_recorded': 'Delivery recorded',
+     'procurement.received': 'Goods received',
+     'safety.incident_opened': 'Safety incident opened',
+    }
+    const label = knownLabels[event.event_type] || String(event.event_type || 'Workflow update').replace(/[._]/g, ' ').replace(/\b\w/g, character => character.toUpperCase())
+    const source = event.source_module === 'blood-bank' ? 'blood-bank' : event.source_module
+    return (
+     <div key={event.id} style={s.timelineCard}>
+      <div style={s.timelineLineWrap}><div style={{...s.timelineDot,background:'#1A6FB5'}} /></div>
+      <div style={{flex:1}}>
+      <div style={{display:'flex',justifyContent:'space-between',gap:12,flexWrap:'wrap',alignItems:'flex-start'}}>
+       <div>
+        <div style={{fontSize:14,fontWeight:800,color:'#111'}}>{label}</div>
+        <div style={{fontSize:12,color:'#667085',marginTop:4}}>{event.payload?.title || event.source_module} • {formatDateTime(event.created_at)}</div>
+       </div>
+       <button type="button" style={s.linkButton} onClick={() => navigate?.(source)}>Open module</button>
+      </div>
+      {event.payload?.triage_category && <div style={{fontSize:12,color:'#667085',marginTop:6}}>Triage: {event.payload.triage_category}</div>}
+      </div>
+     </div>
+    )
+    })}
+   </div>
+  )}
 
    <div style={{...s.sectionLabel,marginTop:18}}>Visit Timeline</div>
    {detailTimeline.length === 0 ? (
@@ -3138,7 +2702,7 @@ const referWard = wards.find(w => w.id === refer_ward)
            <div style={{fontSize:12,color:'#334155',marginTop:6}}>{String(report.impression || report.report_text || 'No report text yet').slice(0, 120)}</div>
           </div>
           {['Reported','Verified'].includes(report.status) && (
-           <button style={{...s.primaryBtn,background:'#fff',color:'#5B21B6',border:'1px solid #5B21B6',padding:'8px 12px'}} onClick={() => openRadiologyReportPrintWindow({ ...report, patients: detailPatient || {} }, hospitalName)}>
+           <button style={{...s.primaryBtn,background:'#fff',color:'#0F6E56',border:'1px solid #0F6E56',padding:'8px 12px'}} onClick={() => openRadiologyReportPrintWindow({ ...report, patients: detailPatient || {} }, hospitalName)}>
             Print Report
            </button>
           )}
@@ -3222,11 +2786,11 @@ const referWard = wards.find(w => w.id === refer_ward)
  disabled={!canPrint}
  onClick={() => {
    if (!canPrint) {
-     window.notifyFromLegacyAlert('Only billing-authorized users can print receipts.')
+     notifyWarning('Only billing-authorized users can print receipts.')
      return
    }
    if (!focusVisit) {
-    window.notifyFromLegacyAlert('No visit available to reprint receipt for.')
+    notifyWarning('No visit available to reprint receipt for.')
     return
    }
    printReceipt(hospitalName, hospitalId, showDetail.patients||{}, {
@@ -3244,11 +2808,16 @@ const referWard = wards.find(w => w.id === refer_ward)
 }
 
 // ─── Tiny helper ─────────────────────────────────────────────────────────────
+// Links the label to its field (click the label to focus; screen readers announce it) when the field is a single
+// input / select / textarea without its own id.
 function Fld({label,children}) {
+ const autoId = useId()
+ const only = Children.count(children) === 1 && isValidElement(children) && ['input','select','textarea'].includes(children.type) ? children : null
+ const fieldId = only ? (only.props.id || autoId) : null
  return (
  <div style={{marginBottom:14}}>
- <label style={{fontSize:12,color:'#666',display:'block',marginBottom:5,fontWeight:500}}>{label}</label>
- {children}
+ <label htmlFor={fieldId || undefined} style={{fontSize:12,color:'#666',display:'block',marginBottom:5,fontWeight:500}}>{label}</label>
+ {only && !only.props.id ? cloneElement(only, { id: fieldId }) : children}
  </div>
  )
 }
@@ -3257,13 +2826,13 @@ function Fld({label,children}) {
 const s = {
  page: { padding:'20px 24px', flex:1, overflowY:'auto', background:'#f7f8f7', fontFamily:'-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif' },
  loadWrap: { height:'80vh', display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center' },
- spinner: { width:36, height:36, border:'3px solid #e8ebe8', borderTop:'3px solid #5B21B6', borderRadius:'50%', animation:'spin 0.9s linear infinite' },
+ spinner: { width:36, height:36, border:'3px solid #e8ebe8', borderTop:'3px solid #0F6E56', borderRadius:'50%', animation:'spin 0.9s linear infinite' },
  header: { display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:16, flexWrap:'wrap', gap:10 },
  title: { fontSize:26, fontWeight:800, margin:0, color:'#111' },
  subtitle: { color:'#777', margin:'4px 0 0', fontSize:13 },
- primaryBtn: { background:'#5B21B6', color:'#fff', border:'none', padding:'10px 20px', borderRadius:8, fontWeight:600, cursor:'pointer', fontSize:14 },
+ primaryBtn: { background:'#0F6E56', color:'#fff', border:'none', padding:'10px 20px', borderRadius:8, fontWeight:600, cursor:'pointer', fontSize:14 },
  tabToggle: { padding:'9px 16px', border:'1px solid #e0e0e0', borderRadius:8, background:'#fff', cursor:'pointer', fontSize:13, color:'#555', fontWeight:500 },
- tabActive: { background:'#5B21B6', color:'#fff', border:'1px solid #5B21B6' },
+ tabActive: { background:'#0F6E56', color:'#fff', border:'1px solid #0F6E56' },
  rangeSelect:{ padding:'9px 12px', border:'1px solid #ddd', borderRadius:8, fontSize:13, cursor:'pointer', background:'#fff', color:'#333' },
  registryToolbar: { display:'flex', gap:10, flexWrap:'wrap', marginBottom:14, background:'#fff', padding:'14px 16px', border:'1px solid #eee', borderRadius:12 },
  bulkBar: { display:'flex', justifyContent:'space-between', alignItems:'center', gap:12, flexWrap:'wrap', marginBottom:14, background:'#FFF8E8', border:'1px solid #F6D58C', borderRadius:12, padding:'12px 16px' },
@@ -3285,18 +2854,18 @@ const s = {
  table: { width:'100%', borderCollapse:'collapse' },
  th: { fontSize:11, color:'#888', fontWeight:600, textAlign:'left', padding:'12px 14px', borderBottom:'2px solid #f0f0f0', textTransform:'uppercase', letterSpacing:.5, whiteSpace:'nowrap' },
  td: { fontSize:13, color:'#333', padding:'12px 14px', verticalAlign:'middle' },
- avatar: { width:38, height:38, borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center', fontSize:15, fontWeight:700, color:'#5B21B6', flexShrink:0 },
+ avatar: { width:38, height:38, borderRadius:'50%', display:'flex', alignItems:'center', justifyContent:'center', fontSize:15, fontWeight:700, color:'#0F6E56', flexShrink:0 },
  patName: { fontWeight:600, color:'#111', fontSize:14 },
  pill: { fontSize:11, fontWeight:600, padding:'3px 8px', borderRadius:99 },
  actionBtn: { fontSize:12, padding:'6px 12px', border:'1px solid #ddd', borderRadius:6, background:'#fff', cursor:'pointer', fontWeight:500, color:'#333', whiteSpace:'nowrap' },
- smallActionBtn: { fontSize:12, padding:'7px 12px', border:'1px solid #5B21B6', borderRadius:8, background:'#F4FBF8', color:'#5B21B6', cursor:'pointer', fontWeight:700 },
+ smallActionBtn: { fontSize:12, padding:'7px 12px', border:'1px solid #0F6E56', borderRadius:8, background:'#F4FBF8', color:'#0F6E56', cursor:'pointer', fontWeight:700 },
  btnDisabled: { opacity:0.5, cursor:'not-allowed' },
- btnPri: { background:'#5B21B6', color:'#fff', border:'1px solid #5B21B6' },
+ btnPri: { background:'#0F6E56', color:'#fff', border:'1px solid #0F6E56' },
  btnGhost: { background:'#F8FAFC', color:'#98A2B3', border:'1px solid #E4E7EC' },
  btnOrange: { background:'#FFF3DC', color:'#C07000', border:'1px solid #FAC775' },
- btnPurple: { background:'#F0EAFC', color:'#7B5EA7', border:'1px solid #D4B8F4' },
+ btnPurple: { background:'#EAF5EF', color:'#7B5EA7', border:'1px solid #D4B8F4' },
  btnRed: { background:'#FCEBEB', color:'#A32D2D', border:'1px solid #f5c6cb' },
- btnGreen: { background:'#F3E8FF', color:'#5B21B6', border:'1px solid #D8B4FE' },
+ btnGreen: { background:'#E1F5EE', color:'#0F6E56', border:'1px solid #B4E5D0' },
  empty: { textAlign:'center', padding:'80px 20px', color:'#999' },
  overlay: { position:'fixed', inset:0, background:'rgba(0,0,0,.45)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:1000, padding:20 },
  modal: { background:'#fff', borderRadius:16, width:'100%', maxWidth:700, maxHeight:'90vh', display:'flex', flexDirection:'column', boxShadow:'0 20px 60px rgba(0,0,0,.2)', animation:'fadeIn .2s ease' },
@@ -3311,7 +2880,7 @@ const s = {
  tagWrap: { display:'flex', gap:8, flexWrap:'wrap', marginTop:10 },
  tagPill: { display:'inline-flex', alignItems:'center', gap:6, padding:'6px 10px', borderRadius:999, background:'#FCEBEB', color:'#A32D2D', fontSize:12, fontWeight:600 },
  tagRemoveBtn: { border:'none', background:'transparent', color:'#A32D2D', cursor:'pointer', fontSize:14, lineHeight:1, padding:0 },
- sectionLabel:{ fontSize:11, fontWeight:700, color:'#5B21B6', textTransform:'uppercase', letterSpacing:.8, marginBottom:12, marginTop:4, paddingBottom:6, borderBottom:'1px solid #F3E8FF' },
+ sectionLabel:{ fontSize:11, fontWeight:700, color:'#0F6E56', textTransform:'uppercase', letterSpacing:.8, marginBottom:12, marginTop:4, paddingBottom:6, borderBottom:'1px solid #E1F5EE' },
  cancelBtn: { padding:'10px 20px', border:'1px solid #ddd', borderRadius:8, background:'#fff', cursor:'pointer', fontSize:14, fontWeight:500, color:'#555' },
  summaryCard:{ borderRadius:10, padding:14, background:'#f9fafb', border:'1px solid #eee' },
  resultCard: { background:'#fff', border:'1px solid #e0e0e0', borderRadius:10, padding:'14px 16px', cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'space-between', gap:12, transition:'border .15s' },
@@ -3325,7 +2894,7 @@ const s = {
  timelineStatCard: { background:'#fff', border:'1px solid #E4E7EC', borderRadius:12, padding:'12px 14px' },
  timelineList: { display:'flex', flexDirection:'column', gap:14 },
  timelineCard: { display:'flex', gap:14, background:'#fff', border:'1px solid #E4E7EC', borderRadius:14, padding:'16px 18px' },
- timelineCardActive: { border:'1px solid #5B21B6', boxShadow:'0 0 0 3px rgba(15,110,86,.08)' },
+ timelineCardActive: { border:'1px solid #0F6E56', boxShadow:'0 0 0 3px rgba(15,110,86,.08)' },
  timelineLineWrap: { display:'flex', flexDirection:'column', alignItems:'center', flexShrink:0 },
  timelineDot: { width:14, height:14, borderRadius:'50%', marginTop:6 },
  timelineLine: { width:2, flex:1, background:'#D0D5DD', marginTop:4 },

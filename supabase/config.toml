@@ -1,0 +1,48 @@
+# Minimal Supabase CLI config for deploying the payment functions (scripts/deploy-payments.ps1).
+# Everything not listed here keeps the CLI defaults.
+project_id = "izsincdmayaogcwbhlty"
+
+# Payment gateways call this endpoint without a Supabase login.
+[functions.payments-webhook]
+verify_jwt = false
+
+# These check the user's login inside the function (and the cron sweep uses x-cron-secret).
+[functions.payments-initiate]
+verify_jwt = false
+
+[functions.payments-status]
+verify_jwt = false
+
+[functions.payments-refund]
+verify_jwt = false
+
+# SMS confirm links are opened by patients (no login); the sweep uses x-cron-secret.
+[functions.appointments-reminders]
+verify_jwt = false
+
+[functions.gemini-proxy]
+verify_jwt = false
+
+# FHIR API: outside systems send an API key (not a Supabase JWT); each function checks keys / sign-in itself.
+[functions.fhir]
+verify_jwt = false
+
+[functions.fhir-bundle]
+verify_jwt = false
+
+[functions.fhir-claim]
+verify_jwt = false
+
+[functions.fhir-patient]
+verify_jwt = false
+
+[functions.fhir-encounter]
+verify_jwt = false
+
+# Analyzer clients authenticate with a hospital-scoped one-time API key.
+[functions.lab-ingest]
+verify_jwt = false
+
+# Patient portal: patients have no Supabase account; the function checks its own portal session token.
+[functions.patient-portal]
+verify_jwt = false

@@ -1,6 +1,7 @@
 import { useEffect, useState, useMemo, useCallback } from 'react'
 import supabase from '../supabase'
 import { useHospital } from '../context'
+import { notifyError, notifyWarning } from '../notifications'
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const DOSE_TIMES = ['Morning', 'Afternoon', 'Evening', 'Night']
@@ -30,7 +31,7 @@ const RX_STATUS_META = {
   Rejected: { bg: '#FCEBEB', color: '#A32D2D', icon: '❌' },
 }
 
-const AVATAR_COLORS = ['#E1F5EE', '#E3F0FB', '#F0EAFC', '#FFF3DC', '#FCEBEB', '#EAF3DE']
+const AVATAR_COLORS = ['#E1F5EE', '#E3F0FB', '#EAF5EF', '#FFF3DC', '#FCEBEB', '#EAF3DE']
 
 // ── Pure helpers ───────────────────────────────────────────────────────────────
 function getRxStatus(rx) { return rx.status || 'Pending' }
@@ -825,7 +826,7 @@ export default function Prescriptions() {
   async function handleSaveDoseLog(form) {
     if (!logDoseModal) return
     const { adm, rx, time } = logDoseModal
-    if (form.status === 'Given' && !form.given_by.trim()) { window.notifyFromLegacyAlert('Enter the name of the nurse who administered this dose.'); return }
+    if (form.status === 'Given' && !form.given_by.trim()) { notifyWarning('Enter the name of the nurse who administered this dose.'); return }
     setSaving(true)
     const existing = (medLogsMap[adm.id] || []).find(l => l.prescription_id === rx.id && l.scheduled_time === time)
     if (existing) {
@@ -849,8 +850,8 @@ export default function Prescriptions() {
   async function handleSaveVitals(form) {
     if (!recordVitalsModal) return
     const adm = recordVitalsModal
-    if (!form.recorded_by.trim()) { window.notifyFromLegacyAlert('Enter the name of the nurse recording these vitals.'); return }
-    if (!form.bp_systolic && !form.pulse_bpm) { window.notifyFromLegacyAlert('Enter at least BP or Pulse.'); return }
+    if (!form.recorded_by.trim()) { notifyWarning('Enter the name of the nurse recording these vitals.'); return }
+    if (!form.bp_systolic && !form.pulse_bpm) { notifyWarning('Enter at least BP or Pulse.'); return }
     setSaving(true)
     try {
       const flag   = vitalFlag(form)
@@ -891,7 +892,7 @@ export default function Prescriptions() {
       if (updated?.length) setLatestVitalsMap(m => ({ ...m, [adm.patient_id]: updated[0] }))
     } catch (err) {
       console.error('handleSaveVitals error', err)
-      window.notifyFromLegacyAlert('Failed to save vitals. Please try again.')
+      notifyError('Failed to save vitals. Please try again.')
     } finally {
       setSaving(false)
     }
@@ -1107,7 +1108,7 @@ export default function Prescriptions() {
                 )
               })()}
               {selectedRx.visits?.assigned_doctor_name && (
-                <div style={{ background: '#F0EAFC', borderRadius: 8, padding: '8px 12px', marginBottom: 12, fontSize: 12 }}>
+                <div style={{ background: '#EAF5EF', borderRadius: 8, padding: '8px 12px', marginBottom: 12, fontSize: 12 }}>
                   <span style={{ color: '#7B5EA7', fontWeight: 700 }}>🩺 Dr. {selectedRx.visits.assigned_doctor_name}</span>
                   {selectedRx.visits.speciality && <span style={{ color: '#888', marginLeft: 8 }}>{selectedRx.visits.speciality}</span>}
                 </div>

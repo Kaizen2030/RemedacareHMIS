@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import supabase from '../supabase'
 import { useHospital } from '../context'
+import { colors as C, typography } from '../theme'
 
 const CATEGORIES = [
  'All Categories', 'Antibiotics', 'Analgesics', 'Antihypertensives',
@@ -223,7 +224,7 @@ export default function Expiry() {
  if (woErr) { setSaving(false); showToastMsg('Failed: ' + woErr.message, 'error'); return }
 
  await supabase.from('drug_batches')
- .update({ quantity_remaining: newQty, status: newQty <= 0 ? 'Written Off' : writeoffBatch.status })
+ .update({ quantity_remaining: newQty, status: newQty <= 0 ? 'Written Off' : writeoffBatch.status, last_change_reason: 'write_off' })
  .eq('id', writeoffBatch.id)
  .eq('hospital_id', hospitalId)
 
@@ -281,17 +282,16 @@ export default function Expiry() {
  {/* STAT CARDS */}
  <div style={s.statsGrid}>
  {[
- { icon: '', label: 'Expired', value: stats.expired.length, color: '#A32D2D', bg: '#FCEBEB' },
- { icon: '', label: '< 30 Days', value: stats.lt30.length, color: '#C07000', bg: '#FFF3DC' },
- { icon: '', label: '< 60 Days', value: stats.lt60.length, color: '#A07000', bg: '#FFF8E1' },
- { icon: '', label: '< 90 Days', value: stats.lt90.length, color: '#1a6fb5', bg: '#E3F0FB' },
- { icon: '', label: 'Loss (Expired)', value: formatKES(stats.totalLossValue), color: '#A32D2D', bg: '#FCEBEB', small: true },
- { icon: '', label: 'At Risk Value', value: formatKES(stats.atRiskValue), color: '#C07000', bg: '#FFF3DC', small: true }
+ { label: 'Expired', value: stats.expired.length },
+ { label: '< 30 Days', value: stats.lt30.length },
+ { label: '< 60 Days', value: stats.lt60.length },
+ { label: '< 90 Days', value: stats.lt90.length },
+ { label: 'Loss (Expired)', value: formatKES(stats.totalLossValue), small: true },
+ { label: 'At Risk Value', value: formatKES(stats.atRiskValue), small: true }
  ].map(c => (
- <div key={c.label} style={{ ...s.statCard, background: c.bg }}>
- <div style={{ fontSize: 22 }}>{c.icon}</div>
- <div style={{ fontSize: c.small ? 14 : 26, fontWeight: 800, color: c.color, marginTop: 4 }}>{c.value}</div>
- <div style={{ fontSize: 11, color: '#666', marginTop: 2 }}>{c.label}</div>
+ <div key={c.label} style={{ ...s.statCard, background: C.surface, border: `1px solid ${C.border}` }}>
+ <div style={{ fontSize: c.small ? 14 : 26, fontWeight: 800, color: c.label === 'Expired' ? C.danger : C.text, marginTop: 4 }}>{c.value}</div>
+ <div style={{ fontSize: 11, color: C.sub, marginTop: 2 }}>{c.label}</div>
  </div>
  ))}
  </div>
@@ -598,14 +598,14 @@ export default function Expiry() {
 }
 
 const s = {
- page: { padding: '20px 24px', flex: 1, overflowY: 'auto', background: '#f7f8f7', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', position: 'relative' },
+ page: { padding: '20px 24px', flex: 1, overflowY: 'auto', background: C.bgAlt, fontFamily: typography.fontFamily, position: 'relative' },
  loadingWrap: { height: '80vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
  spinner: { width: 36, height: 36, border: '3px solid #e8ebe8', borderTop: '3px solid #0F6E56', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 },
  title: { fontSize: 26, fontWeight: 800, margin: 0, color: '#111' },
  subtitle: { color: '#777', margin: '4px 0 0 0', fontSize: 13 },
  statsGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 12, marginBottom: 20 },
- statCard: { borderRadius: 12, padding: '14px 16px', border: '1px solid rgba(0,0,0,0.06)', boxShadow: '0 2px 8px rgba(0,0,0,0.04)' },
+ statCard: { borderRadius: 8, padding: '14px 16px' },
  input: { border: '1px solid #e0e0e0', borderRadius: 8, padding: '9px 12px', fontSize: 13, outline: 'none', boxSizing: 'border-box', fontFamily: 'inherit', width: '100%' },
  select: { border: '1px solid #e0e0e0', borderRadius: 8, padding: '9px 12px', fontSize: 13, outline: 'none', background: '#fff', cursor: 'pointer', fontFamily: 'inherit' },
  label: { display: 'block', fontSize: 11, fontWeight: 600, color: '#555', marginBottom: 5, textTransform: 'uppercase', letterSpacing: '0.3px' },

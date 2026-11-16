@@ -1,6 +1,6 @@
 {
-  "name": "Brightpath Travel Scholars",
-  "short_name": "Brightpath Travel Scholars",
+  "name": "RemedacareHMS",
+  "short_name": "RemedacareHMS",
   "description": "Hospital management system for Kenyan healthcare operations.",
   "start_url": "/",
   "display": "standalone",

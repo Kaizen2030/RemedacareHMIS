@@ -6,6 +6,8 @@ import { executeWithFallback } from '../utils/dbCompat'
 import { buildAmrInterventions, summarizeAmrInterventions } from '../utils/hospitalSignals'
 import { executeMicrobiologyQuery } from '../utils/microbiologyResults'
 import { colors as C, typography } from '../theme'
+import { nairobiDay, nairobiDayStart } from '../utils/payments/money'
+import { METHOD_LABELS } from '../utils/payments/methods'
 
 const PAY_COLORS = {
   Cash: C.primary,
@@ -133,6 +135,32 @@ function formatKES(value) {
   return `KES ${Number(value || 0).toLocaleString()}`
 }
 
+function formatWorkflowEvent(event) {
+  const knownLabels = {
+    'emergency.red_triage': 'Emergency red triage',
+    'theatre.scheduled': 'Theatre case scheduled',
+    'theatre.started': 'Theatre case started',
+    'theatre.completed': 'Theatre case completed',
+    'blood.issued': 'Blood unit issued',
+    'morgue.death_recorded': 'Mortuary admission recorded',
+    'morgue.release_requested': 'Mortuary release requested',
+    'morgue.released': 'Mortuary release approved',
+    'maternity.delivery_recorded': 'Delivery recorded',
+    'procurement.received': 'Goods received',
+    'safety.incident_opened': 'Safety incident opened',
+  }
+  return knownLabels[event?.event_type]
+    || String(event?.event_type || 'Workflow update').replace(/[._]/g, ' ').replace(/\b\w/g, character => character.toUpperCase())
+}
+
+const WORKFLOW_EVENT_SCREENS = { 'blood-bank': 'blood-bank', theatre: 'theatre', morgue: 'morgue', icu: 'icu', emergency: 'emergency', dialysis: 'dialysis', maternity: 'maternity', telemedicine: 'telemedicine', biomedical: 'biomedical', hivtb: 'hivtb', nutrition: 'nutrition', 'quality-safety': 'quality-safety', payroll: 'payroll', procurement: 'procurement' }
+
+function formatEventTime(value) {
+  if (!value) return 'Time unavailable'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? 'Time unavailable' : date.toLocaleString('en-KE', { dateStyle: 'medium', timeStyle: 'short' })
+}
+
 function pillStyle(bg, color) {
   return { ...css.pill, background: bg, color }
 }
@@ -205,6 +233,8 @@ export default function Dashboard() {
   const [weeklyRevenue, setWeeklyRevenue] = useState([])
   const [recentSales, setRecentSales] = useState([])
   const [recentAdmissions, setRecentAdmissions] = useState([])
+  const [workflowEvents, setWorkflowEvents] = useState([])
+  const [workflowEventsError, setWorkflowEventsError] = useState('')
   const [pendingLabs, setPendingLabs] = useState([])
   const [pendingRxQueue, setPendingRxQueue] = useState([])
   const [bedMap, setBedMap] = useState([])
@@ -226,12 +256,13 @@ export default function Dashboard() {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'prescriptions', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'lab_tests', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'invoices', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'sales_ledger', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'payments', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'pharmacy_inventory', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'mpesa_transactions', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'sha_claims', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'insurance_claims', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'microbiology_results', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'workflow_events', filter: `hospital_id=eq.${hospitalId}` }, () => fetchDashboard(false))
       .subscribe()
 
     window.addEventListener('remedacare:workflow_changed', localHandler)
@@ -255,10 +286,8 @@ export default function Dashboard() {
 
     try {
       const today = new Date()
-      const todayIso = today.toISOString().split('T')[0]
-      const weekStart = new Date(today)
-      weekStart.setDate(today.getDate() - 6)
-      const weekStartIso = weekStart.toISOString().split('T')[0]
+      const todayIso = nairobiDay(today)
+      const weekStartIso = nairobiDay(today.getTime() - 6 * 86400000)
 
       const [
         salesTodayResult,
@@ -284,18 +313,22 @@ export default function Dashboard() {
         microbiologyResultsResult,
         activePrescriptionResult,
         stewardshipInterventionsResult,
+        workflowEventsResult,
       ] = await Promise.all([
+        // Revenue = money actually received (payments ledger), not services sold.
         supabase
-          .from('sales_ledger')
-          .select('*')
+          .from('payments')
+          .select('id, kind, method, amount, receipt_no, payer_name, completed_at, invoices(patient_name, invoice_no)')
           .eq('hospital_id', hospitalId)
-          .gte('sold_at', todayIso)
-          .order('sold_at', { ascending: false }),
+          .eq('status', 'completed')
+          .gte('completed_at', nairobiDayStart(todayIso))
+          .order('completed_at', { ascending: false }),
         supabase
-          .from('sales_ledger')
-          .select('sold_at, total_kes, payment_method')
+          .from('payments')
+          .select('kind, method, amount, completed_at')
           .eq('hospital_id', hospitalId)
-          .gte('sold_at', weekStartIso),
+          .eq('status', 'completed')
+          .gte('completed_at', nairobiDayStart(weekStartIso)),
         supabase
           .from('patients')
           .select('id', { count: 'exact', head: true })
@@ -414,10 +447,26 @@ export default function Dashboard() {
             .limit(120),
           async () => ({ data: [], error: null, compatFallback: true }),
         ),
+        supabase
+          .from('workflow_events')
+          .select('id, patient_id, visit_id, source_module, event_type, record_id, payload, created_at')
+          .eq('hospital_id', hospitalId)
+          .order('created_at', { ascending: false })
+          .limit(8),
       ])
 
-      const salesToday = salesTodayResult.data || []
-      const salesWeek = salesWeekResult.data || []
+      const signed = (p) => (p.kind === 'refund' ? -1 : 1) * Number(p.amount || 0)
+      const salesToday = (salesTodayResult.data || []).map(p => ({
+        id: p.id,
+        drug_name: p.invoices?.patient_name || p.payer_name || 'Payment',
+        detail: [p.kind === 'refund' ? 'Refund' : METHOD_LABELS[p.method] || p.method, p.receipt_no].filter(Boolean).join(' · '),
+        total_kes: signed(p),
+      }))
+      const salesWeek = (salesWeekResult.data || []).map(p => ({
+        sold_at: p.completed_at,
+        total_kes: signed(p),
+        payment_method: p.kind === 'refund' ? 'Refunds' : (METHOD_LABELS[p.method] || p.method),
+      }))
       const pendingLabRows = pendingLabsResult.data || []
       const pendingRxRows = pendingRxResult.data || []
       const stockRows = stockRowsResult.data || []
@@ -431,6 +480,14 @@ export default function Dashboard() {
       })
       const stewardshipSummary = summarizeAmrInterventions(stewardshipItems)
 
+      if (workflowEventsResult.error) {
+        setWorkflowEvents([])
+        setWorkflowEventsError('Cross-module activity is unavailable until the workflow-events migration is applied.')
+      } else {
+        setWorkflowEvents(workflowEventsResult.data || [])
+        setWorkflowEventsError('')
+      }
+
       const revenue = salesToday.reduce((sum, sale) => sum + Number(sale.total_kes || 0), 0)
 
       const days = []
@@ -439,20 +496,20 @@ export default function Dashboard() {
         day.setDate(today.getDate() - i)
         days.push({
           label: day.toLocaleDateString('en-KE', { weekday: 'short' }),
-          date: day.toISOString().split('T')[0],
+          date: nairobiDay(day),
           amount: 0,
         })
       }
 
       const payMethods = {}
       salesWeek.forEach(sale => {
-        const dateKey = sale.sold_at?.split('T')[0]
+        const dateKey = sale.sold_at ? nairobiDay(sale.sold_at) : null
         const day = days.find(item => item.date === dateKey)
         const amount = Number(sale.total_kes || 0)
         if (day) day.amount += amount
 
         const method = sale.payment_method || 'Cash'
-        payMethods[method] = (payMethods[method] || 0) + amount
+        if (amount > 0) payMethods[method] = (payMethods[method] || 0) + amount
       })
 
       const totalPay = Object.values(payMethods).reduce((sum, amount) => sum + amount, 0) || 1
@@ -599,6 +656,44 @@ export default function Dashboard() {
           </div>
         )}
 
+        {(workflowEventsError || workflowEvents.length > 0) && (
+          <div style={{ ...css.card, marginBottom: '16px' }}>
+            <div style={css.cardHead}>
+              <span>Cross-module activity</span>
+              <span style={{ fontSize: '12px', color: C.sub }}>{workflowEventsError ? 'Unavailable' : 'Latest events'}</span>
+            </div>
+            {workflowEventsError ? (
+              <div role="alert" style={{ ...css.cardBody, color: C.warn }}>{workflowEventsError}</div>
+            ) : (
+              <div style={{ padding: '0 16px' }}>
+                {workflowEvents.map((event) => (
+                  <div key={event.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px', padding: '10px 0', borderBottom: `1px solid ${C.border}` }}>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, color: C.text }}>{formatWorkflowEvent(event)}</div>
+                      <div style={{ fontSize: '11px', color: C.sub, marginTop: '3px' }}>
+                        {[event.payload?.patient_name || event.payload?.patientName, event.payload?.title || event.source_module, event.visit_id ? 'Visit ' + String(event.visit_id).slice(0, 8) : null, formatEventTime(event.created_at)].filter(Boolean).join(' · ')}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      style={{ ...css.btn, ...css.btnGhost, flexShrink: 0 }}
+                      aria-label={event.patient_id ? 'Open patient visit' : `Open ${event.source_module} workflow`}
+                      onClick={() => {
+                        if (event.patient_id) {
+                          navigate?.('consultation', { patientId: event.patient_id, visitId: event.visit_id || undefined, source: 'workflow-event' })
+                          return
+                        }
+                        const screen = WORKFLOW_EVENT_SCREENS[event.source_module]
+                        if (screen) navigate?.(screen)
+                      }}
+                    >{event.patient_id ? 'Open visit' : 'Open workflow'}</button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         <div style={css.kpiGrid}>
           <KPICard label="Today's Revenue" value={formatKES(stats.revenue)} color={C.primary} onClick={() => navigate?.('billing')} />
           <KPICard label="Transactions" value={stats.transactions} color={C.blue} sub="Sales today" onClick={() => navigate?.('billing')} />
@@ -622,15 +717,15 @@ export default function Dashboard() {
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6,1fr)', gap: 0 }}>
             {[
-              { lbl: 'Cash', val: financeRecon.cash, color: '#374151', bg: '#F9FAFB', icon: '💵' },
-              { lbl: 'M-Pesa', val: financeRecon.mpesa, color: '#16A34A', bg: '#F0FDF4', icon: '📱' },
-              { lbl: 'SHA', val: financeRecon.sha, color: '#2563EB', bg: '#EFF6FF', icon: '🏥' },
-              { lbl: 'Insurance', val: financeRecon.insurance, color: '#D97706', bg: '#FFFBEB', icon: '🛡️' },
-              { lbl: 'Credit', val: financeRecon.credit, color: '#7C3AED', bg: '#F5F3FF', icon: '📋' },
-              { lbl: 'Total Collected', val: financeRecon.total, color: '#16A34A', bg: '#F0FDF4', icon: '✅' },
-            ].map(({ lbl, val, color, bg, icon }, i, arr) => (
+              { lbl: 'Cash', val: financeRecon.cash, color: '#374151', bg: '#F9FAFB' },
+              { lbl: 'M-Pesa', val: financeRecon.mpesa, color: '#16A34A', bg: '#F0FDF4' },
+              { lbl: 'SHA', val: financeRecon.sha, color: '#2563EB', bg: '#EFF6FF' },
+              { lbl: 'Insurance', val: financeRecon.insurance, color: '#D97706', bg: '#FFFBEB' },
+              { lbl: 'Credit', val: financeRecon.credit, color: '#0A9272', bg: '#EAF5EF' },
+              { lbl: 'Total Collected', val: financeRecon.total, color: '#16A34A', bg: '#F0FDF4' },
+            ].map(({ lbl, val, color, bg }, i, arr) => (
               <div key={lbl} style={{ padding: '14px 16px', background: bg, borderRight: i < arr.length - 1 ? '1px solid #E8ECF2' : 'none' }}>
-                <div style={{ fontSize: '11px', color: '#6B7280', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '.5px', marginBottom: '6px' }}>{icon} {lbl}</div>
+                <div style={{ fontSize: '11.5px', color: '#111827', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.5px', marginBottom: '6px' }}>{lbl}</div>
                 <div style={{ fontSize: '18px', fontWeight: 800, color, letterSpacing: '-0.5px' }}>KES {Number(val || 0).toLocaleString()}</div>
               </div>
             ))}
@@ -705,18 +800,18 @@ export default function Dashboard() {
 
           <div style={{ ...css.card, flex: 1, minWidth: '280px' }}>
             <div style={css.cardHead}>
-              <span>Recent Sales</span>
+              <span>Recent Payments</span>
               <span style={{ fontSize: '12px', color: C.sub }}>Today</span>
             </div>
             <div style={{ padding: '0 16px' }}>
               {recentSales.length === 0 ? (
-                <p style={css.empty}>No sales today</p>
+                <p style={css.empty}>No payments received today</p>
               ) : recentSales.map((sale, index) => (
                 <div key={`${sale.id || index}`} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: `1px solid ${C.border}` }}>
                   <div>
                     <div style={{ fontSize: '13px', fontWeight: 600, color: C.text }}>{sale.drug_name || 'Service'}</div>
                     <div style={{ fontSize: '11px', color: C.sub, marginTop: '2px' }}>
-                      {(sale.payment_method || 'Cash')} - {(sale.quantity || sale.qty_sold || 1)} unit(s)
+                      {sale.detail}
                     </div>
                   </div>
                   <div style={{ fontSize: '13px', fontWeight: 700, color: C.primary }}>{formatKES(sale.total_kes || 0)}</div>

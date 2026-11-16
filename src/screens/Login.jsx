@@ -1,15 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
-import supabase from '../supabase'
+import supabase, { isLocalPreview } from '../supabase'
 import { sendPatientNotification } from '../utils/notifications'
 import { getAuthConfirmRedirectUrl, getAuthResetRedirectUrl } from '../utils/authUrls'
-import hmsLogo from '../../icon.png'
+import hmsLogo from '../assets/remedacarehms-logo.svg'
+import { notifySuccess } from '../notifications'
+import { version as APP_VERSION } from '../../package.json'
 
 const AUTH_GATE_KEY = 'remedacare:auth:gate'
 const KNOWN_USERS_KEY = 'remedacare:auth:known_users'
 const DEVICE_TOKEN_KEY = 'remedacare:auth:device_token'
 const TRUSTED_DEVICE_KEY = 'remedacare:auth:trusted_devices'
 const REMEMBER_PREF_KEY = 'remedacare:auth:remember_device'
-const LOGIN_ATTEMPTS_KEY = 'remedacare:auth:login_attempts'
 const BRANDING_CACHE_KEY = 'remedacare:auth:branding'
 const DEFAULT_BRANDING = {
   hospitalName: 'RemedacareHMS',
@@ -17,10 +18,18 @@ const DEFAULT_BRANDING = {
   level: 'Kenya',
   primaryColor: '#0F6E56',
 }
+/** Login badge: "Kenya", "Kenya · Level 4 facility" — never "Kenya Kenya". */
+export function facilityBadge(level) {
+  const l = String(level || '').replace(/\s+/g, ' ').trim()
+  if (!l || /^kenya$/i.test(l)) return 'Kenya'
+  if (/kenya/i.test(l)) return l
+  if (/^\d$/.test(l)) return `Kenya · Level ${l} facility`
+  if (/^level ?\d/i.test(l)) return `Kenya · ${l}${/facility|hospital|centre|center/i.test(l) ? '' : ' facility'}`
+  return `Kenya · ${l}`
+}
+
 const MFA_WINDOW_MS = 5 * 60 * 1000
 const DEVICE_TRUST_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
-const LOGIN_LOCK_WINDOW_MS = 15 * 60 * 1000
-const MAX_LOGIN_ATTEMPTS = 5
 const PASSWORD_RESET_REDIRECT_URL = getAuthResetRedirectUrl()
 const ACCOUNT_CONFIRM_REDIRECT_URL = getAuthConfirmRedirectUrl()
 const PENDING_SIGNUP_EMAIL_KEY = 'remedacare:auth:pending_signup_email'
@@ -161,41 +170,6 @@ function trustDevice(userId, email) {
   writeJson(window.localStorage, TRUSTED_DEVICE_KEY, next)
 }
 
-function getLoginAttempts(email) {
-  if (typeof window === 'undefined') return []
-  const all = readJson(window.localStorage, LOGIN_ATTEMPTS_KEY, {})
-  return Array.isArray(all?.[String(email || '').toLowerCase()]) ? all[String(email || '').toLowerCase()] : []
-}
-
-function saveLoginAttempts(email, attempts) {
-  if (typeof window === 'undefined') return
-  const cleanEmail = String(email || '').toLowerCase()
-  const all = readJson(window.localStorage, LOGIN_ATTEMPTS_KEY, {})
-  all[cleanEmail] = attempts
-  writeJson(window.localStorage, LOGIN_ATTEMPTS_KEY, all)
-}
-
-function getActiveLock(email) {
-  const now = Date.now()
-  const attempts = getLoginAttempts(email).filter((entry) => now - Number(entry?.at || 0) < LOGIN_LOCK_WINDOW_MS)
-  if (attempts.length < MAX_LOGIN_ATTEMPTS) return null
-  const lockedUntil = Number(attempts[attempts.length - 1]?.at || now) + LOGIN_LOCK_WINDOW_MS
-  return lockedUntil > now ? lockedUntil : null
-}
-
-function recordFailedAttempt(email) {
-  const now = Date.now()
-  const current = getLoginAttempts(email).filter((entry) => now - Number(entry?.at || 0) < LOGIN_LOCK_WINDOW_MS)
-  current.push({ at: now })
-  saveLoginAttempts(email, current)
-  return getActiveLock(email)
-}
-
-function clearFailedAttempts(email) {
-  if (!email) return
-  saveLoginAttempts(email, [])
-}
-
 function maskEmail(email = '') {
   const [local, domain] = String(email || '').split('@')
   if (!local || !domain) return email || 'your email'
@@ -251,7 +225,7 @@ function getAuthEmailErrorMessage(err, contextLabel) {
   }
 
   if (lower.includes('redirect') || lower.includes('allow list') || lower.includes('allowed')) {
-    return `We could not send the ${label} email because the redirect URL is not allowed in Supabase Auth. Add the Pharmcourse redirect URL in Auth > URL Configuration.`
+    return `We could not send the ${label} email because the redirect URL is not allowed in Supabase Auth. Add the RemedacareHMS redirect URL in Auth > URL Configuration.`
   }
 
   if (lower.includes('smtp') || lower.includes('resend') || lower.includes('email provider') || lower.includes('mailer')) {
@@ -529,6 +503,11 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
   }, [branding])
 
   useEffect(() => {
+    // Clear lock records written by earlier versions of the login screen.
+    removeStorage(window.localStorage, 'remedacare:auth:login_attempts')
+  }, [])
+
+  useEffect(() => {
     setActivationMessage(activationNotice || '')
     if (activationNotice) {
       const pendingEmail = readPendingSignupEmail()
@@ -662,11 +641,6 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
     clearAuthGate()
   }
 
-  function showLockMessage(lockedUntil) {
-    const minutes = Math.max(1, Math.ceil((lockedUntil - Date.now()) / 60000))
-    setError(`This device is locked for ${minutes} more minute${minutes === 1 ? '' : 's'} after repeated failed sign-in attempts.`)
-  }
-
   async function startMfaChallenge(authUser, profile, rememberPreference) {
     const method = getMfaMethod(profile)
     const deviceToken = getOrCreateDeviceToken(Boolean(rememberPreference))
@@ -744,7 +718,6 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
   }
 
   async function finalizeSuccessfulLogin(authUser, profile, rememberPreference) {
-    clearFailedAttempts(profile?.email || authUser?.email)
     rememberKnownUser(profile?.email || authUser?.email, profile?.branding)
     writeBrandingCache(profile?.branding)
     writePendingSignupEmail('')
@@ -766,12 +739,6 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
   async function handleLogin() {
     if (!email || !password) {
       setError('Enter email and password')
-      return
-    }
-
-    const lockedUntil = getActiveLock(email)
-    if (lockedUntil) {
-      showLockMessage(lockedUntil)
       return
     }
 
@@ -824,13 +791,12 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
       await finalizeSuccessfulLogin(authUser, profile, rememberDevice)
     } catch (e) {
       clearAuthGate()
-      const nextLock = recordFailedAttempt(email)
       const friendly = await getFriendlyLoginError(e, email)
-      setError(nextLock ? `${friendly} This device is now locked for 15 minutes after repeated failed attempts.` : friendly)
+      setError(friendly)
       await logAuthAudit('login_failed', {
         email: String(email || '').toLowerCase(),
         reason: getErrorMessage(e),
-        locked_until: nextLock || null,
+        locked_until: null,
       })
     }
     setLoading(false)
@@ -887,7 +853,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
         return
       }
 
-      window.notifyFromLegacyAlert('Password set successfully!')
+      notifySuccess('Password set successfully!')
       await finalizeSuccessfulLogin(authUser, profile, gate?.rememberDevice)
     } catch (e) {
       setError(`Failed to update password: ${getErrorMessage(e)}`)
@@ -972,7 +938,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
 
       const profile = await loadAuthProfile(authUser, challenge.email)
       await startMfaChallenge(authUser, profile, challenge.rememberDevice)
-      window.notifyFromLegacyAlert('A new verification code has been sent.')
+      notifySuccess('A new verification code has been sent.')
     } catch (e) {
       setError(getErrorMessage(e))
     }
@@ -1002,7 +968,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
           throw updateErr
         }
       } else {
-        window.notifyFromLegacyAlert('Password updated successfully!')
+        notifySuccess('Password updated successfully!')
         await supabase.auth.signOut()
         setMode('login')
         setNewPassword('')
@@ -1018,6 +984,11 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
 
   async function handleForgotPassword() {
     if (!email) return setError('Enter your email address')
+    if (isLocalPreview) {
+      setError('')
+      setResetSent(true)
+      return
+    }
     setLoading(true)
     setError('')
     try {
@@ -1025,7 +996,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
       if (err) throw err
 
       setResetSent(true)
-      window.notifyFromLegacyAlert('Password reset link sent to your Pharmcourse email!')
+      notifySuccess('Password reset link sent to your RemedacareHMS email!')
     } catch (e) {
       setError(getAuthEmailErrorMessage(e, 'password reset'))
     }
@@ -1056,7 +1027,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
       if (err) throw err
 
       writePendingSignupEmail(email)
-      window.notifyFromLegacyAlert('Account created. Check your Pharmcourse email to activate the app, then sign in.')
+      notifySuccess('Account created. Check your RemedacareHMS email to activate the app, then sign in.')
       setMode('login')
       setPassword('')
       setSignupConfirmPassword('')
@@ -1070,9 +1041,8 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
     setLoading(false)
   }
 
-  const brandAccent = displayBranding.primaryColor || '#0F6E56'
+  const brandAccent = '#0F6E56'
   const strengthForDisplay = mode === 'signup' ? getPasswordStrength(password) : getPasswordStrength(newPassword)
-  const lockExpiresAt = getActiveLock(email)
 
   return (
     <div style={st.page}>
@@ -1084,14 +1054,13 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
           ) : (
             <div style={{ ...st.logoIcon, color: brandAccent }}>Hospital</div>
           )}
-          <div style={st.hospitalBadge}>Kenya {displayBranding.level || 'Level Facility'}</div>
+          <div style={st.hospitalBadge}>{facilityBadge(displayBranding.level)}</div>
           <h1 style={{ ...st.logoText, color: brandAccent }}>{displayBranding.hospitalName || 'RemedacareHMS'}</h1>
           <p style={st.logoSub}>Secure clinical sign-in and hospital workspace access</p>
         </div>
 
         {activationMessage && <div style={st.infoBox}>{activationMessage}</div>}
         {error && <div style={st.errorBox}>{error}</div>}
-        {!error && lockExpiresAt ? <div style={st.warningBox}>This device is temporarily locked after repeated failed sign-in attempts.</div> : null}
 
         {(mode === 'login' || mode === 'signup') && (
           <div style={st.tabs}>
@@ -1191,7 +1160,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
               />
             </div>
             <label style={st.checkboxRow}>
-              <input type="checkbox" checked={trustThisDevice} onChange={(e) => setTrustThisDevice(e.target.checked)} />
+              <input type="checkbox" style={{ accentColor: '#0F6E56' }} checked={trustThisDevice} onChange={(e) => setTrustThisDevice(e.target.checked)} />
               <span>Trust this device for 30 days</span>
             </label>
             <button style={{ ...st.btnPrimary, background: brandAccent }} onClick={handleVerifyMfa} disabled={loading}>
@@ -1295,7 +1264,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
 
         {mode === 'forgot' && (
           <>
-            <p style={st.note}>Enter your email address to receive a secure Pharmcourse password reset link.</p>
+            <p style={st.note}>Enter your email address to receive a secure RemedacareHMS password reset link.</p>
             <div style={st.formGroup}>
               <label style={st.label}>Email Address</label>
               <input
@@ -1308,7 +1277,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
               />
             </div>
             {resetSent ? (
-              <div style={st.successBox}>Reset link sent. Check your Pharmcourse inbox for the secure password reset email.</div>
+              <div style={st.successBox}>{isLocalPreview ? 'Preview mode is active. Connect Supabase to send password reset emails.' : 'Reset link sent. Check your RemedacareHMS inbox for the secure password reset email.'}</div>
             ) : (
               <button style={{ ...st.btnPrimary, background: brandAccent }} onClick={handleForgotPassword} disabled={loading}>
                 {loading ? 'Sending...' : 'Send Reset Link'}
@@ -1352,7 +1321,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
               </div>
             </div>
             <label style={st.checkboxRow}>
-              <input type="checkbox" checked={rememberDevice} onChange={(e) => setRememberDevice(e.target.checked)} />
+              <input type="checkbox" style={{ accentColor: '#0F6E56' }} checked={rememberDevice} onChange={(e) => setRememberDevice(e.target.checked)} />
               <span>Remember this device</span>
             </label>
             <button style={{ ...st.btnPrimary, background: brandAccent }} onClick={handleLogin} disabled={loading}>
@@ -1471,7 +1440,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
           </>
         )}
 
-        <p style={st.version}>RemedacareHMS v1.0.0 - Secure Hospital Management</p>
+        <p style={st.version}>RemedacareHMS v{APP_VERSION} · Secure Hospital Management</p>
       </div>
     </div>
   )
@@ -1480,7 +1449,7 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
 const st = {
   page: {
     minHeight: '100vh',
-    background: 'linear-gradient(180deg, #FFFFFF 0%, #FAF5FF 100%)',
+    background: 'linear-gradient(180deg, #F7FCF9 0%, #F0F2F0 100%)',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -1506,19 +1475,19 @@ const st = {
     padding: '38px',
     width: '100%',
     maxWidth: '460px',
-    boxShadow: '0 24px 60px rgba(91,33,182,0.12)',
-    border: '1px solid #E9DDF7',
+    boxShadow: '0 24px 60px rgba(15,110,86,0.12)',
+    border: '1px solid #D8E1DC',
     position: 'relative',
     zIndex: 1,
   },
   logoArea: { textAlign: 'center', marginBottom: '24px' },
-  logoImage: { width: 76, height: 76, objectFit: 'contain', marginBottom: 10 },
+  logoImage: { display: 'block', width: 76, height: 76, objectFit: 'contain', margin: '0 auto 10px' }, // own line, so the badge sits centred under it
   logoIcon: {
     width: 76,
     height: 76,
     borderRadius: 18,
     margin: '0 auto 10px',
-    background: '#F5F3FF',
+    background: '#EAF5EF',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -1527,7 +1496,7 @@ const st = {
   },
   hospitalBadge: {
     display: 'inline-block',
-    background: '#F5F3FF',
+    background: '#EAF5EF',
     color: '#0F6E56',
     padding: '6px 10px',
     borderRadius: 999,
@@ -1558,11 +1527,11 @@ const st = {
   tabActive: (accent) => ({
     background: '#fff',
     color: accent,
-    boxShadow: '0 2px 6px rgba(91,33,182,0.10)',
+    boxShadow: '0 2px 6px rgba(15,110,86,0.10)',
   }),
   infoBox: {
-    background: '#F3E8FF',
-    border: '1px solid #D8B4FE',
+    background: '#E1F5EE',
+    border: '1px solid #B4E5D0',
     borderRadius: '10px',
     padding: '10px 14px',
     fontSize: '12px',
@@ -1588,8 +1557,8 @@ const st = {
     marginBottom: '14px',
   },
   successBox: {
-    background: '#F3E8FF',
-    border: '1px solid #D8B4FE',
+    background: '#E1F5EE',
+    border: '1px solid #B4E5D0',
     borderRadius: '10px',
     padding: '10px 14px',
     fontSize: '13px',
@@ -1728,4 +1697,3 @@ const st = {
     marginTop: '20px',
   },
 }
-

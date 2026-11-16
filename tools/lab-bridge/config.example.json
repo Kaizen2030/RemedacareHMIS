@@ -1,0 +1,10 @@
+{
+  "endpoint": "https://YOUR-PROJECT.supabase.co/functions/v1/lab-ingest",
+  "queueDir": "queue",
+  "analysers": [
+    { "name": "Mindray BC-5000 haematology", "key": "rcl_PASTE_THE_KEY_SHOWN_ONCE", "protocol": "hl7", "transport": "tcp-server", "port": 5100 },
+    { "name": "Mindray BS-240 chemistry", "key": "rcl_PASTE_THE_KEY_SHOWN_ONCE", "protocol": "astm", "transport": "tcp-server", "port": 5200 },
+    { "name": "Older analyser on COM3", "key": "rcl_PASTE_THE_KEY_SHOWN_ONCE", "protocol": "astm", "transport": "serial", "path": "COM3", "baudRate": 9600 },
+    { "name": "Analyser CSV export folder", "key": "rcl_PASTE_THE_KEY_SHOWN_ONCE", "protocol": "csv", "transport": "folder", "folder": "C:\\LabExports\\analyser" }
+  ]
+}

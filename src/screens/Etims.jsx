@@ -3,6 +3,7 @@ import SkeletonLoader from '../components/SkeletonLoader'
 import supabase from '../supabase'
 import { useHospital } from '../context'
 import { colors as C, typography } from '../theme'
+import { notifyError, notifyWarning } from '../notifications'
 
 const STATUS_COLORS = {
  Submitted: { bg: C.primaryL, color: C.primary },
@@ -109,7 +110,7 @@ export default function ETims() {
  }
 
  async function handleSave() {
- if (!form.sale_ref || !form.amount_kes) { window.notifyFromLegacyAlert('Sale reference and amount are required'); return }
+ if (!form.sale_ref || !form.amount_kes) { notifyWarning('Sale reference and amount are required'); return }
  setSaving(true)
  const { error } = await supabase.from('etims_submissions').insert({
  hospital_id: hospitalId,
@@ -119,7 +120,7 @@ export default function ETims() {
  status: form.status,
  submitted_at: new Date(form.submitted_at).toISOString(),
  })
- if (error) window.notifyFromLegacyAlert('Error: ' + error.message)
+ if (error) notifyError('Error: ' + error.message)
  setShowAdd(false); setForm(emptyForm)
  await fetchAll(); setSaving(false)
  }
@@ -127,12 +128,12 @@ export default function ETims() {
  // Submit an invoice to eTIMS — in production calls KRA eTIMS API
  async function submitToETims(ref, service, amount) {
  if (!isAdmin) {
- window.notifyFromLegacyAlert('Only Admin users can submit invoices to KRA eTIMS.')
+ notifyWarning('Only Admin users can submit invoices to KRA eTIMS.')
  return
  }
  setSaving(true)
  const alreadySubmitted = submissions.some(s => s.sale_ref === ref)
- if (alreadySubmitted) { window.notifyFromLegacyAlert(`${ref} is already submitted to eTIMS.`); setSaving(false); return }
+ if (alreadySubmitted) { notifyWarning(`${ref} is already submitted to eTIMS.`); setSaving(false); return }
  const { error } = await supabase.from('etims_submissions').insert({
  hospital_id: hospitalId,
  sale_ref: ref,
@@ -141,14 +142,14 @@ export default function ETims() {
  status: 'Submitted',
  submitted_at: new Date().toISOString(),
  })
- if (error) window.notifyFromLegacyAlert('Error: ' + error.message)
+ if (error) notifyError('Error: ' + error.message)
  else await fetchAll()
  setSaving(false)
  }
 
  async function updateStatus(id, status) {
  if (!isAdmin && ['Submitted','Accepted'].includes(status)) {
- window.notifyFromLegacyAlert('Only Admin users can update KRA submission status.')
+ notifyWarning('Only Admin users can update KRA submission status.')
  return
  }
  await supabase.from('etims_submissions').update({ status }).eq('id', id)
@@ -158,12 +159,12 @@ export default function ETims() {
  // Bulk submit all pending invoices
  async function bulkSubmitInvoices() {
  if (!isAdmin) {
- window.notifyFromLegacyAlert('Only Admin users can bulk submit invoices to KRA eTIMS.')
+ notifyWarning('Only Admin users can bulk submit invoices to KRA eTIMS.')
  return
  }
  const submittedRefs = new Set(submissions.map(s => s.sale_ref))
  const unsubmitted = invoices.filter(inv => !submittedRefs.has(inv.invoice_no))
- if (unsubmitted.length === 0) { window.notifyFromLegacyAlert('All invoices already submitted to eTIMS.'); return }
+ if (unsubmitted.length === 0) { notifyWarning('All invoices already submitted to eTIMS.'); return }
  if (!await window.openConfirmDialog(`Submit ${unsubmitted.length} invoice(s) to KRA eTIMS?`)) return
  setSaving(true)
  const rows = unsubmitted.map(inv => ({
@@ -175,7 +176,7 @@ export default function ETims() {
  submitted_at: new Date().toISOString(),
  }))
  const { error } = await supabase.from('etims_submissions').insert(rows)
- if (error) window.notifyFromLegacyAlert('Error: ' + error.message)
+ if (error) notifyError('Error: ' + error.message)
  else await fetchAll()
  setSaving(false)
  }

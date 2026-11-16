@@ -4,7 +4,11 @@ import supabase from '../supabase'
 import { useHospital } from '../context'
 import { executeWithFallback, omitKeys } from '../utils/dbCompat'
 import { broadcastWorkflowChanged } from '../utils/workflowEvents'
+import { fetchPaymentStatus, listInvoicePayments, newIdempotencyKey, pollUntilSettled, recordManualPayments, refundPayment, startOnlinePayment } from '../utils/payments/api'
+import { canManagePayments } from '../access'
+import { isValidMpesaCode, normalizeKenyanPhone } from '../utils/payments/phone'
 import { colors as C, typography } from '../theme'
+import { notifyError, notifyFromLegacyAlert, notifyInfo, notifySuccess, notifyWarning } from '../notifications'
 
 const STATUS_COLORS = {
  Completed: { bg: C.primaryL, color: C.primary },
@@ -125,8 +129,46 @@ export default function MPesa() {
  const willBeCompleted = nextStatus === 'Completed'
  let nextPaid = Number(linkedInvoice.paid_kes || 0)
 
- if (!currentlyCompleted && willBeCompleted) nextPaid += amount
- else if (currentlyCompleted && nextStatus === 'Reversed') nextPaid = Math.max(0, nextPaid - amount)
+ if (!currentlyCompleted && willBeCompleted) {
+  // Preferred path: record in the payments ledger so the M-Pesa code, receipt no. and audit trail exist.
+  if (isValidMpesaCode(record.reference)) {
+   try {
+    const saved = await recordManualPayments({
+     invoiceId,
+     lines: [{ method: 'mpesa_manual', amount, reference: record.reference, phone: record.phone }],
+     // per invoice: one patient's M-Pesa payment may legitimately cover several of their invoices
+     idempotencyKey: `mpesa-log-${invoiceId}-${String(record.reference).toUpperCase()}`,
+    })
+    const review = saved.find((p) => p.needs_review && p.review_note)
+    if (review) notifyWarning(`Applied to the invoice, but flagged for review: ${review.review_note}`)
+   } catch (e) {
+    notifyError('M-Pesa transaction saved, but it could not be applied to the invoice: ' + e.message)
+   }
+   return
+  }
+  nextPaid += amount // legacy fallback (code not in standard format) — the DB bridge ledgers it
+ }
+ else if (currentlyCompleted && nextStatus === 'Reversed') {
+  // A reversal gives money back: it is a refund on the ledger (finance/admin only, with a reason).
+  // Lowering invoices.paid_kes directly is refused by the database.
+  const code = String(record.reference || '').toUpperCase()
+  const ledgerPayments = await listInvoicePayments(invoiceId).catch(() => [])
+  const original = ledgerPayments.find((p) => p.kind === 'payment' && p.status === 'completed' && String(p.reference || '').toUpperCase() === code)
+  if (!original) {
+   notifyWarning('Marked as reversed here, but no matching payment was found on the invoice. Ask finance to record a refund from Billing → Payments.')
+   return
+  }
+  if (!canManagePayments(userRole)) {
+   notifyWarning('Marked as reversed here. Only finance/admin can refund it on the invoice — ask them to refund receipt ' + (original.receipt_no || code) + ' from Billing → Payments.')
+   return
+  }
+  try {
+   await refundPayment({ payment: original, amount: Math.min(amount, Number(original.amount)), reason: `M-Pesa transaction ${code} reversed`, reference: code })
+  } catch (e) {
+   notifyError('Marked as reversed, but the refund could not be recorded on the invoice: ' + e.message)
+  }
+  return
+ }
  else if (currentlyCompleted === willBeCompleted) return
 
  const total = Number(linkedInvoice.amount_kes || 0)
@@ -145,7 +187,7 @@ export default function MPesa() {
  .eq('id', invoiceId)
 
  if (error) {
-  window.notifyFromLegacyAlert('M-Pesa transaction saved, but invoice sync failed: ' + error.message)
+  notifyError('M-Pesa transaction saved, but invoice sync failed: ' + error.message)
  }
  }
 
@@ -158,7 +200,15 @@ export default function MPesa() {
    ['Pending', 'Partial'].includes(inv.status) &&
    Math.abs(Number(inv.amount_kes || 0) - amount) < 1
   )
-  if (!match) return
+  if (!match) {
+   notifyWarning(`No open M-Pesa invoice for KES ${amount.toLocaleString()} was found. Open Billing and use “Pay” on the right invoice instead.`)
+   return
+  }
+  // Amount alone does not identify the patient (many consultations cost the same), so confirm.
+  const sure = await window.openConfirmDialog(
+   `Apply M-Pesa ${record.reference || ''} (KES ${amount.toLocaleString()}${record.phone ? `, from ${record.phone}` : ''}) to invoice ${match.invoice_no} for ${match.patient_name}?`,
+  )
+  if (!sure) return
   await supabase.from('mpesa_transactions')
    .update({ invoice_id: match.id, patient_id: match.patient_id || null, visit_id: match.visit_id || null })
    .eq('id', record.id)
@@ -167,7 +217,7 @@ export default function MPesa() {
  }
 
  async function handleSave() {
- if (!form.reference || !form.amount_kes) { window.notifyFromLegacyAlert('Reference and amount are required'); return }
+ if (!form.reference || !form.amount_kes) { notifyWarning('Reference and amount are required'); return }
  setSaving(true)
  const payload = {
  hospital_id: hospitalId,
@@ -185,7 +235,7 @@ export default function MPesa() {
   () => supabase.from('mpesa_transactions').insert(payload),
   async () => supabase.from('mpesa_transactions').insert(omitKeys(payload, ['patient_id', 'visit_id', 'invoice_id'])),
  )
- if (error) window.notifyFromLegacyAlert('Error: ' + error.message)
+ if (error) notifyError('Error: ' + error.message)
  else if (form.status === 'Completed') await syncInvoiceForTransaction({ ...payload, status: 'Pending' }, 'Completed')
  setShowAdd(false); setForm(emptyForm)
  await fetchAll(); setSaving(false)
@@ -193,36 +243,54 @@ export default function MPesa() {
  }
 
  async function handleSTKPush() {
- if (!stkPhone || !stkAmount) { window.notifyFromLegacyAlert('Phone and amount required'); return }
- setStkLoading(true)
- // Log as Pending — in production this would call Safaricom Daraja API
- const ref = 'STK' + Date.now().toString().slice(-8)
  const selectedInvoice = linkableInvoices.find(inv => inv.id === stkInvoiceId)
- const payload = {
- hospital_id: hospitalId,
- reference: ref,
- phone: stkPhone,
- amount_kes: parseFloat(stkAmount),
- drug_or_service: stkService || 'STK Push Payment',
- patient_id: selectedInvoice?.patient_id || null,
- visit_id: selectedInvoice?.visit_id || null,
- invoice_id: selectedInvoice?.id || null,
- status: 'Pending',
- transacted_at: new Date().toISOString(),
+ if (!selectedInvoice) { notifyWarning('Select the invoice this payment is for — every M-Pesa payment must be linked to an invoice.'); return }
+ if (!normalizeKenyanPhone(stkPhone)) { notifyWarning('Enter a valid Safaricom number, e.g. 0712 345 678'); return }
+ const amount = Number(stkAmount)
+ if (!(amount >= 1) || !Number.isInteger(amount)) { notifyWarning('STK Push works in whole shillings (KES 1 or more).'); return }
+ setStkLoading(true)
+ try {
+  const res = await startOnlinePayment({
+   invoiceId: selectedInvoice.id, method: 'mpesa', amount, phone: stkPhone,
+   payerName: selectedInvoice.patient_name, idempotencyKey: newIdempotencyKey(),
+  })
+  notifyWarning(`${res.action?.message || 'Prompt sent.'}\nWaiting for the patient to enter their PIN…`)
+  setStkPhone(''); setStkAmount(''); setStkService(''); setStkInvoiceId('')
+  await fetchAll()
+  pollUntilSettled(res.payment.id, { intervalMs: 3000, timeoutMs: 150000 }).then(async (final) => {
+   await fetchAll()
+   if (final?.status === 'completed') notifySuccess(`M-Pesa received: KES ${Number(final.amount).toLocaleString()} (${final.reference || final.receipt_no}).`)
+   else if (final && final.status !== 'pending') notifySuccess(`M-Pesa payment ${final.status}: ${final.failure_reason || 'not completed'}`)
+   broadcastWorkflowChanged({ source: 'mpesa-stk', status: final?.status })
+  })
+ } catch (e) {
+  notifyError('STK Push failed: ' + e.message)
+ } finally {
+  setStkLoading(false)
  }
- const { error } = await executeWithFallback(
-  () => supabase.from('mpesa_transactions').insert(payload),
-  async () => supabase.from('mpesa_transactions').insert(omitKeys(payload, ['patient_id', 'visit_id', 'invoice_id'])),
- )
- if (error) window.notifyFromLegacyAlert('Error: ' + error.message)
- else window.notifyFromLegacyAlert(`STK Push sent to ${stkPhone}. Reference: ${ref}\n\nIn production this triggers the Safaricom Daraja API and sends a prompt to the patient's phone.`)
- setStkPhone(''); setStkAmount(''); setStkService(''); setStkInvoiceId('')
- setStkLoading(false); await fetchAll()
- if (!error) broadcastWorkflowChanged({ source: 'mpesa-stk', reference: ref, status: 'Pending' })
+}
+
+// Rows mirrored from a gateway payment (STK push) are owned by the payments ledger: their
+// status comes from Safaricom / the gateway, never from a button here. Confirming one by hand
+// while the STK was still in flight used to count the same money twice.
+const isGatewayManaged = (r) => !!r?.payment_id
+
+async function checkGatewayRow(r) {
+ try {
+  const p = await fetchPaymentStatus(r.payment_id)
+  await fetchAll()
+  notifyFromLegacyAlert(p ? `Gateway status: ${p.status}${p.failure_reason ? ` — ${p.failure_reason}` : ''}${p.receipt_no ? ` (receipt ${p.receipt_no})` : ''}` : 'No update from the gateway yet.')
+ } catch (e) {
+  notifyError('Could not check the payment: ' + e.message)
+ }
 }
 
 async function updateStatus(id, status) {
  const record = records.find(r => r.id === id) || showDetail
+ if (isGatewayManaged(record)) {
+  notifyInfo('This STK payment is tracked automatically from the gateway. Use “Check” to refresh it; refunds are done by finance from Billing → Payments.')
+  return
+ }
  await supabase.from('mpesa_transactions').update({ status }).eq('id', id)
  if (record) {
   await syncInvoiceForTransaction(record, status)
@@ -410,6 +478,16 @@ async function updateStatus(id, status) {
  <div style={{display:'flex',gap:'4px'}}>
  <button style={{...css.btn,...css.btnGhost,padding:'4px 10px',fontSize:'11px'}}
  onClick={()=>setShowDetail(r)}>View</button>
+ {isGatewayManaged(r) ? (
+ <>
+ <span style={{fontSize:'10px',color:C.muted,alignSelf:'center'}} title="Status comes from the gateway">auto</span>
+ {r.status==='Pending' && (
+ <button style={{...css.btn,...css.btnBlue,padding:'4px 10px',fontSize:'11px'}}
+ onClick={()=>checkGatewayRow(r)}>Check</button>
+ )}
+ </>
+ ) : (
+ <>
  {r.status==='Pending' && (
  <>
  <button style={{...css.btn,background:C.primaryL,color:C.primary,border:'none',padding:'4px 10px',fontSize:'11px'}}
@@ -421,6 +499,8 @@ async function updateStatus(id, status) {
  {r.status==='Completed' && (
  <button style={{...css.btn,background:'#F3F4F6',color:C.sub,border:'none',padding:'4px 10px',fontSize:'11px'}}
  onClick={()=>updateStatus(r.id,'Reversed')}>Reverse</button>
+ )}
+ </>
  )}
  {r.status==='Completed' && !r.invoice_id && (
  <button style={{...css.btn,background:'#EFF6FF',color:'#2563EB',border:'none',padding:'4px 10px',fontSize:'11px'}}
@@ -500,7 +580,7 @@ async function updateStatus(id, status) {
  () => supabase.from('mpesa_transactions').insert(payload),
  async () => supabase.from('mpesa_transactions').insert(omitKeys(payload, ['patient_id'])),
  )
- if(error) window.notifyFromLegacyAlert('Error: '+error.message)
+ if(error) notifyError('Error: '+error.message)
  else await fetchAll()
  }}>
  Import
@@ -588,10 +668,10 @@ async function updateStatus(id, status) {
  <div style={css.cardHead}>Send STK Push</div>
  <div style={{padding:'20px'}}>
  <div style={{background:C.blueL,border:`1px solid ${C.blue}22`,borderRadius:'8px',padding:'12px 14px',fontSize:'12px',color:C.blue,marginBottom:'16px',lineHeight:'1.6'}}>
- Sends a payment prompt directly to the patient's phone via Safaricom Daraja API.
- The patient enters their M-Pesa PIN to complete payment. Requires M-Pesa STK Push integration configured in Settings.
+ Sends a payment prompt directly to the patient's phone. The patient enters their M-Pesa PIN and the
+ invoice is updated automatically with the M-Pesa receipt. Configure the gateway in Settings → Payments.
  </div>
- <label style={css.lbl}>Linked Invoice (optional)</label>
+ <label style={css.lbl}>Invoice *</label>
  <select
  style={{...css.input,cursor:'pointer'}}
  value={stkInvoiceId}
@@ -603,7 +683,7 @@ async function updateStatus(id, status) {
   setStkService(`Invoice ${invoice.invoice_no} - ${invoice.patient_name}`)
  }
  }}>
- <option value="">-- No linked invoice --</option>
+ <option value="">-- Select invoice --</option>
  {linkableInvoices.slice(0, 120).map(inv => (
  <option key={inv.id} value={inv.id}>
  {inv.invoice_no} - {inv.patient_name} - KES {Math.max(0, Number(inv.amount_kes || 0) - Number(inv.paid_kes || 0)).toLocaleString()}
@@ -612,9 +692,9 @@ async function updateStatus(id, status) {
  </select>
  <label style={css.lbl}>Patient Phone Number *</label>
  <input style={css.input} placeholder="e.g. 0712345678" value={stkPhone}
- onChange={e=>setStkPhone(e.target.value.replace(/\D/g,''))}/>
+ onChange={e=>setStkPhone(e.target.value.replace(/[^\d+\s]/g,''))}/>
  <label style={css.lbl}>Amount (KES) *</label>
- <input style={css.input} type="number" placeholder="0" value={stkAmount}
+ <input style={css.input} type="number" min="1" step="1" placeholder="0" value={stkAmount}
  onChange={e=>setStkAmount(e.target.value)}/>
  <label style={css.lbl}>Service Description</label>
  <input style={css.input} placeholder="e.g. Consultation, Lab tests, Pharmacy"
@@ -642,10 +722,17 @@ async function updateStatus(id, status) {
  <div style={{fontSize:'11px',color:C.muted,marginTop:'1px'}}>{r.drug_or_service}</div>
  </div>
  <div style={{display:'flex',gap:'6px'}}>
+ {isGatewayManaged(r) ? (
+ <button style={{...css.btn,...css.btnBlue,padding:'5px 10px',fontSize:'11px'}}
+ onClick={()=>checkGatewayRow(r)}>Check status</button>
+ ) : (
+ <>
  <button style={{...css.btn,background:C.primaryL,color:C.primary,border:'none',padding:'5px 10px',fontSize:'11px'}}
  onClick={()=>updateStatus(r.id,'Completed')}>Confirm</button>
  <button style={{...css.btn,background:C.dangerL,color:C.danger,border:'none',padding:'5px 10px',fontSize:'11px'}}
  onClick={()=>updateStatus(r.id,'Failed')}>Failed</button>
+ </>
+ )}
  </div>
  </div>
  ))}
@@ -738,7 +825,7 @@ async function updateStatus(id, status) {
  <div style={css.modal} onClick={e=>e.stopPropagation()}>
  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'16px'}}>
  <div style={css.modalH}>Transaction Detail</div>
- <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={()=>setShowDetail(null)}></button>
+ <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={()=>setShowDetail(null)} aria-label="Close" title="Close">✕</button>
  </div>
  {[
  ['Reference', showDetail.reference],
@@ -754,7 +841,11 @@ async function updateStatus(id, status) {
  </div>
  ))}
  <div style={{marginTop:'16px',display:'flex',gap:'8px'}}>
- {showDetail.status==='Pending' && (
+ {isGatewayManaged(showDetail) && showDetail.status==='Pending' && (
+ <button style={{...css.btn,...css.btnBlue,flex:1,padding:'10px'}}
+ onClick={()=>{checkGatewayRow(showDetail);setShowDetail(null)}}>Check with gateway</button>
+ )}
+ {!isGatewayManaged(showDetail) && showDetail.status==='Pending' && (
  <>
  <button style={{...css.btn,background:C.primaryL,color:C.primary,border:'none',flex:1,padding:'10px'}}
  onClick={()=>{updateStatus(showDetail.id,'Completed');setShowDetail(null)}}>Confirm Completed</button>
@@ -762,7 +853,7 @@ async function updateStatus(id, status) {
  onClick={()=>{updateStatus(showDetail.id,'Failed');setShowDetail(null)}}>Mark Failed</button>
  </>
  )}
- {showDetail.status==='Completed' && (
+ {!isGatewayManaged(showDetail) && showDetail.status==='Completed' && (
  <button style={{...css.btn,background:'#F3F4F6',color:C.sub,border:'none',flex:1,padding:'10px'}}
  onClick={()=>{updateStatus(showDetail.id,'Reversed');setShowDetail(null)}}>Reverse Transaction</button>
  )}

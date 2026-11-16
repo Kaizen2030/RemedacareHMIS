@@ -1,6 +1,8 @@
-import { useEffect, useState, useMemo } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import supabase from '../supabase'
 import { useHospital } from '../context'
+import { typography } from '../theme'
+import { canPerformAction, resolveRole } from '../access'
 import { executeWithFallback, omitKeys } from '../utils/dbCompat'
 import { extractGeminiText, generateGeminiContent } from '../utils/geminiProxy'
 import {
@@ -10,6 +12,7 @@ import {
   normalizeSusceptibilityProfile,
 } from '../utils/hospitalSignals'
 import { executeMicrobiologyQuery, MICROBIOLOGY_RESULT_BASE_COLUMNS } from '../utils/microbiologyResults'
+import { notifyError, notifyWarning } from '../notifications'
 
 // All antibiotics tracked (column key -> display label)
 const ANTIBIOTICS = [
@@ -67,13 +70,6 @@ const ANTIBIOTIC_KEY_MAP = Object.fromEntries([
 ].map(([label, key]) => [normalizeAntibioticText(label), key]))
 
 const SAMPLE_TYPES = ['All', 'Urine', 'Blood', 'Wound Swab', 'Sputum', 'CSF', 'HVS', 'Stool', 'Other']
-
-const SIR_COLORS = {
-  S: { bg: '#E1F5EE', color: '#0F6E56', label: 'S' },
-  I: { bg: '#FFF3DC', color: '#C07000', label: 'I' },
-  R: { bg: '#FCEBEB', color: '#A32D2D', label: 'R' },
-  NT: { bg: '#f5f5f5', color: '#aaa', label: '—' },
-}
 
 const BLANK_FORM = {
   patient_name: '', lab_test_id: '', patient_id: '',
@@ -203,13 +199,6 @@ function buildMicrobiologyPayload(row, hospitalId = null) {
   return payload
 }
 
-function pctColor(pct) {
-  if (pct == null) return { bg: '#f5f5f5', color: '#bbb' }
-  if (pct >= 80) return { bg: '#E1F5EE', color: '#0F6E56' }
-  if (pct >= 50) return { bg: '#FFF3DC', color: '#C07000' }
-  return { bg: '#FCEBEB', color: '#A32D2D' }
-}
-
 // ─── Gemini API extraction ────────────────────────────────────────────────────
 async function extractWithGemini(fileDataUrl, mimeType, fileName) {
   const isImage = mimeType.startsWith('image/')
@@ -244,7 +233,10 @@ async function extractWithGemini(fileDataUrl, mimeType, fileName) {
     contents: [{ parts }],
     generationConfig: {
       temperature: 0.0,
-      maxOutputTokens: 1200,
+      // A multi-isolate instrument report (e.g. VITEK 2 with 6+ isolates × 15+ drugs) needs far more than 1,200 tokens;
+      // a truncated answer is invalid JSON and the whole upload failed.
+      maxOutputTokens: 8192,
+      responseMimeType: 'application/json',
       topP: 0.95,
       topK: 40
     }
@@ -363,7 +355,8 @@ function mapSpreadsheetRow(raw, hospitalId) {
 }
 
 export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
-  const { hospitalId } = useHospital()
+  const { hospitalId, userRole } = useHospital()
+  const canManage = resolveRole(userRole) === 'Admin' || canPerformAction(userRole, 'manage_antibiogram')
   const [tab, setTab] = useState('patient')
   const [results, setResults] = useState([])
   const [labTests, setLabTests] = useState([])
@@ -384,6 +377,7 @@ export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
 
   // Detail panel
   const [selected, setSelected] = useState(null)
+  const reportRef = useRef(null)
 
   // Upload state
   const [uploadError, setUploadError] = useState('')
@@ -456,7 +450,7 @@ export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
     if (!raw) return
     const knownKey = resolveKnownAntibioticKey(raw)
     const key = knownKey || normalizeSusceptibilityKey(raw)
-    if (!key || EXCLUDED_FIELDS.has(key)) { window.notifyFromLegacyAlert('Invalid antibiotic name.'); return }
+    if (!key || EXCLUDED_FIELDS.has(key)) { notifyWarning('Invalid antibiotic name.'); return }
     setForm(current => {
       const next = { ...current, [key]: normalizeSIR(current[key]) || 'NT' }
       if (!KNOWN_ANTIBIOTIC_KEYS.has(key)) {
@@ -619,6 +613,7 @@ export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
     setForm(f => ({ ...f, patient_name: p.full_name, patient_id: p.id }))
   }
   function openNew() {
+    if (!canManage) return
     setForm({ ...BLANK_FORM, susceptibility_profile: {} })
     setEditingId(null)
     setPatientSearch('')
@@ -626,6 +621,7 @@ export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
     setShowModal(true)
   }
   function openEdit(r) {
+    if (!canManage) return
     setForm(hydrateMicrobiologyRow({ ...BLANK_FORM, ...r }))
     setEditingId(r.id)
     setPatientSearch(r.patient_name || '')
@@ -634,8 +630,9 @@ export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
   }
 
   async function handleSave() {
-    if (!form.patient_name) { window.notifyFromLegacyAlert('Patient name required'); return }
-    if (!form.organism_identified) { window.notifyFromLegacyAlert('Organism identified required'); return }
+    if (!canManage) return
+    if (!form.patient_name) { notifyWarning('Patient name required'); return }
+    if (!form.organism_identified) { notifyWarning('Organism identified required'); return }
     setSaving(true)
     const payload = buildMicrobiologyPayload(form, hospitalId)
     const hasExtraSusceptibility = Object.keys(payload.susceptibility_profile || {}).length > 0
@@ -652,17 +649,18 @@ export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
         return runSave(omitKeys(payload, ['susceptibility_profile']))
       }
     )
-    if (error) { window.notifyFromLegacyAlert('Error: ' + error.message); setSaving(false); return }
+    if (error) { notifyError('Error: ' + error.message); setSaving(false); return }
     setShowModal(false)
     broadcastAntibiogramUpdated({ source: editingId ? 'edit' : 'create', id: editingId || null, patient_id: form.patient_id || null })
     if (usedCompatFallback && hasExtraSusceptibility) {
-      window.notifyFromLegacyAlert('Saved the standard antibiotics, but extra S/I/R agents were not preserved because `microbiology_results.susceptibility_profile` is missing. Apply `microbiology_susceptibility_profile_upgrade.sql` to keep the full culture susceptibility profile.')
+      notifyWarning('Saved the standard antibiotics, but extra S/I/R agents were not preserved because `microbiology_results.susceptibility_profile` is missing. Apply `microbiology_susceptibility_profile_upgrade.sql` to keep the full culture susceptibility profile.')
     }
     fetchAll()
     setSaving(false)
   }
 
   async function handleDelete(id) {
+    if (!canManage) return
     if (!await window.openConfirmDialog('Delete this microbiology result? This cannot be undone.')) return
     await supabase.from('microbiology_results').delete().eq('id', id)
     setSelected(null)
@@ -710,307 +708,284 @@ export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
     </div>
   )
 
+  const testedFor = (r) => allAntibiotics
+    .map((a) => ({ ...a, sir: normalizeSIR(r?.[a.key]) }))
+    .filter((x) => x.sir && x.sir !== 'NT')
+  const flagsFor = (r) => [r.esbl && 'ESBL', r.mrsa && 'MRSA', r.vre && 'VRE', r.carbapenem_r && 'Carbapenem-R'].filter(Boolean)
+  const stats = {
+    isolates: results.length,
+    organisms: organisms.length - 1,
+    esbl: results.filter((r) => r.esbl).length,
+    mrsa: results.filter((r) => r.mrsa).length,
+    cr: results.filter((r) => r.carbapenem_r).length,
+  }
+  const matrixColumns = allAntibiotics.filter((a) => hospitalMatrix.some((row) => row[`pct_${a.key}`] != null))
+  const filtersOn = Boolean(search || filterOrganism !== 'All' || filterSample !== 'All')
+  const selectedTested = selected ? testedFor(selected) : []
+  const openResult = (r) => { setSelected(r); requestAnimationFrame(() => reportRef.current?.scrollIntoView?.({ block: 'start', behavior: 'smooth' })) }
+  const SIR_GROUPS = [['R', 'Resistant'], ['I', 'Susceptible, increased exposure'], ['S', 'Susceptible']]
+
   return (
     <div style={s.page}>
-      <style>{`@keyframes spin{to{transform:rotate(360deg)}} @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}`}</style>
+      <style>{'@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}} .abg-row:hover td{background:#F2F8F5} @media print{.abg-noprint{display:none!important}}'}</style>
 
       {/* HEADER */}
       <div style={s.header}>
-        <div>
-          <h1 style={s.title}>🧫 Antibiogram Surveillance</h1>
-          <p style={s.subtitle}>
-            {results.length} isolates &nbsp;•&nbsp;
-            {organisms.length - 1} organisms &nbsp;•&nbsp;
-            <span style={{ color: '#A32D2D', fontWeight: 600 }}>{results.filter(r => r.esbl).length} ESBL</span> &nbsp;•&nbsp;
-            <span style={{ color: '#A32D2D', fontWeight: 600 }}>{results.filter(r => r.mrsa).length} MRSA</span>
-          </p>
+        <div style={{ minWidth: 0 }}>
+          <h1 style={s.title}>Antibiogram &amp; AMR</h1>
+          <p style={s.subtitle}>Culture &amp; sensitivity results per patient, and the hospital cumulative antibiogram (EUCAST S / I / R).</p>
         </div>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          {onNavigateLab && (
-            <button style={{ ...s.btn, background: '#fff', color: '#0F6E56', border: '1px solid #0F6E56' }} onClick={onNavigateLab}>
-              🔬 Lab Orders
-            </button>
-          )}
-          {onNavigateAI && (
-            <button style={{ ...s.btn, background: '#F0EAFC', color: '#7B5EA7', border: '1px solid #D4C5F5' }} onClick={onNavigateAI}>
-              ✦ AI Suggestion
-            </button>
-          )}
-
-          {/* Upload button */}
-          <div style={{ position: 'relative' }}>
+        <div style={s.actions}>
+          {onNavigateLab && <button type="button" style={s.btnGhost} onClick={onNavigateLab}>Lab orders</button>}
+          {onNavigateAI && <button type="button" style={s.btnGhost} onClick={onNavigateAI}>AI suggestion</button>}
+          <button type="button" style={s.btnGhost} onClick={fetchAll}>Refresh</button>
+          {canManage && <>
             <input id="antibiogram-upload" type="file" accept=".csv,.xlsx,.xls,.pdf,image/*" style={{ display: 'none' }} onChange={handleUploadFile} disabled={uploading} />
-            <label htmlFor="antibiogram-upload" style={{ ...s.btn, background: uploading ? '#ccc' : '#fff', color: uploading ? '#888' : '#0F6E56', border: '1px solid #0F6E56', cursor: uploading ? 'not-allowed' : 'pointer', display: 'inline-block' }}>
-              {uploading ? `⏳ ${uploadStep || 'Processing...'}` : '📎 Upload File'}
+            <label htmlFor="antibiogram-upload" style={{ ...s.btnSecondary, ...(uploading ? s.btnBusy : {}) }}>
+              {uploading ? (uploadStep || 'Processing…') : 'Upload file'}
             </label>
-          </div>
-          <button style={s.btn} onClick={openNew}>+ Add C&S Result</button>
-          <button style={{ ...s.btn, background: '#fff', color: '#0F6E56', border: '1px solid #0F6E56' }} onClick={fetchAll}>↻</button>
+            <button type="button" style={s.btn} onClick={openNew}>Add C&amp;S result</button>
+          </>}
         </div>
+      </div>
 
-        {uploadError && (
-          <div style={{ width: '100%', marginTop: 8, background: '#FCEBEB', border: '1px solid #F09595', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#A32D2D', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <span>⚠️ {uploadError}</span>
-            <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#A32D2D', fontSize: 16 }} onClick={() => setUploadError('')}>✕</button>
+      {/* SUMMARY */}
+      <div style={s.statsRow}>
+        {[['Isolates', stats.isolates, false], ['Organisms', stats.organisms, false], ['ESBL', stats.esbl, true], ['MRSA', stats.mrsa, true], ['Carbapenem-resistant', stats.cr, true]].map(([label, value, alarm]) => (
+          <div key={label} style={{ ...s.stat, ...(alarm && value > 0 ? s.statAlarm : {}) }}>
+            <div style={{ ...s.statValue, color: alarm && value > 0 ? '#912018' : '#101828' }}>{value}</div>
+            <div style={s.statLabel}>{label}</div>
           </div>
-        )}
+        ))}
+      </div>
 
-        {/* Upload preview panel */}
-        {showUploadPreview && (
-          <div style={{ width: '100%', background: '#fff', border: '1px solid #9FE1CB', borderRadius: 12, padding: 16, marginTop: 12 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
-              <div>
-                <div style={{ fontWeight: 700, fontSize: 14, color: '#111' }}>
-                  🧫 Preview — {uploadPreviewRows.length} isolate{uploadPreviewRows.length !== 1 ? 's' : ''} extracted from <em>{previewFileName}</em>
-                </div>
-                <div style={{ fontSize: 12, color: '#555', marginTop: 3 }}>
-                  Review the data below, then confirm to save to the antibiogram.
-                </div>
-              </div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button style={{ ...s.btn, background: '#fff', color: '#555', border: '1px solid #ddd' }} onClick={cancelUploadPreview}>Cancel</button>
-                <button style={s.btn} onClick={confirmUploadPreview} disabled={uploading}>
-                  {uploading ? 'Saving...' : `✅ Confirm & Save ${uploadPreviewRows.length} Row${uploadPreviewRows.length !== 1 ? 's' : ''}`}
-                </button>
-              </div>
+      {uploadError && (
+        <div role="alert" style={s.alert}>
+          <span>{uploadError}</span>
+          <button type="button" aria-label="Dismiss" style={s.alertClose} onClick={() => setUploadError('')}>✕</button>
+        </div>
+      )}
+
+      {/* UPLOAD PREVIEW */}
+      {showUploadPreview && (
+        <div style={{ ...s.panel, borderColor: '#0F6E56', marginBottom: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
+            <div>
+              <div style={s.panelTitle}>Check before saving: {uploadPreviewRows.length} isolate{uploadPreviewRows.length !== 1 ? 's' : ''} read from <em>{previewFileName}</em></div>
+              <div style={s.muted}>Compare with the original report. You can edit any record after saving.</div>
             </div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <button type="button" style={s.btnGhost} onClick={cancelUploadPreview}>Cancel</button>
+              <button type="button" style={s.btn} onClick={confirmUploadPreview} disabled={uploading}>
+                {uploading ? 'Saving…' : `Save ${uploadPreviewRows.length} result${uploadPreviewRows.length !== 1 ? 's' : ''}`}
+              </button>
+            </div>
+          </div>
+          <div style={s.tableWrap}>
+            <table style={s.table}>
+              <thead><tr>{['Patient', 'Organism', 'Specimen', 'Collected', 'Growth', 'Resistance', 'Results'].map((h) => <th key={h} style={s.th}>{h}</th>)}</tr></thead>
+              <tbody>
+                {uploadPreviewRows.map((row, idx) => {
+                  const tested = getSusceptibilityEntries(row)
+                  const count = (v) => tested.filter((e) => e.sir === v).length
+                  return (
+                    <tr key={idx}>
+                      <td style={s.td}><strong>{row.patient_name || '—'}</strong></td>
+                      <td style={{ ...s.td, fontStyle: 'italic', fontWeight: 600 }}>{row.organism_identified || '—'}</td>
+                      <td style={s.td}>{row.sample_type || '—'}</td>
+                      <td style={s.td}>{row.collection_date || '—'}</td>
+                      <td style={s.td}>{row.growth || '—'}</td>
+                      <td style={s.td}>{flagsFor(row).map((f) => <span key={f} style={s.flag}>{f}</span>)}{!flagsFor(row).length && '—'}</td>
+                      <td style={s.td}>{tested.length ? <SirCounts s={count('S')} i={count('I')} r={count('R')} /> : <span style={s.muted}>none read</span>}</td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
-            <div style={{ overflowX: 'auto', borderRadius: 8, border: '1px solid #eee', maxHeight: 300 }}>
-              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+      {/* TABS */}
+      <div role="tablist" aria-label="Antibiogram views" style={s.tabRow}>
+        {[['patient', 'Patient results', results.length], ['hospital', 'Hospital antibiogram', hospitalMatrix.length]].map(([id, label, n]) => (
+          <button key={id} type="button" role="tab" aria-selected={tab === id} style={{ ...s.tabBtn, ...(tab === id ? s.tabBtnActive : {}) }} onClick={() => setTab(id)}>
+            {label} <span style={{ ...s.tabCount, ...(tab === id ? s.tabCountActive : {}) }}>{n}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* FILTERS */}
+      {!(tab === 'patient' && selected) && <div style={s.filters}>
+        {tab === 'patient' && <div style={{ flex: '1 1 260px' }}>
+          <label style={s.filterLabel} htmlFor="abg-search">Search</label>
+          <input id="abg-search" style={s.input} placeholder="Patient name or organism" value={search} onChange={(e) => setSearch(e.target.value)} />
+        </div>}
+        {tab === 'patient' && <div style={{ flex: '0 1 240px' }}>
+          <label style={s.filterLabel} htmlFor="abg-organism">Organism</label>
+          <select id="abg-organism" style={s.input} value={filterOrganism} onChange={(e) => setFilterOrganism(e.target.value)}>
+            {organisms.map((o) => <option key={o} value={o}>{o === 'All' ? 'All organisms' : o}</option>)}
+          </select>
+        </div>}
+        <div style={{ flex: '0 1 200px' }}>
+          <label style={s.filterLabel} htmlFor="abg-sample">Specimen</label>
+          <select id="abg-sample" style={s.input} value={filterSample} onChange={(e) => setFilterSample(e.target.value)}>
+            {SAMPLE_TYPES.map((st) => <option key={st} value={st}>{st === 'All' ? 'All specimens' : st}</option>)}
+          </select>
+        </div>
+        {filtersOn && <button type="button" style={{ ...s.btnGhost, alignSelf: 'flex-end' }} onClick={() => { setSearch(''); setFilterOrganism('All'); setFilterSample('All') }}>Clear filters</button>}
+      </div>}
+
+      {/* ========== PATIENT RESULTS ========== */}
+      {tab === 'patient' && !selected && (
+        <div>
+          {filteredResults.length === 0 ? (
+            <div style={s.empty}>
+              <div style={s.emptyTitle}>{results.length ? 'No result matches these filters' : 'No culture & sensitivity results yet'}</div>
+              <div style={s.muted}>{results.length ? 'Clear the filters to see all results.' : canManage ? 'Use "Add C&S result" to enter one, or "Upload file" to import a VITEK / Phoenix report (PDF or image) or a spreadsheet.' : 'Results appear here when the laboratory adds them.'}</div>
+            </div>
+          ) : (
+            <div style={s.tableWrap}>
+              <table style={s.table}>
                 <thead>
-                  <tr style={{ background: '#f5f5f5' }}>
-                    {['Patient', 'Organism', 'Sample', 'Date', 'Growth', 'ESBL', 'MRSA', 'Antibiotics tested'].map(h => (
-                      <th key={h} style={{ padding: '8px 10px', textAlign: 'left', fontWeight: 700, color: '#555', whiteSpace: 'nowrap', borderBottom: '1px solid #eee' }}>{h}</th>
-                    ))}
-                  </tr>
+                  <tr>{['Collected', 'Patient', 'Specimen', 'Organism', 'Resistance', 'Results', ''].map((h, i) => <th key={i} style={s.th}>{h}</th>)}</tr>
                 </thead>
                 <tbody>
-                  {uploadPreviewRows.map((row, idx) => {
-                    const abxTested = getSusceptibilityEntries(row)
-                    const sCount = abxTested.filter(entry => entry.sir === 'S').length
-                    const rCount = abxTested.filter(entry => entry.sir === 'R').length
+                  {filteredResults.map((r) => {
+                    const tested = testedFor(r)
+                    const count = (v) => tested.filter((x) => x.sir === v).length
                     return (
-                      <tr key={idx} style={{ background: idx % 2 === 0 ? '#fff' : '#fafafa', borderBottom: '1px solid #f0f0f0' }}>
-                        <td style={{ padding: '8px 10px', fontWeight: 600 }}>{row.patient_name || '—'}</td>
-                        <td style={{ padding: '8px 10px', color: '#0F6E56', fontWeight: 600 }}>{row.organism_identified || '—'}</td>
-                        <td style={{ padding: '8px 10px' }}>{row.sample_type || '—'}</td>
-                        <td style={{ padding: '8px 10px', color: '#888', fontSize: 11 }}>{row.collection_date || '—'}</td>
-                        <td style={{ padding: '8px 10px' }}>{row.growth || '—'}</td>
-                        <td style={{ padding: '8px 10px' }}>{row.esbl ? <span style={{ color: '#A32D2D', fontWeight: 700 }}>✓</span> : '—'}</td>
-                        <td style={{ padding: '8px 10px' }}>{row.mrsa ? <span style={{ color: '#A32D2D', fontWeight: 700 }}>✓</span> : '—'}</td>
-                        <td style={{ padding: '8px 10px', fontSize: 11 }}>
-                          {abxTested.length > 0
-                            ? <span>{abxTested.length} tested · <span style={{ color: '#0F6E56' }}>{sCount}S</span> · <span style={{ color: '#A32D2D' }}>{rCount}R</span></span>
-                            : <span style={{ color: '#bbb' }}>None extracted</span>}
-                        </td>
+                      <tr key={r.id} className="abg-row" onClick={() => openResult(r)} style={{ cursor: 'pointer' }}>
+                        <td style={{ ...s.td, whiteSpace: 'nowrap' }}>{r.collection_date || '—'}</td>
+                        <td style={s.td}><div style={{ fontWeight: 700, whiteSpace: 'nowrap' }}>{r.patient_name}</div>{r.ward_department && <div style={s.muted}>{r.ward_department}</div>}</td>
+                        <td style={s.td}>{r.sample_type || '—'}</td>
+                        <td style={{ ...s.td, fontStyle: 'italic', fontWeight: 700, color: '#101828' }}>{r.organism_identified}</td>
+                        <td style={s.td}>{flagsFor(r).length ? flagsFor(r).map((f) => <span key={f} style={s.flag}>{f}</span>) : <span style={s.muted}>None flagged</span>}</td>
+                        <td style={s.td}>{tested.length ? <SirCounts s={count('S')} i={count('I')} r={count('R')} /> : <span style={s.muted}>No AST</span>}</td>
+                        <td style={{ ...s.td, textAlign: 'right', whiteSpace: 'nowrap' }}><button type="button" style={s.btnLink} onClick={(e) => { e.stopPropagation(); openResult(r) }}>Open report ›</button></td>
                       </tr>
                     )
                   })}
                 </tbody>
               </table>
             </div>
-
-            <div style={{ marginTop: 10, fontSize: 11, color: '#888', background: '#f9fafb', borderRadius: 6, padding: '6px 10px' }}>
-              ℹ After saving, you can edit individual records to correct any extraction errors.
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* TABS */}
-      <div style={s.tabRow}>
-        {[{ id: 'patient', label: '👤 Per-Patient Results' }, { id: 'hospital', label: '🏥 Hospital Antibiogram' }].map(t => (
-          <button key={t.id} style={{ ...s.tabBtn, ...(tab === t.id ? s.tabBtnActive : {}) }} onClick={() => setTab(t.id)}>{t.label}</button>
-        ))}
-      </div>
-
-      {/* FILTERS */}
-      <div style={{ display: 'flex', gap: 10, marginBottom: 14, flexWrap: 'wrap', alignItems: 'center' }}>
-        <input style={{ ...s.input, flex: 1, minWidth: 200 }} placeholder="Search patient or organism..." value={search} onChange={e => setSearch(e.target.value)} />
-        <select style={{ ...s.input, width: 'auto' }} value={filterOrganism} onChange={e => setFilterOrganism(e.target.value)}>
-          {organisms.map(o => <option key={o}>{o}</option>)}
-        </select>
-        <select style={{ ...s.input, width: 'auto' }} value={filterSample} onChange={e => setFilterSample(e.target.value)}>
-          {SAMPLE_TYPES.map(st => <option key={st}>{st}</option>)}
-        </select>
-        {(search || filterOrganism !== 'All' || filterSample !== 'All') && (
-          <button style={{ ...s.input, width: 'auto', background: '#FCEBEB', color: '#A32D2D', border: '1px solid #F09595', cursor: 'pointer', fontWeight: 600, fontSize: 12 }}
-            onClick={() => { setSearch(''); setFilterOrganism('All'); setFilterSample('All') }}>Clear</button>
-        )}
-      </div>
-
-      {/* ========== PER-PATIENT TAB ========== */}
-      {tab === 'patient' && (
-        <div style={{ display: 'flex', gap: 16 }}>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            {filteredResults.length === 0 ? (
-              <div style={s.empty}>
-                <div style={{ fontSize: 48 }}>🧫</div>
-                <div style={{ fontWeight: 600, color: '#555', marginTop: 12 }}>No C&S results yet</div>
-                <div style={{ color: '#aaa', fontSize: 13, marginTop: 4 }}>Click "+ Add C&S Result" to enter manually, or "📎 Upload File" to import from image, PDF, or spreadsheet</div>
-              </div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {filteredResults.map(r => (
-                  <div key={r.id} style={{ ...s.card, border: selected?.id === r.id ? '2px solid #0F6E56' : '1px solid #eee', background: selected?.id === r.id ? '#f0faf7' : '#fff' }}
-                    onClick={() => setSelected(selected?.id === r.id ? null : r)}>
-                    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 14, flex: 1, minWidth: 0, flexWrap: 'wrap' }}>
-                      <div style={{ width: 44, height: 44, borderRadius: 10, background: '#E1F5EE', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22, flexShrink: 0 }}>🧫</div>
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
-                          <span style={{ fontWeight: 700, fontSize: 14, color: '#111' }}>{r.organism_identified}</span>
-                          <span style={{ ...s.pill, background: '#E3F0FB', color: '#1a6fb5' }}>{r.sample_type}</span>
-                          {r.esbl && <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>ESBL</span>}
-                          {r.mrsa && <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>MRSA</span>}
-                          {r.carbapenem_r && <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>CRO</span>}
-                        </div>
-                        <div style={{ fontSize: 12, color: '#666', display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                          <span>👤 {r.patient_name}</span>
-                          {r.ward_department && <span>🏥 {r.ward_department}</span>}
-                          <span>📅 {r.collection_date}</span>
-                          {r.growth && <span>Growth: <b>{r.growth}</b></span>}
-                        </div>
-                        <div style={{ display: 'flex', gap: 4, marginTop: 8, flexWrap: 'wrap' }}>
-                          {allAntibiotics.filter(a => normalizeSIR(r[a.key]) && normalizeSIR(r[a.key]) !== 'NT').slice(0, 10).map(a => {
-                            const sir = normalizeSIR(r[a.key]) || 'NT'
-                            const c = SIR_COLORS[sir] || SIR_COLORS.NT
-                            return (
-                              <div key={a.key} style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 5, background: c.bg, color: c.color, lineHeight: 1.6 }} title={a.label}>
-                                {a.label.split('-')[0].split(' ')[0].slice(0, 5)} <span style={{ opacity: 0.7 }}>{c.label}</span>
-                              </div>
-                            )
-                          })}
-                          {allAntibiotics.filter(a => normalizeSIR(r[a.key]) && normalizeSIR(r[a.key]) !== 'NT').length > 10 && (
-                            <div style={{ fontSize: 10, color: '#aaa', padding: '2px 6px' }}>+{allAntibiotics.filter(a => normalizeSIR(r[a.key]) && normalizeSIR(r[a.key]) !== 'NT').length - 10} more</div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                    <div style={{ display: 'flex', gap: 6, flexShrink: 0 }} onClick={e => e.stopPropagation()}>
-                      <button style={{ ...s.actionBtn, background: '#E3F0FB', color: '#1a6fb5', border: '1px solid #90C4F0' }} onClick={() => openEdit(r)}>✏️ Edit</button>
-                      <button style={{ ...s.actionBtn, background: '#FCEBEB', color: '#A32D2D', border: '1px solid #F09595' }} onClick={() => handleDelete(r.id)}>🗑</button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* DETAIL PANEL */}
-          {selected && (
-            <div style={s.detailPanel}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
-                <span style={{ fontWeight: 700, fontSize: 14 }}>Result Detail</span>
-                <button style={{ background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', color: '#aaa' }} onClick={() => setSelected(null)}>✕</button>
-              </div>
-
-              <div style={s.sectionLabel}>Patient & Sample</div>
-              {[
-                ['Patient', selected.patient_name],
-                ['Sample', selected.sample_type],
-                ['Collected', selected.collection_date],
-                ['Ward / Dept', selected.ward_department || '—'],
-                ['Diagnosis', selected.diagnosis || '—'],
-                ['Gram Stain', selected.gram_stain || '—'],
-                ['Growth', selected.growth || '—'],
-                ['Colony Count', selected.colony_count || '—'],
-              ].map(([l, v]) => (
-                <div key={l} style={{ marginBottom: 8, paddingBottom: 8, borderBottom: '1px solid #f5f5f5' }}>
-                  <div style={{ fontSize: 10, color: '#aaa', fontWeight: 700, textTransform: 'uppercase', marginBottom: 1 }}>{l}</div>
-                  <div style={{ fontSize: 13, color: '#111' }}>{v}</div>
-                </div>
-              ))}
-
-              <div style={{ ...s.sectionLabel, marginTop: 10 }}>Organism</div>
-              <div style={{ fontWeight: 700, fontSize: 15, color: '#0F6E56', marginBottom: 8 }}>{selected.organism_identified}</div>
-              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
-                {selected.esbl && <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>ESBL</span>}
-                {selected.mrsa && <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>MRSA</span>}
-                {selected.vre && <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>VRE</span>}
-                {selected.carbapenem_r && <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>Carbapenem-R</span>}
-              </div>
-
-              <div style={s.sectionLabel}>Antibiogram</div>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {allAntibiotics.filter(a => normalizeSIR(selected[a.key]) && normalizeSIR(selected[a.key]) !== 'NT').map(a => {
-                  const sir = normalizeSIR(selected[a.key]) || 'NT'
-                  const c = SIR_COLORS[sir] || SIR_COLORS.NT
-                  return (
-                    <div key={a.key} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '5px 8px', borderRadius: 6, background: c.bg }}>
-                      <span style={{ fontSize: 12, color: '#333' }}>{a.label}</span>
-                      <span style={{ fontSize: 12, fontWeight: 800, color: c.color }}>{sir}</span>
-                    </div>
-                  )
-                })}
-                {allAntibiotics.filter(a => normalizeSIR(selected[a.key]) && normalizeSIR(selected[a.key]) !== 'NT').length === 0 && (
-                  <div style={{ fontSize: 12, color: '#aaa', fontStyle: 'italic' }}>No susceptibility data recorded</div>
-                )}
-              </div>
-
-              {selected.clinical_notes && (
-                <>
-                  <div style={{ ...s.sectionLabel, marginTop: 10 }}>Clinical Notes</div>
-                  <div style={{ fontSize: 12, color: '#555', background: '#f9f9f9', borderRadius: 8, padding: '8px 10px' }}>{selected.clinical_notes}</div>
-                </>
-              )}
-
-              {onNavigateAI && (
-                <button style={{ ...s.btn, width: '100%', marginTop: 14, background: '#7B5EA7', fontSize: 12 }} onClick={onNavigateAI}>
-                  ✦ Get AI Prescription Suggestion
-                </button>
-              )}
-            </div>
           )}
         </div>
       )}
 
-      {/* ========== HOSPITAL ANTIBIOGRAM TAB ========== */}
+      {/* ========== FULL-WIDTH RESULT REPORT ========== */}
+      {tab === 'patient' && selected && (() => {
+        const idx = filteredResults.findIndex((r) => r.id === selected.id)
+        const prev = idx > 0 ? filteredResults[idx - 1] : null
+        const next = idx >= 0 && idx < filteredResults.length - 1 ? filteredResults[idx + 1] : null
+        const facts = [['Ward / dept', selected.ward_department], ['Gram stain', selected.gram_stain], ['Growth', selected.growth], ['Colony count', selected.colony_count],
+          ['Diagnosis', selected.diagnosis], ['Performed by', selected.performed_by], ['Verified by', selected.verified_by]].filter(([, v]) => v)
+        return (
+          <article aria-label={`Result report: ${selected.organism_identified}`} style={s.report} ref={reportRef}>
+            <div className="abg-noprint" style={s.reportBar}>
+              <button type="button" style={s.btnGhost} onClick={() => setSelected(null)}>← Back to results</button>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                {idx >= 0 && <span style={s.muted}>{idx + 1} of {filteredResults.length}</span>}
+                <button type="button" style={s.btnGhost} disabled={!prev} onClick={() => prev && openResult(prev)}>‹ Previous</button>
+                <button type="button" style={s.btnGhost} disabled={!next} onClick={() => next && openResult(next)}>Next ›</button>
+                <button type="button" style={s.btnGhost} onClick={() => window.print()}>Print</button>
+                {canManage && <button type="button" style={s.btnGhost} onClick={() => openEdit(selected)}>Edit</button>}
+                {canManage && <button type="button" style={s.btnDanger} onClick={() => handleDelete(selected.id)}>Delete</button>}
+              </div>
+            </div>
+
+            <header style={s.reportHead}>
+              <div style={{ minWidth: 0, flex: '1 1 380px' }}>
+                <div style={s.eyebrow}>Culture &amp; sensitivity report</div>
+                <h2 style={s.reportTitle}>{selected.organism_identified}</h2>
+                <div style={s.reportMeta}>
+                  <span><strong>{selected.patient_name}</strong></span>
+                  <span>{selected.sample_type || 'Specimen not stated'}</span>
+                  {selected.collection_date && <span>Collected {selected.collection_date}</span>}
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+                {flagsFor(selected).length ? flagsFor(selected).map((f) => <span key={f} style={s.flagLarge}>{f}</span>) : <span style={s.okBadge}>No resistance flag</span>}
+              </div>
+            </header>
+
+            {facts.length > 0 && (
+              <dl style={s.factsRow}>
+                {facts.map(([l, v]) => <div key={l} style={s.fact}><dt style={s.factLabel}>{l}</dt><dd style={s.factValue}>{v}</dd></div>)}
+              </dl>
+            )}
+
+            <h3 style={s.sectionTitle}>Susceptibility · {selectedTested.length} antibiotics tested</h3>
+            {selectedTested.length === 0 ? <div style={s.muted}>No susceptibility results recorded.</div> : (
+              <div style={s.sirColumns}>
+                {SIR_GROUPS.map(([code, label]) => {
+                  const list = selectedTested.filter((x) => x.sir === code)
+                  return (
+                    <section key={code} aria-label={label} style={s.sirCol}>
+                      <div style={s.sirColHead}>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}><span aria-hidden="true" style={{ width: 8, height: 8, borderRadius: 4, background: SIR_STYLE[code].dot }} />{label}</span><span style={{ ...s.sirChip, background: '#F2F4F7', color: '#101828' }}>{list.length}</span>
+                      </div>
+                      {list.length === 0 && <div style={{ ...s.muted, padding: '8px 0' }}>None</div>}
+                      {list.map((x) => (
+                        <div key={x.key} style={s.abxRow}>
+                          <span>{x.label}</span>
+                          <span style={{ ...s.sirChip, background: SIR_STYLE[code].bg, color: SIR_STYLE[code].color }}>{code}</span>
+                        </div>
+                      ))}
+                    </section>
+                  )
+                })}
+              </div>
+            )}
+            <p style={{ ...s.muted, marginTop: 12 }}>S = susceptible at standard dosing · I = susceptible, increased exposure (high dosage needed) · R = resistant (EUCAST).</p>
+
+            {selected.clinical_notes && <><h3 style={s.sectionTitle}>Clinical notes</h3><p style={{ fontSize: 14, color: '#101828', margin: 0, whiteSpace: 'pre-wrap' }}>{selected.clinical_notes}</p></>}
+            {onNavigateAI && <div className="abg-noprint" style={{ marginTop: 16 }}><button type="button" style={s.btnSecondary} onClick={onNavigateAI}>AI prescribing suggestion</button></div>}
+          </article>
+        )
+      })()}
+
+      {/* ========== HOSPITAL ANTIBIOGRAM ========== */}
       {tab === 'hospital' && (
         <div>
           {hospitalMatrix.length === 0 ? (
             <div style={s.empty}>
-              <div style={{ fontSize: 48 }}>🏥</div>
-              <div style={{ fontWeight: 600, color: '#555', marginTop: 12 }}>No data yet</div>
-              <div style={{ color: '#aaa', fontSize: 13, marginTop: 4 }}>Add per-patient C&S results to populate the hospital antibiogram</div>
+              <div style={s.emptyTitle}>No data yet</div>
+              <div style={s.muted}>The hospital antibiogram is built from the patient results.</div>
             </div>
           ) : (
             <>
-              <div style={{ fontSize: 12, color: '#888', marginBottom: 10 }}>
-                % Susceptibility (S) — <span style={{ color: '#0F6E56', fontWeight: 600 }}>≥80% good</span> &nbsp;
-                <span style={{ color: '#C07000', fontWeight: 600 }}>50–79% moderate</span> &nbsp;
-                <span style={{ color: '#A32D2D', fontWeight: 600 }}>&lt;50% resistant</span> &nbsp;•&nbsp;
-                Interpret with caution if n &lt; 10
+              <div style={s.legend}>
+                <span style={s.legendTitle}>% susceptible</span>
+                <span style={{ ...s.legendChip, ...PCT_STYLE.good }}>≥ 80% good</span>
+                <span style={{ ...s.legendChip, ...PCT_STYLE.mid }}>50–79% moderate</span>
+                <span style={{ ...s.legendChip, ...PCT_STYLE.poor }}>&lt; 50% poor</span>
+                <span style={s.muted}>Interpret with caution when n &lt; 30 isolates (CLSI M39). Only antibiotics with results are shown.</span>
               </div>
-              <div style={{ overflowX: 'auto', borderRadius: 12, border: '1px solid #eee', background: '#fff', boxShadow: '0 2px 8px rgba(0,0,0,.04)' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+              <div style={s.tableWrap}>
+                <table style={s.table}>
                   <thead>
-                    <tr style={{ background: '#0F6E56', color: '#fff' }}>
-                      <th style={{ padding: '10px 14px', textAlign: 'left', fontWeight: 700, position: 'sticky', left: 0, background: '#0F6E56', zIndex: 2, minWidth: 180 }}>Organism</th>
-                      <th style={{ padding: '10px 8px', textAlign: 'center', fontWeight: 600, minWidth: 50 }}>n</th>
-                      <th style={{ padding: '10px 6px', textAlign: 'center', fontWeight: 600, minWidth: 46, color: '#FCEBEB' }}>ESBL</th>
-                      <th style={{ padding: '10px 6px', textAlign: 'center', fontWeight: 600, minWidth: 46, color: '#FCEBEB' }}>MRSA</th>
-                      <th style={{ padding: '10px 6px', textAlign: 'center', fontWeight: 600, minWidth: 46, color: '#FCEBEB' }}>CRO</th>
-                      {allAntibiotics.map(a => (
-                        <th key={a.key} style={{ padding: '10px 6px', textAlign: 'center', fontWeight: 600, minWidth: 72, whiteSpace: 'nowrap' }}>{a.label}</th>
-                      ))}
+                    <tr>
+                      <th style={{ ...s.thDark, position: 'sticky', left: 0, zIndex: 2, minWidth: 200, textAlign: 'left' }}>Organism</th>
+                      <th style={s.thDark}>n</th>
+                      <th style={s.thDark}>ESBL</th>
+                      <th style={s.thDark}>MRSA</th>
+                      <th style={s.thDark}>Carb-R</th>
+                      {matrixColumns.map((a) => <th key={a.key} style={{ ...s.thDark, whiteSpace: 'nowrap' }}>{a.label}</th>)}
                     </tr>
                   </thead>
                   <tbody>
                     {hospitalMatrix.map((row, i) => (
-                      <tr key={row.organism} style={{ background: i % 2 === 0 ? '#fff' : '#fafcfb', borderBottom: '1px solid #f0f0f0' }}>
-                        <td style={{ padding: '10px 14px', fontWeight: 700, color: '#111', position: 'sticky', left: 0, background: i % 2 === 0 ? '#fff' : '#fafcfb', zIndex: 1 }}>{row.organism}</td>
-                        <td style={{ padding: '8px', textAlign: 'center', color: '#555', fontWeight: 600 }}>{row.count}</td>
-                        <td style={{ padding: '8px', textAlign: 'center' }}>{row.esbl > 0 ? <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>{row.esbl}</span> : <span style={{ color: '#bbb' }}>—</span>}</td>
-                        <td style={{ padding: '8px', textAlign: 'center' }}>{row.mrsa > 0 ? <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>{row.mrsa}</span> : <span style={{ color: '#bbb' }}>—</span>}</td>
-                        <td style={{ padding: '8px', textAlign: 'center' }}>{row.carbapenem_r > 0 ? <span style={{ ...s.pill, background: '#FCEBEB', color: '#A32D2D' }}>{row.carbapenem_r}</span> : <span style={{ color: '#bbb' }}>—</span>}</td>
-                        {allAntibiotics.map(a => {
+                      <tr key={row.organism}>
+                        <td style={{ ...s.td, position: 'sticky', left: 0, background: '#FFFFFF', zIndex: 1, fontStyle: 'italic', fontWeight: 700, color: '#101828' }}>{row.organism}</td>
+                        <td style={{ ...s.td, textAlign: 'center', fontWeight: 700, color: row.count < 30 ? '#B54708' : '#101828' }} title={row.count < 30 ? 'Fewer than 30 isolates' : undefined}>{row.count}</td>
+                        {['esbl', 'mrsa', 'carbapenem_r'].map((k) => (
+                          <td key={k} style={{ ...s.td, textAlign: 'center' }}>{row[k] > 0 ? <span style={s.flag}>{row[k]}</span> : <span style={s.muted}>0</span>}</td>
+                        ))}
+                        {matrixColumns.map((a) => {
                           const pct = row[`pct_${a.key}`]
-                          const c = pctColor(pct)
-                          return (
-                            <td key={a.key} style={{ padding: '6px', textAlign: 'center' }}>
-                              {pct != null ? <span style={{ ...s.pill, background: c.bg, color: c.color, fontWeight: 700, minWidth: 38, display: 'inline-block', textAlign: 'center' }}>{pct}%</span> : <span style={{ color: '#ddd', fontSize: 11 }}>—</span>}
-                            </td>
-                          )
+                          const st = pct == null ? null : pct >= 80 ? PCT_STYLE.good : pct >= 50 ? PCT_STYLE.mid : PCT_STYLE.poor
+                          return <td key={a.key} style={{ ...s.td, textAlign: 'center', padding: 4 }}>{st ? <span style={{ ...s.pctCell, ...st }}>{pct}%</span> : <span style={s.muted}>–</span>}</td>
                         })}
                       </tr>
                     ))}
@@ -1028,10 +1003,10 @@ export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
           <div style={{ ...s.modal, maxWidth: 700 }} onClick={e => e.stopPropagation()}>
             <div style={s.modalHeader}>
               <div>
-                <h2 style={s.modalTitle}>🧫 {editingId ? 'Edit' : 'Add'} C&S Result</h2>
+                <h2 style={s.modalTitle}>{editingId ? 'Edit' : 'Add'} culture &amp; sensitivity result</h2>
                 <div style={{ fontSize: 12, color: '#888', marginTop: 2 }}>Enter culture & sensitivity for a patient isolate</div>
               </div>
-              <button style={s.closeBtn} onClick={() => setShowModal(false)}>✕</button>
+              <button type="button" aria-label="Close" style={s.closeBtn} onClick={() => setShowModal(false)}>✕</button>
             </div>
             <div style={s.modalBody}>
               <div style={s.sectionLabel}>Patient</div>
@@ -1153,7 +1128,7 @@ export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
             </div>
             <div style={s.modalFooter}>
               <button style={s.cancelBtn} onClick={() => setShowModal(false)}>Cancel</button>
-              <button style={s.submitBtn} onClick={handleSave} disabled={saving}>{saving ? 'Saving...' : '🧫 Save C&S Result'}</button>
+              <button style={s.submitBtn} onClick={handleSave} disabled={saving}>{saving ? 'Saving…' : 'Save result'}</button>
             </div>
           </div>
         </div>
@@ -1162,32 +1137,116 @@ export default function Antibiogram({ onNavigateLab, onNavigateAI }) {
   )
 }
 
+// Solid, high-contrast colours for results (S green, I amber, R red)
+// Professional palette: neutral surfaces, colour only as small muted signals (S green, I amber, R red)
+const SIR_STYLE = {
+  S: { bg: '#F2F4F7', color: '#05603A', dot: '#3F8F6B' },
+  I: { bg: '#F2F4F7', color: '#93370D', dot: '#C4873A' },
+  R: { bg: '#F2F4F7', color: '#912018', dot: '#B5544B' },
+}
+const PCT_STYLE = {
+  good: { color: '#05603A' },
+  mid: { color: '#93370D' },
+  poor: { color: '#912018' },
+}
+
+/** "5 S · 1 I · 9 R" with a small proportional bar. */
+function SirCounts({ s: sCount, i: iCount, r: rCount }) {
+  const total = sCount + iCount + rCount || 1
+  return (
+    <div style={{ minWidth: 150 }}>
+      <div style={{ display: 'flex', gap: 10, fontSize: 12.5, fontWeight: 700 }}>
+        <span style={{ color: SIR_STYLE.S.color }}>{sCount} S</span>
+        <span style={{ color: SIR_STYLE.I.color }}>{iCount} I</span>
+        <span style={{ color: SIR_STYLE.R.color }}>{rCount} R</span>
+      </div>
+      <div aria-hidden="true" style={{ display: 'flex', height: 6, borderRadius: 3, overflow: 'hidden', marginTop: 4, background: '#EAECF0' }}>
+        <span style={{ width: `${(100 * sCount) / total}%`, background: SIR_STYLE.S.dot }} />
+        <span style={{ width: `${(100 * iCount) / total}%`, background: SIR_STYLE.I.dot }} />
+        <span style={{ width: `${(100 * rCount) / total}%`, background: SIR_STYLE.R.dot }} />
+      </div>
+    </div>
+  )
+}
+
 const s = {
-  page: { padding: '20px 24px', flex: 1, overflowY: 'auto', background: '#f7f8f7', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', minHeight: '100vh', boxSizing: 'border-box' },
-  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap', gap: 10 },
-  title: { fontSize: 24, fontWeight: 800, margin: 0, color: '#111' },
-  subtitle: { color: '#777', margin: '4px 0 0', fontSize: 13 },
-  btn: { background: '#0F6E56', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 8, fontWeight: 600, cursor: 'pointer', fontSize: 13 },
-  tabRow: { display: 'flex', gap: 4, marginBottom: 14, background: '#fff', padding: '6px 8px', borderRadius: 10, border: '1px solid #eee' },
-  tabBtn: { padding: '8px 16px', border: 'none', background: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#888', borderRadius: 7 },
-  tabBtnActive: { background: '#0F6E56', color: '#fff' },
-  card: { borderRadius: 12, padding: '14px 16px', cursor: 'pointer', display: 'flex', alignItems: 'flex-start', gap: 12, boxShadow: '0 2px 6px rgba(0,0,0,0.04)', transition: 'box-shadow .15s', flexWrap: 'wrap' },
-  pill: { fontSize: 11, fontWeight: 600, padding: '3px 9px', borderRadius: 99, display: 'inline-block' },
-  actionBtn: { fontSize: 12, padding: '6px 12px', borderRadius: 6, cursor: 'pointer', fontWeight: 600, whiteSpace: 'nowrap', border: 'none' },
-  sectionLabel: { fontSize: 11, fontWeight: 700, color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '.8px', marginBottom: 10, marginTop: 4, paddingBottom: 5, borderBottom: '1px solid #E1F5EE' },
-  detailPanel: { width: 300, flexShrink: 0, background: '#fff', borderRadius: 12, border: '1px solid #eee', padding: 18, overflowY: 'auto', maxHeight: 'calc(100vh - 140px)' },
-  empty: { textAlign: 'center', padding: '80px 20px', color: '#999' },
-  input: { width: '100%', padding: '10px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 13, outline: 'none', boxSizing: 'border-box', background: '#fff', color: '#111', fontFamily: 'inherit' },
-  formGrid2: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 },
+  page: { padding: '20px 24px 32px', color: '#101828', fontFamily: typography.fontFamily, boxSizing: 'border-box' },
+  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap', gap: 12 },
+  title: { fontSize: 22, fontWeight: 800, margin: 0, color: '#101828' },
+  subtitle: { color: '#344054', margin: '4px 0 0', fontSize: 13.5 },
+  actions: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' },
+  btn: { background: '#0F6E56', color: '#FFFFFF', border: '1px solid #0F6E56', padding: '9px 16px', borderRadius: 8, fontWeight: 700, cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' },
+  btnSecondary: { background: '#FFFFFF', color: '#0F6E56', border: '1px solid #0F6E56', padding: '9px 16px', borderRadius: 8, fontWeight: 700, cursor: 'pointer', fontSize: 13, display: 'inline-block', fontFamily: 'inherit' },
+  btnGhost: { background: '#FFFFFF', color: '#101828', border: '1px solid #D0D5DD', padding: '9px 14px', borderRadius: 8, fontWeight: 600, cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' },
+  btnDanger: { background: '#FFFFFF', color: '#B42318', border: '1px solid #B42318', padding: '9px 14px', borderRadius: 8, fontWeight: 700, cursor: 'pointer', fontSize: 13, fontFamily: 'inherit' },
+  btnBusy: { background: '#F2F4F7', color: '#344054', borderColor: '#D0D5DD', cursor: 'wait' },
+  iconBtn: { background: '#FFFFFF', border: '1px solid #D0D5DD', borderRadius: 8, width: 32, height: 32, cursor: 'pointer', color: '#101828', fontSize: 14, flexShrink: 0 },
+  statsRow: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 16 },
+  stat: { background: '#FFFFFF', border: '1px solid #D0D5DD', borderRadius: 10, padding: '12px 14px' },
+  statAlarm: {},
+  statValue: { fontSize: 24, fontWeight: 800, lineHeight: 1.1 },
+  statLabel: { fontSize: 12.5, fontWeight: 700, color: '#344054', marginTop: 2 },
+  alert: { background: '#FEF3F2', border: '1px solid #B42318', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#B42318', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, marginBottom: 14, fontWeight: 600 },
+  alertClose: { background: 'none', border: 'none', cursor: 'pointer', color: '#B42318', fontSize: 16 },
+  panel: { background: '#FFFFFF', border: '1px solid #D0D5DD', borderRadius: 12, padding: 16 },
+  panelTitle: { fontWeight: 800, fontSize: 14, color: '#101828' },
+  tabRow: { display: 'flex', gap: 4, marginBottom: 14, borderBottom: '2px solid #EAECF0' },
+  tabBtn: { padding: '10px 14px', borderTop: 'none', borderLeft: 'none', borderRight: 'none', borderBottom: '3px solid transparent', marginBottom: -2, background: 'none', cursor: 'pointer', fontSize: 14, fontWeight: 700, color: '#475467', display: 'inline-flex', gap: 8, alignItems: 'center', fontFamily: 'inherit' },
+  tabBtnActive: { color: '#0F6E56', borderBottom: '3px solid #0F6E56' },
+  tabCount: { fontSize: 11.5, fontWeight: 700, background: '#F2F4F7', color: '#344054', borderRadius: 999, padding: '1px 8px' },
+  tabCountActive: { background: '#0F6E56', color: '#FFFFFF' },
+  filters: { display: 'flex', gap: 12, marginBottom: 14, flexWrap: 'wrap', alignItems: 'flex-end', background: '#FFFFFF', border: '1px solid #D0D5DD', borderRadius: 10, padding: 12 },
+  filterLabel: { display: 'block', fontSize: 12, fontWeight: 700, color: '#344054', marginBottom: 4 },
+  tableWrap: { overflowX: 'auto', background: '#FFFFFF', border: '1px solid #D0D5DD', borderRadius: 10 },
+  table: { width: '100%', minWidth: 760, borderCollapse: 'separate', borderSpacing: 0, fontSize: 13 },
+  th: { textAlign: 'left', padding: '10px 12px', fontSize: 12, fontWeight: 800, color: '#344054', background: '#F9FAFB', borderBottom: '1px solid #D0D5DD', whiteSpace: 'nowrap' },
+  thDark: { textAlign: 'center', padding: '10px 8px', fontSize: 12, fontWeight: 800, color: '#344054', background: '#F9FAFB', borderBottom: '1px solid #D0D5DD' },
+  td: { padding: '10px 12px', borderBottom: '1px solid #EAECF0', verticalAlign: 'middle', color: '#101828', background: '#FFFFFF' },
+  tdSel: { background: '#E6F4EE' },
+  flag: { display: 'inline-block', fontSize: 11.5, fontWeight: 700, color: '#912018', background: '#FFFFFF', border: '1px solid #D9A8A3', borderRadius: 4, padding: '1px 7px', marginRight: 4, marginBottom: 2 },
+  flagLarge: { display: 'inline-block', fontSize: 12.5, fontWeight: 700, color: '#912018', background: '#FFFFFF', border: '1px solid #D9A8A3', borderRadius: 4, padding: '3px 10px' },
+  muted: { color: '#475467', fontSize: 12.5 },
+  btnLink: { background: 'none', border: 'none', color: '#0F6E56', fontWeight: 800, cursor: 'pointer', fontSize: 13, padding: 0, fontFamily: 'inherit' },
+  report: { background: '#FFFFFF', border: '1px solid #D0D5DD', borderRadius: 12, padding: '18px 22px 22px', scrollMarginTop: 12 },
+  reportBar: { display: 'flex', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap', alignItems: 'center', paddingBottom: 14, marginBottom: 16, borderBottom: '1px solid #EAECF0' },
+  reportHead: { display: 'flex', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' },
+  reportTitle: { fontSize: 26, fontWeight: 800, fontStyle: 'italic', margin: '4px 0 6px', color: '#101828', lineHeight: 1.2 },
+  reportMeta: { display: 'flex', gap: 18, flexWrap: 'wrap', fontSize: 14.5, color: '#101828' },
+  okBadge: { display: 'inline-block', fontSize: 12.5, fontWeight: 700, color: '#344054', background: '#FFFFFF', border: '1px solid #D0D5DD', borderRadius: 4, padding: '3px 10px' },
+  factsRow: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, margin: '16px 0 0', padding: 12, background: '#F9FAFB', borderRadius: 10, border: '1px solid #EAECF0' },
+  fact: { minWidth: 0 },
+  sirColumns: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 },
+  sirCol: { border: '1px solid #EAECF0', borderRadius: 10, padding: '10px 14px' },
+  sirColHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontWeight: 800, fontSize: 13.5, color: '#101828', paddingBottom: 6, borderBottom: '1px solid #EAECF0', marginBottom: 2 },
+  detailPanel: { flex: '0 1 380px', minWidth: 300, background: '#FFFFFF', border: '1px solid #D0D5DD', borderRadius: 12, padding: 18, position: 'sticky', top: 12, maxHeight: 'calc(100vh - 24px)', overflowY: 'auto', boxSizing: 'border-box' },
+  eyebrow: { fontSize: 12, fontWeight: 700, color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '.03em' },
+  detailTitle: { fontSize: 19, fontWeight: 800, fontStyle: 'italic', margin: '4px 0 0', color: '#101828', lineHeight: 1.25 },
+  facts: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 14px', margin: '14px 0 4px' },
+  factLabel: { fontSize: 11.5, fontWeight: 700, color: '#475467', textTransform: 'uppercase', letterSpacing: '.03em' },
+  factValue: { margin: '2px 0 0', fontSize: 13.5, fontWeight: 600, color: '#101828' },
+  sectionTitle: { fontSize: 14, fontWeight: 800, color: '#101828', margin: '16px 0 8px', paddingTop: 12, borderTop: '1px solid #EAECF0' },
+  groupHead: { fontSize: 12, fontWeight: 800, textTransform: 'uppercase', letterSpacing: '.03em', margin: '6px 0 4px' },
+  abxRow: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '6px 0', borderBottom: '1px solid #F2F4F7', fontSize: 13.5, fontWeight: 600 },
+  sirChip: { minWidth: 26, textAlign: 'center', fontWeight: 800, fontSize: 12.5, borderRadius: 6, padding: '2px 6px' },
+  legend: { display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 },
+  legendTitle: { fontSize: 12.5, fontWeight: 800, color: '#101828' },
+  legendChip: { fontSize: 12, fontWeight: 700, padding: '2px 4px' },
+  pctCell: { display: 'inline-block', minWidth: 44, padding: '4px 6px', fontWeight: 700, fontSize: 13 },
+  empty: { textAlign: 'center', padding: '56px 20px', background: '#FFFFFF', border: '1px dashed #D0D5DD', borderRadius: 12 },
+  emptyTitle: { fontWeight: 800, color: '#101828', fontSize: 15, marginBottom: 4 },
+  // modal and form (unchanged layout, solid colours)
+  input: { width: '100%', padding: '9px 12px', border: '1px solid #D0D5DD', borderRadius: 8, fontSize: 13.5, outline: 'none', boxSizing: 'border-box', background: '#FFFFFF', color: '#101828', fontFamily: 'inherit' },
+  sectionLabel: { fontSize: 12, fontWeight: 800, color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '.6px', marginBottom: 10, marginTop: 4, paddingBottom: 5, borderBottom: '1px solid #D1E9DF' },
+  formGrid2: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14 },
   formGroup: { marginBottom: 14 },
-  label: { fontSize: 12, color: '#666', display: 'block', marginBottom: 5, fontWeight: 500 },
-  overlay: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 20 },
-  modal: { background: '#fff', borderRadius: 16, width: '100%', maxWidth: 700, maxHeight: '90vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,0.2)', animation: 'fadeIn 0.2s ease' },
-  modalHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', padding: '18px 24px', borderBottom: '1px solid #f0f0f0' },
-  modalTitle: { fontSize: 17, fontWeight: 700, margin: 0, color: '#111' },
-  closeBtn: { background: 'none', border: 'none', fontSize: 18, cursor: 'pointer', color: '#aaa' },
-  modalBody: { padding: '20px 24px', overflowY: 'auto', flex: 1 },
-  modalFooter: { padding: '14px 24px', borderTop: '1px solid #f0f0f0', display: 'flex', justifyContent: 'flex-end', gap: 10 },
-  cancelBtn: { padding: '10px 20px', border: '1px solid #ddd', borderRadius: 8, background: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#555' },
-  submitBtn: { padding: '10px 24px', border: 'none', borderRadius: 8, background: '#0F6E56', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
+  label: { fontSize: 12.5, color: '#344054', display: 'block', marginBottom: 5, fontWeight: 700 },
+  overlay: { position: 'fixed', inset: 0, background: 'rgba(16,24,40,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 20 },
+  modal: { background: '#FFFFFF', borderRadius: 14, width: '100%', maxWidth: 700, maxHeight: '90vh', display: 'flex', flexDirection: 'column', boxShadow: '0 20px 60px rgba(0,0,0,0.25)', animation: 'fadeIn 0.2s ease' },
+  modalHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', padding: '16px 22px', borderBottom: '1px solid #EAECF0' },
+  modalTitle: { fontSize: 18, fontWeight: 800, margin: 0, color: '#101828' },
+  closeBtn: { background: '#FFFFFF', border: '1px solid #D0D5DD', borderRadius: 8, width: 32, height: 32, fontSize: 14, cursor: 'pointer', color: '#101828' },
+  modalBody: { padding: '18px 22px', overflowY: 'auto', flex: 1 },
+  modalFooter: { padding: '14px 22px', borderTop: '1px solid #EAECF0', display: 'flex', justifyContent: 'flex-end', gap: 10 },
+  cancelBtn: { padding: '9px 18px', border: '1px solid #D0D5DD', borderRadius: 8, background: '#FFFFFF', cursor: 'pointer', fontSize: 13, fontWeight: 700, color: '#101828' },
+  submitBtn: { padding: '9px 22px', border: 'none', borderRadius: 8, background: '#0F6E56', color: '#FFFFFF', cursor: 'pointer', fontSize: 13, fontWeight: 700 },
 }

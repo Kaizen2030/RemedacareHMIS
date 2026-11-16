@@ -7,6 +7,10 @@ import useStaff from '../hooks/useStaff'
 import PatientWorkflowCard from '../components/PatientWorkflowCard'
 import { buildWorkflowInvoiceNote, createServiceLine, inferInvoiceSource, SERVICE_SOURCES, stringifyServiceLines } from '../utils/workflowBilling'
 import { colors as C, typography } from '../theme'
+import PaymentModal from '../components/PaymentModal'
+import PaymentsCashUp from '../components/PaymentsCashUp'
+import { isSelfPayMethod } from '../utils/payments/invoices'
+import { notifyError, notifyFromLegacyAlert, notifyWarning } from '../notifications'
 
 const css = {
   page: { minHeight: '100vh', background: C.bg, fontFamily: typography.fontFamily, fontSize: '13px', color: C.text },
@@ -46,9 +50,9 @@ const css = {
   receipt: { background: C.surface, borderRadius: '12px', padding: '32px', width: '620px', maxWidth: '95vw', boxShadow: '0 20px 60px rgba(0,0,0,.2)', maxHeight: '90vh', overflowY: 'auto' },
 }
 
-const PAYMENT_OPTIONS = ['Cash', 'M-Pesa', 'Credit', 'Insurance', 'SHA', 'SHA (Social Health Authority)', 'AAR Insurance', 'Jubilee Insurance', 'Britam', 'CIC Insurance', 'APA Insurance', 'Sanlam', 'Old Mutual', 'NHIF', 'Corporate Scheme', 'Other']
+const PAYMENT_OPTIONS = ['Cash', 'M-Pesa', 'Card', 'Bank Transfer', 'Cheque', 'Airtel Money', 'Credit', 'Insurance', 'SHA', 'SHA (Social Health Authority)', 'AAR Insurance', 'Jubilee Insurance', 'Britam', 'CIC Insurance', 'APA Insurance', 'Sanlam', 'Old Mutual', 'NHIF', 'Corporate Scheme', 'Other']
 const STATUS_OPTIONS = ['Pending', 'Paid', 'Partial', 'Approved', 'Cancelled']
-const NON_INSURANCE = ['Cash', 'M-Pesa']
+const NON_INSURANCE = ['Cash', 'M-Pesa', 'Card', 'Bank Transfer', 'Cheque', 'Airtel Money', 'Split']
 const SHA_METHOD = 'SHA (Social Health Authority)'
 const SHA_METHODS = ['SHA', 'SHA (Social Health Authority)']
 const PRIVATE_INSURERS = ['AAR Insurance', 'Jubilee Insurance', 'Britam', 'CIC Insurance', 'APA Insurance', 'Sanlam', 'Old Mutual', 'NHIF', 'Corporate Scheme', 'Insurance']
@@ -234,7 +238,7 @@ function statusBadge(status) {
 }
 
 function paymentBadge(method) {
-  const color = method === 'Cash' ? 'gray' : method === 'M-Pesa' ? 'green' : NON_INSURANCE.includes(method) ? 'gray' : 'blue'
+  const color = method === 'Cash' ? 'gray' : method === 'M-Pesa' ? 'green' : method === 'Card' ? 'purple' : NON_INSURANCE.includes(method) ? 'gray' : 'blue'
   return <Badge color={color} label={method || '—'} />
 }
 
@@ -324,6 +328,7 @@ function InvoiceModal({ invoice, patients, visits, onClose, onSave }) {
     split_payment: invoice?.split_payment || false,
     split_method: invoice?.split_method || 'Cash',
     split_amount: invoice?.split_amount || 0,
+    collect_now: !invoice?.id,
   })
   const [patSearch, setPatSearch] = useState(invoice?.patient_name || '')
   const [showPats, setShowPats] = useState(false)
@@ -393,8 +398,8 @@ function InvoiceModal({ invoice, patients, visits, onClose, onSave }) {
           )}
         </div>
 
-        <label style={css.lbl}>Visit</label>
-        <select
+        <label htmlFor="bill-visit" style={css.lbl}>Visit</label>
+        <select id="bill-visit"
           style={css.input}
           value={form.visit_id}
           onChange={e => {
@@ -427,12 +432,18 @@ function InvoiceModal({ invoice, patients, visits, onClose, onSave }) {
 
         <div style={css.row3}>
           <div>
-            <label style={css.lbl}>Total Amount (KES) *</label>
-            <input style={css.input} type="number" placeholder="0" value={form.amount_kes} onChange={e => updateField('amount_kes', e.target.value)} />
+            <label htmlFor="bill-total-amount-kes" style={css.lbl}>Total Amount (KES) *</label>
+            <input id="bill-total-amount-kes" style={css.input} type="number" placeholder="0" value={form.amount_kes} onChange={e => updateField('amount_kes', e.target.value)} />
           </div>
           <div>
             <label style={css.lbl}>Amount Paid (KES)</label>
-            <input style={css.input} type="number" placeholder="0" value={form.paid_kes} onChange={e => updateField('paid_kes', e.target.value)} />
+            <div
+              style={{ padding: '8px 10px', border: `1px solid ${C.border}`, borderRadius: '7px', fontSize: '13px', background: C.bgAlt, color: C.sub, marginBottom: '4px' }}
+              title="Payments are recorded with the Pay button so every shilling has a receipt"
+            >
+              {formatKES(form.paid_kes)}
+            </div>
+            <div style={{ fontSize: '10px', color: C.muted, marginBottom: '8px' }}>{editing ? 'Use “Pay” to add payments' : 'Collected after saving'}</div>
           </div>
           <div>
             <label style={css.lbl}>Balance</label>
@@ -444,14 +455,14 @@ function InvoiceModal({ invoice, patients, visits, onClose, onSave }) {
 
         <div style={css.row2}>
           <div>
-            <label style={css.lbl}>Payment Method</label>
-            <select style={{ ...css.input, cursor: 'pointer' }} value={form.payment_method} onChange={e => updateField('payment_method', e.target.value)}>
+            <label htmlFor="bill-payment-method" style={css.lbl}>Payment Method</label>
+            <select id="bill-payment-method" style={{ ...css.input, cursor: 'pointer' }} value={form.payment_method} onChange={e => updateField('payment_method', e.target.value)}>
               {PAYMENT_OPTIONS.map(option => <option key={option}>{option}</option>)}
             </select>
           </div>
           <div>
-            <label style={css.lbl}>Status</label>
-            <select style={{ ...css.input, cursor: 'pointer' }} value={form.status} onChange={e => updateField('status', e.target.value)}>
+            <label htmlFor="bill-status" style={css.lbl}>Status</label>
+            <select id="bill-status" style={{ ...css.input, cursor: 'pointer' }} value={form.status} onChange={e => updateField('status', e.target.value)}>
               {STATUS_OPTIONS.map(option => <option key={option}>{option}</option>)}
             </select>
           </div>
@@ -460,8 +471,8 @@ function InvoiceModal({ invoice, patients, visits, onClose, onSave }) {
         {isInsurance && (
           <div style={css.row2}>
             <div>
-              <label style={css.lbl}>Insurer</label>
-              <input style={css.input} placeholder="Insurance provider" value={form.insurer} onChange={e => updateField('insurer', e.target.value)} />
+              <label htmlFor="bill-insurer" style={css.lbl}>Insurer</label>
+              <input id="bill-insurer" style={css.input} placeholder="Insurance provider" value={form.insurer} onChange={e => updateField('insurer', e.target.value)} />
             </div>
             <div>
               <label style={css.lbl}>{form.payment_method === SHA_METHOD ? 'SHA Member No' : 'Policy / Member No'}</label>
@@ -480,22 +491,29 @@ function InvoiceModal({ invoice, patients, visits, onClose, onSave }) {
             {form.split_payment && (
               <div style={css.row2}>
                 <div>
-                  <label style={css.lbl}>Co-pay Method</label>
-                  <select style={{ ...css.input, cursor: 'pointer' }} value={form.split_method} onChange={e => updateField('split_method', e.target.value)}>
+                  <label htmlFor="bill-co-pay-method" style={css.lbl}>Co-pay Method</label>
+                  <select id="bill-co-pay-method" style={{ ...css.input, cursor: 'pointer' }} value={form.split_method} onChange={e => updateField('split_method', e.target.value)}>
                     <option>Cash</option><option>M-Pesa</option>
                   </select>
                 </div>
                 <div>
-                  <label style={css.lbl}>Co-pay Amount (KES)</label>
-                  <input style={css.input} type="number" placeholder="0" value={form.split_amount} onChange={e => updateField('split_amount', e.target.value)} />
+                  <label htmlFor="bill-co-pay-amount-kes" style={css.lbl}>Co-pay Amount (KES)</label>
+                  <input id="bill-co-pay-amount-kes" style={css.input} type="number" placeholder="0" value={form.split_amount} onChange={e => updateField('split_amount', e.target.value)} />
                 </div>
               </div>
             )}
           </div>
         )}
 
-        <label style={css.lbl}>Notes</label>
-        <textarea style={{ ...css.input, height: '60px', resize: 'vertical' }} placeholder="Optional notes..." value={form.notes} onChange={e => updateField('notes', e.target.value)} />
+        <label htmlFor="bill-notes" style={css.lbl}>Notes</label>
+        <textarea id="bill-notes" style={{ ...css.input, height: '60px', resize: 'vertical' }} placeholder="Optional notes..." value={form.notes} onChange={e => updateField('notes', e.target.value)} />
+
+        {!editing && !isInsurance && (
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', margin: '2px 0 10px', cursor: 'pointer' }}>
+            <input type="checkbox" checked={form.collect_now} onChange={e => updateField('collect_now', e.target.checked)} />
+            Take payment now (opens the payment screen after saving)
+          </label>
+        )}
 
         <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
           <button style={{ ...css.btn, ...css.btnGhost, flex: 1, padding: '10px' }} onClick={onClose}>Cancel</button>
@@ -526,7 +544,7 @@ function ReceiptModal({ invoice, hospitalName, visitLabel, canPrint, onClose, on
               style={{ ...css.btn, ...css.btnPri }}
               onClick={() => {
                 if (!canPrint) {
-                  window.notifyFromLegacyAlert('Only Admin and Cashier users can print billing receipts.')
+                  notifyWarning('Only Admin and Cashier users can print billing receipts.')
                   return
                 }
                 onPrint(invoice)
@@ -605,13 +623,57 @@ function ReceiptModal({ invoice, hospitalName, visitLabel, canPrint, onClose, on
   )
 }
 
+const QUEUE_SOURCE_LABEL = { consultation: 'Consultation', laboratory: 'Lab', pharmacy: 'Pharmacy', ward: 'Ward', procedure: 'Procedure' }
+function waitedFor(createdAt) {
+  const mins = Math.max(0, Math.round((Date.now() - new Date(createdAt).getTime()) / 60000))
+  if (mins < 60) return `${mins} min`
+  if (mins < 1440) return `${Math.floor(mins / 60)} h ${mins % 60} min`
+  return `${Math.floor(mins / 1440)} day(s)`
+}
+
+/** Live list of patients sent to the cashier by any department. Money is only taken here. */
+function CashierQueue({ queue, canTake, onTake }) {
+  const total = queue.reduce((a, i) => a + Number(i.balance_kes || 0), 0)
+  return (
+    <div style={{ ...css.card, marginBottom: '18px', padding: 0, overflow: 'hidden', border: queue.length ? `1px solid ${C.primary}` : css.card.border }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 16px', background: queue.length ? C.primaryL : 'transparent', flexWrap: 'wrap', gap: 8 }}>
+        <div style={{ fontWeight: 800, fontSize: 14 }}>
+          Waiting to pay <span style={{ background: C.primary, color: '#fff', borderRadius: 99, padding: '1px 9px', marginLeft: 6, fontSize: 12 }}>{queue.length}</span>
+        </div>
+        <div style={{ fontSize: 12, color: C.sub }}>{queue.length ? `${formatKES(total)} to collect · updates live` : 'No one is waiting. Bills from lab, pharmacy and reception appear here.'}</div>
+      </div>
+      {queue.length > 0 && (
+        <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+          {queue.map(inv => {
+            const src = inferInvoiceSource(inv)
+            return (
+              <div key={inv.id} style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1.6fr) minmax(0,1fr) auto auto', gap: 12, alignItems: 'center', padding: '10px 16px', borderTop: `1px solid ${C.border}` }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontWeight: 700, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{inv.patient_name || 'Patient'}</div>
+                  <div style={{ fontSize: 11, color: C.sub }}>{inv.invoice_no} · from {QUEUE_SOURCE_LABEL[src] || src || 'Billing'}{inv.status === 'Partial' ? ' · part-paid' : ''}</div>
+                </div>
+                <div style={{ fontSize: 11, color: C.sub }}>waiting {waitedFor(inv.created_at)}</div>
+                <div style={{ fontWeight: 800, fontSize: 14 }}>{formatKES(inv.balance_kes)}</div>
+                {canTake
+                  ? <button type="button" style={{ ...css.btn, ...css.btnPri }} onClick={() => onTake(inv)}>Take payment</button>
+                  : <span style={{ fontSize: 11, color: C.sub }}>cashier only</span>}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Billing() {
-  const { hospitalId, hospitalName, userRole, navigationState, clearNavigationState } = useHospital()
+  const { hospitalId, hospitalName, hospitalProfile, userRole, navigationState, clearNavigationState } = useHospital()
   const isAdmin = ['Admin', 'admin'].includes(userRole || '')
   const canPrint = isAdmin || ['Cashier', 'cashier'].includes(userRole || '')
   const canDeleteInvoice = canPerformAction(userRole, 'delete_invoice')
 
   const [invoices, setInvoices] = useState([])
+  const [cashierQueue, setCashierQueue] = useState([])
   const [patients, setPatients] = useState([])
   const [visits, setVisits] = useState([])
   const [labTests, setLabTests] = useState([])
@@ -624,7 +686,11 @@ export default function Billing() {
   const [editInv, setEditInv] = useState(null)
   const [viewInv, setViewInv] = useState(null)
   const [detailInv, setDetailInv] = useState(null)
+  const [payInv, setPayInv] = useState(null)
+  const [showCashUp, setShowCashUp] = useState(false)
+  const [ledger, setLedger] = useState([])
   const [loading, setLoading] = useState(false)
+  const canTakePayment = canPerformAction(userRole, 'record_payment')
 
   const { staff: allStaff } = useStaff()
   const billingStaff = allStaff.filter(s =>
@@ -643,6 +709,7 @@ export default function Billing() {
     const channel = supabase
       .channel(`billing-screen-${hospitalId}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'invoices', filter: `hospital_id=eq.${hospitalId}` }, () => loadData(false))
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'payments', filter: `hospital_id=eq.${hospitalId}` }, () => loadData(false))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'lab_tests', filter: `hospital_id=eq.${hospitalId}` }, () => loadData(false))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'visits', filter: `hospital_id=eq.${hospitalId}` }, () => loadData(false))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'admissions', filter: `hospital_id=eq.${hospitalId}` }, () => loadData(false))
@@ -689,7 +756,8 @@ export default function Billing() {
     if (!hospitalId) return
     if (showSpinner) setLoading(true)
 
-    const [{ data: inv }, { data: pats }, { data: vts }, { data: labs }] = await Promise.all([
+    const monthStart = new Date(); monthStart.setDate(1); monthStart.setHours(0, 0, 0, 0)
+    const [{ data: inv }, { data: pats }, { data: vts }, { data: labs }, { data: ledgerRows }] = await Promise.all([
       (() => {
         const query = supabase
           .from('invoices')
@@ -726,9 +794,27 @@ export default function Billing() {
         .select('id, visit_id, patient_id, patient_name, test_type, category, priority, status, assigned_to, amount, payment_method, ordered_at')
         .eq('hospital_id', hospitalId)
         .order('ordered_at', { ascending: false }),
+      supabase
+        .from('payments')
+        .select('id, invoice_id, kind, method, amount, status, completed_at')
+        .eq('hospital_id', hospitalId)
+        .eq('status', 'completed')
+        .gte('completed_at', monthStart.toISOString()),
     ])
+    setLedger(ledgerRows || [])
 
     setInvoices(inv || [])
+    // Cashier queue: self-pay bills from every department still waiting for money (last 3 days),
+    // oldest first. Independent of the date filter below so nobody waiting is ever hidden.
+    const { data: waiting } = await supabase
+      .from('invoices')
+      .select('id, invoice_no, patient_name, patient_id, visit_id, amount_kes, paid_kes, balance_kes, status, payment_method, insurer, notes, services, created_at')
+      .eq('hospital_id', hospitalId)
+      .in('status', ['Pending', 'Partial'])
+      .gte('created_at', new Date(Date.now() - 3 * 86400000).toISOString())
+      .order('created_at', { ascending: true })
+      .limit(100)
+    setCashierQueue((waiting || []).filter(i => Number(i.balance_kes || 0) > 0 && !i.insurer && isSelfPayMethod(i.payment_method)))
     setPatients(pats || [])
     setLabTests(labs || [])
     setVisits((vts || []).map(visit => ({
@@ -760,11 +846,20 @@ export default function Billing() {
 
   const todayStr = new Date().toISOString().slice(0, 10)
   const todayInvs = invoices.filter(i => i.created_at?.slice(0, 10) === todayStr)
-  const todayRev = todayInvs.reduce((a, i) => a + (Number(i.paid_kes) || 0), 0)
   const unpaid = invoices.filter(i => ['Pending', 'Partial'].includes(i.status))
   const unpaidAmt = unpaid.reduce((a, i) => a + (Number(i.balance_kes) || 0), 0)
-  const mpesaAmt = invoices.filter(i => i.payment_method === 'M-Pesa').reduce((a, i) => a + (Number(i.paid_kes) || 0), 0)
-  const cashAmt = invoices.filter(i => i.payment_method === 'Cash' && i.created_at?.slice(0, 10) === todayStr).reduce((a, i) => a + (Number(i.paid_kes) || 0), 0)
+  // Collections come from the payments ledger (net of refunds), not from the invoice's single payment_method label
+  const net = (rows) => rows.reduce((a, p) => a + (p.kind === 'refund' ? -Number(p.amount) : Number(p.amount)), 0)
+  // Calendar day in Nairobi (UTC+3) — a plain toISOString() date is "yesterday" until 03:00
+  const nairobiDay = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Nairobi' }).format(new Date(d))
+  const nairobiToday = nairobiDay(Date.now())
+  const ledgerToday = ledger.filter(p => p.completed_at && nairobiDay(p.completed_at) === nairobiToday)
+  const todayRev = ledgerToday.reduce((a, p) => a + (p.kind === 'refund' ? -Number(p.amount) : Number(p.amount)), 0)
+  const MPESA_IDS = ['mpesa', 'mpesa_manual']
+  const CARD_BANK_IDS = ['card_online', 'card_pos', 'bank_transfer', 'cheque', 'airtel_money']
+  const mpesaAmt = net(ledger.filter(p => MPESA_IDS.includes(p.method)))
+  const cashAmt = net(ledgerToday.filter(p => p.method === 'cash'))
+  const cardBankAmt = net(ledger.filter(p => CARD_BANK_IDS.includes(p.method)))
   const insureAmt = invoices.filter(i => !NON_INSURANCE.includes(i.payment_method)).reduce((a, i) => a + (Number(i.balance_kes || i.amount_kes) || 0), 0)
   const shaAmt = invoices.filter(i => SHA_METHODS.some(m => (i.payment_method || '').includes(m))).reduce((a, i) => a + (Number(i.amount_kes) || 0), 0)
   const creditAmt = invoices.filter(i => i.payment_method === 'Credit').reduce((a, i) => a + (Number(i.balance_kes) || 0), 0)
@@ -866,21 +961,22 @@ export default function Billing() {
 
   async function handleSave(form, id) {
     if (!form.patient_name || !form.amount_kes) {
-      window.notifyFromLegacyAlert('Patient name and amount are required.')
+      notifyWarning('Patient name and amount are required.')
       return
     }
 
     setLoading(true)
     const amount = Number(form.amount_kes) || 0
-    const paid = Number(form.paid_kes) || 0
+    // Money received is never typed into an invoice: it is recorded with "Pay" (payments ledger),
+    // and the database keeps paid_kes / balance_kes / status in step with that ledger.
+    const paid = id ? Number(editInv?.paid_kes || 0) : 0
     const balance = Math.max(0, amount - paid)
     const isInsurance = !NON_INSURANCE.includes(form.payment_method)
 
     let status = form.status
-    if (status !== 'Cancelled') {
+    if (status !== 'Cancelled' && status !== 'Approved') {
       if (balance <= 0 && amount > 0) status = 'Paid'
       else if (paid > 0) status = 'Partial'
-      else if (isInsurance) status = 'Pending'
       else status = 'Pending'
     }
 
@@ -906,12 +1002,22 @@ export default function Billing() {
       billed_by: form.handled_by || null,
     }
 
+    if (id) {
+      // Editing: never send money fields. A form opened before a payment arrived would carry
+      // stale numbers; the database recomputes balance/status when the amount changes.
+      delete payload.paid_kes
+      delete payload.balance_kes
+      delete payload.paid_at
+      const manualStatus = ['Cancelled', 'Approved']
+      if (!manualStatus.includes(form.status) && !manualStatus.includes(editInv?.status)) delete payload.status
+    }
+
     const { data: saved, error } = id
       ? await supabase.from('invoices').update(payload).eq('id', id).eq('hospital_id', hospitalId).select().single()
       : await supabase.from('invoices').insert(payload).select().single()
 
     if (error) {
-      window.notifyFromLegacyAlert(`Error saving invoice: ${error.message}`)
+      notifyError(`Error saving invoice: ${error.message}`)
     } else {
       // Auto-post SHA / Insurance claim on save (no manual import needed)
       if (!id && saved) {
@@ -920,6 +1026,8 @@ export default function Billing() {
       setShowModal(false)
       setEditInv(null)
       await loadData(false)
+      // New self-pay invoice → go straight to taking the money, so it gets a receipt
+      if (!id && saved && amount > 0 && !isInsurance && canTakePayment && form.collect_now) setPayInv(saved)
     }
     setLoading(false)
   }
@@ -958,25 +1066,19 @@ export default function Billing() {
     setShowModal(true)
   }
 
-  async function markPaid(inv) {
-    const { error } = await supabase
-      .from('invoices')
-      .update({
-        status: 'Paid',
-        paid_kes: Number(inv.amount_kes || 0),
-        balance_kes: 0,
-        paid_at: new Date().toISOString(),
-      })
-      .eq('id', inv.id)
-      .eq('hospital_id', hospitalId)
-
-    if (error) window.notifyFromLegacyAlert(`Error: ${error.message}`)
-    else loadData(false)
+  // "Paid" used to stamp the whole invoice as paid with no method, receipt or audit trail.
+  // It now opens the payment screen so each shilling is recorded in the ledger.
+  function markPaid(inv) {
+    if (!canTakePayment) {
+      notifyWarning('Your role cannot record payments.')
+      return
+    }
+    setPayInv(inv)
   }
 
   async function handleDeleteInvoice(inv) {
     if (!canDeleteInvoice) {
-      window.notifyFromLegacyAlert('Only admins can delete invoices.')
+      notifyWarning('Only admins can delete invoices.')
       return
     }
 
@@ -989,8 +1091,13 @@ export default function Billing() {
       .eq('id', inv.id)
       .eq('hospital_id', hospitalId)
 
-    if (error) window.notifyFromLegacyAlert(`Error deleting invoice: ${error.message}`)
-    else loadData(false)
+    if (error) {
+      // payments.invoice_id is ON DELETE RESTRICT: money already received keeps its invoice
+      const hasPayments = error.code === '23503' || /payments/i.test(error.message || '')
+      notifyFromLegacyAlert(hasPayments
+        ? `Invoice ${inv.invoice_no || ''} has payments recorded against it, so it cannot be deleted. Set its status to Cancelled instead, and ask finance to refund anything that must go back to the patient.`
+        : `Error deleting invoice: ${error.message}`)
+    } else loadData(false)
   }
 
   function exportCSV() {
@@ -1017,7 +1124,7 @@ export default function Billing() {
 
   function printInvoiceReceipt(invoice) {
     if (!canPrint) {
-      window.notifyFromLegacyAlert('Only Admin and Cashier users can print billing receipts.')
+      notifyWarning('Only Admin and Cashier users can print billing receipts.')
       return
     }
 
@@ -1071,6 +1178,7 @@ export default function Billing() {
         <div style={css.header}>
           <div><h1 style={css.h1}>Billing & Invoicing</h1></div>
           <div style={{ display: 'flex', gap: '8px' }}>
+            <button style={{ ...css.btn, ...css.btnGhost }} onClick={() => setShowCashUp(true)}>Cash-up</button>
             <button style={{ ...css.btn, ...css.btnGhost }} onClick={exportCSV} disabled={!isAdmin} title={!isAdmin ? 'Admin only' : ''}>Export CSV</button>
             <button style={{ ...css.btn, ...css.btnPri }} onClick={() => { setEditInv(null); setShowModal(true) }}>+ New Invoice</button>
           </div>
@@ -1103,11 +1211,14 @@ export default function Billing() {
           Available billing staff in HR: {availableBillingStaff.length > 0 ? availableBillingStaff.map(s => s.full_name).join(', ') : 'None currently active'}
         </div>
 
-        <div style={{ ...css.statsRow, gridTemplateColumns: 'repeat(6,1fr)' }}>
+        <CashierQueue queue={cashierQueue} canTake={canTakePayment} onTake={setPayInv} />
+
+        <div style={{ ...css.statsRow, gridTemplateColumns: 'repeat(7,1fr)' }}>
           {[
-            { lbl: "Today's Revenue", val: formatKES(todayRev), sub: `${todayInvs.length} invoices`, color: C.success },
+            { lbl: "Today's Revenue", val: formatKES(todayRev), sub: `${ledgerToday.filter(p => p.kind !== 'refund').length} payments received`, color: C.success },
             { lbl: 'Cash Today', val: formatKES(cashAmt), sub: 'cash payments', color: C.text },
-            { lbl: 'M-Pesa Collected', val: formatKES(mpesaAmt), sub: 'via M-Pesa', color: C.primary },
+            { lbl: 'M-Pesa Collected', val: formatKES(mpesaAmt), sub: 'this month, net', color: C.primary },
+            { lbl: 'Card / Bank', val: formatKES(cardBankAmt), sub: 'cards, bank, cheque', color: C.purple },
             { lbl: 'SHA Billed', val: formatKES(shaAmt), sub: 'SHA invoices total', color: C.blue },
             { lbl: 'Insurance Pending', val: formatKES(insureAmt), sub: 'private insurers', color: C.warn },
             { lbl: 'Credit Outstanding', val: formatKES(creditAmt), sub: `${unpaid.length} unpaid`, color: C.danger },
@@ -1249,11 +1360,11 @@ export default function Billing() {
         </div>
 
         <div style={{ display: 'flex', gap: '10px', marginBottom: '16px', flexWrap: 'wrap' }}>
-          <select style={css.select} value={statusF} onChange={e => setStatusF(e.target.value)}>
+          <select style={css.select} aria-label="Filter by status" value={statusF} onChange={e => setStatusF(e.target.value)}>
             <option value="all">All Status</option>
             {STATUS_OPTIONS.map(option => <option key={option}>{option}</option>)}
           </select>
-          <select style={css.select} value={paymentF} onChange={e => setPaymentF(e.target.value)}>
+          <select style={css.select} aria-label="Filter by payment method" value={paymentF} onChange={e => setPaymentF(e.target.value)}>
             <option value="all">All Payments</option>
             {PAYMENT_OPTIONS.map(option => <option key={option}>{option}</option>)}
           </select>
@@ -1316,8 +1427,11 @@ export default function Billing() {
                             Items
                           </button>
                         )}
-                        {['Pending', 'Partial'].includes(inv.status) && (
-                          <button style={{ ...css.btn, ...css.btnPri, padding: '5px 10px', fontSize: '11px' }} onClick={() => markPaid(inv)}>Paid</button>
+                        {['Pending', 'Partial'].includes(inv.status) && canTakePayment && (
+                          <button style={{ ...css.btn, ...css.btnPri, padding: '5px 10px', fontSize: '11px' }} onClick={() => markPaid(inv)}>Pay</button>
+                        )}
+                        {inv.status === 'Paid' && canTakePayment && (
+                          <button style={{ ...css.btn, ...css.btnGhost, padding: '5px 10px', fontSize: '11px' }} onClick={() => markPaid(inv)} title="Receipts, refunds & history">Payments</button>
                         )}
                       </div>
                     </td>
@@ -1354,6 +1468,26 @@ export default function Billing() {
         <ItemsDetailModal
           invoice={detailInv}
           onClose={() => setDetailInv(null)}
+        />
+      )}
+
+      {payInv && (
+        <PaymentModal
+          invoice={payInv}
+          hospitalId={hospitalId}
+          userRole={userRole}
+          hospitalProfile={hospitalProfile || { name: hospitalName }}
+          onClose={() => { setPayInv(null); loadData(false) }}
+          onChanged={() => loadData(false)}
+        />
+      )}
+
+      {showCashUp && (
+        <PaymentsCashUp
+          hospitalId={hospitalId}
+          userRole={userRole}
+          hospitalProfile={hospitalProfile || { name: hospitalName }}
+          onClose={() => setShowCashUp(false)}
         />
       )}
     </div>

@@ -1,5 +1,15 @@
 import { openPrintPreview } from './printSystem'
 
+export function createRadiologyDraft() {
+  return {
+    modality: '',
+    body_region: '',
+    clinical_indication: '',
+    priority: 'Routine',
+    special_instructions: '',
+  }
+}
+
 function escapeHtml(value) {
   return String(value || '').replace(/[&<>"']/g, character => ({
     '&': '&amp;',

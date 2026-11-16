@@ -259,7 +259,7 @@ function buildAntibiogramDrugSummary(row, maxDrugs = 6) {
 function buildTelegramTopBlock({ hospitalName, title, fileName, rowIndex, totalRows }) {
   const parts = [
     `<b>${escapeTelegramHtml(title)}</b>`,
-    `<b>Hospital:</b> ${escapeTelegramHtml(hospitalName || 'Brightpath Travel Scholars')}`,
+    `<b>Hospital:</b> ${escapeTelegramHtml(hospitalName || 'RemedacareHMS')}`,
   ]
   if (fileName) parts.push(`<b>File:</b> ${escapeTelegramHtml(fileName)}`)
   if (Number.isFinite(rowIndex) && Number.isFinite(totalRows)) parts.push(`<b>Row:</b> ${rowIndex}/${totalRows}`)
@@ -450,7 +450,7 @@ export function buildAntibiogramUploadTelegramLegacyMessage({ hospitalName, file
 
   return [
     `<b>AntibiogramNet</b>`,
-    `<b>🏨 ${escapeTelegramHtml(hospitalName || 'Brightpath Travel Scholars')}</b>`,
+    `<b>🏨 ${escapeTelegramHtml(hospitalName || 'RemedacareHMS')}</b>`,
     `<b>🕐 ${escapeTelegramHtml(new Date().toISOString())}</b>`,
     fileName ? `<b>📄 File:</b> ${escapeTelegramHtml(fileName)}` : '',
     '',
@@ -458,7 +458,7 @@ export function buildAntibiogramUploadTelegramLegacyMessage({ hospitalName, file
     flagSummary ? `<b>Flags:</b> ${escapeTelegramHtml(flagSummary)}` : '',
     '',
     ...sections,
-    `<i>This message was sent automatically from Brightpath Travel Scholars.</i>`,
+    `<i>This message was sent automatically from RemedacareHMS.</i>`,
   ].filter(Boolean).join('\n').trim()
 }
 
@@ -482,7 +482,7 @@ export function buildAntibiogramUploadTelegramCompactMessage({ hospitalName, fil
 
   return [
     'AntibiogramNet',
-    `Hospital: ${hospitalName || 'Brightpath Travel Scholars'}`,
+    `Hospital: ${hospitalName || 'RemedacareHMS'}`,
     `Time: ${new Date().toISOString()}`,
     fileName ? `File: ${fileName}` : '',
     '',
@@ -574,7 +574,7 @@ export function buildAntibiogramUploadTelegramCompactMessageLegacy({ hospitalNam
 
   return [
     'AntibiogramNet',
-    `🏨 ${hospitalName || 'Brightpath Travel Scholars'}`,
+    `🏨 ${hospitalName || 'RemedacareHMS'}`,
     `🕐 ${new Date().toISOString()}`,
     fileName ? `📄 File: ${fileName}` : '',
     '',
@@ -594,6 +594,6 @@ export function buildAntibiogramUploadTelegramCompactMessageLegacy({ hospitalNam
     '',
     `Sample: ${specimen} | Ward: ${ward} | Growth: ${growth}`,
     '',
-    'This message was sent automatically from Brightpath Travel Scholars.',
+    'This message was sent automatically from RemedacareHMS.',
   ].filter(Boolean).join('\n').trim()
 }

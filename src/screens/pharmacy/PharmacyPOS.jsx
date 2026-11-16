@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { matchesDrugSearch } from '../../utils/pharmacy'
 import { parseWorkflowInvoiceNote } from '../../utils/workflowBilling'
+import { pharmacyCdsAlerts } from '../../utils/cds'
+import CdsAlertList from '../../components/CdsAlertList'
+import { PatientBanner } from '../../ui'
 
 function parseServices(services) {
   try {
@@ -106,6 +109,9 @@ function ReleaseModal({ state, getRxMeta, hospitalName, pharmacistName, pharmacy
     mpesa_ref: '',
     notes: '',
     released_by: pharmacistName || '',
+    security_code: '',
+    cds_acknowledged: false,
+    cds_reason: '',
   })
   const [posLines, setPosLines] = useState([])
   const [activeRxId, setActiveRxId] = useState(null)
@@ -132,6 +138,9 @@ function ReleaseModal({ state, getRxMeta, hospitalName, pharmacistName, pharmacy
       mpesa_ref: '',
       notes: '',
       released_by: pharmacistName || '',
+      security_code: '',
+      cds_acknowledged: false,
+      cds_reason: '',
     })
     setPosLines(nextLines)
     setActiveRxId(nextLines[0]?.rxId || null)
@@ -178,6 +187,24 @@ function ReleaseModal({ state, getRxMeta, hospitalName, pharmacistName, pharmacy
   const reviewCount = Math.max(0, reviewItems.length - readyCount)
   const total = cartItems.reduce((sum, item) => sum + item.subtotal, 0)
 
+  // Safety checks at the counter (allergy, age, pregnancy, dose, interactions with what the patient already takes).
+  const cdsAlerts = pharmacyCdsAlerts(state?.group, cartItems.map(item => ({ rx: item.rx, inventoryItem: item.inventoryItem })))
+  const cdsDanger = cdsAlerts.some(a => a.severity === 'danger')
+
+  // Pay-before-dispense: self-paying patients pay at the cashier before anything leaves the shelf.
+  const selfPay = ['Cash', 'M-Pesa'].includes(normalizePaymentMethod(form.payment_method))
+  const cartQuotes = [...new Set(cartItems.map(item => getRxMeta(item.rx)?.quote).filter(Boolean))]
+  const quote = cartQuotes.length === 1 ? cartQuotes[0] : null
+  const quotePaid = quote && (quote.status === 'Paid' || Number(quote.balance_kes || 0) <= 0)
+  const stage = !selfPay ? 'direct' : cartQuotes.length > 1 ? 'mixed' : !quote ? 'bill' : quotePaid ? 'paid' : 'waiting'
+  const confirmLabel = {
+    direct: `Release and bill ${normalizePaymentMethod(form.payment_method)} (${formatKES(total)})`,
+    bill: `Send bill to cashier (${formatKES(total)})`,
+    paid: `Paid — release drugs (${formatKES(total)})`,
+    waiting: 'Waiting for payment at cashier',
+    mixed: 'Items are on different bills',
+  }[stage]
+
   function updateLine(rxId, patch) {
     setPosLines(current => current.map(line => (line.rxId === rxId ? { ...line, ...patch } : line)))
   }
@@ -208,8 +235,9 @@ function ReleaseModal({ state, getRxMeta, hospitalName, pharmacistName, pharmacy
           </div>
           <button style={{ ...css.btn, ...css.btnGhost, padding: '7px 12px' }} onClick={onClose}>Close</button>
         </div>
+        <PatientBanner patient={{ full_name: patientName, age: state?.group?.age, gender: state?.group?.gender, allergies: state?.group?.allergies, chronic_conditions: state?.group?.chronicConditions }} />
 
-        <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 0.9fr', gap: '16px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 420px), 1fr))', gap: '16px' }}>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', minWidth: 0 }}>
             <div style={{ ...css.card, padding: '14px 16px', background: '#FAFBFD' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
@@ -422,7 +450,7 @@ function ReleaseModal({ state, getRxMeta, hospitalName, pharmacistName, pharmacy
                   )}
                 </div>
                 <div>
-                  <label style={css.label}>Payment Method</label>
+                  <label style={css.label}>Who pays</label>
                   <select
                     style={{ ...css.input, cursor: 'pointer' }}
                     value={form.payment_method}
@@ -433,16 +461,17 @@ function ReleaseModal({ state, getRxMeta, hospitalName, pharmacistName, pharmacy
                 </div>
               </div>
 
-              {normalizePaymentMethod(form.payment_method) === 'M-Pesa' && (
-                <div>
-                  <label style={css.label}>M-Pesa Reference</label>
-                  <input
-                    style={css.input}
-                    value={form.mpesa_ref}
-                    onChange={e => setForm(prev => ({ ...prev, mpesa_ref: e.target.value.toUpperCase() }))}
-                    placeholder="e.g. SGH123ABC"
-                  />
-                </div>
+
+              <div>
+                <label style={css.label} htmlFor="release-code">Pharmacist PIN (or type RELEASE if you have no PIN)</label>
+                <input id="release-code" type="password" autoComplete="off" style={css.input} value={form.security_code}
+                  onChange={e => setForm(prev => ({ ...prev, security_code: e.target.value }))} placeholder="PIN" />
+              </div>
+
+              {cdsAlerts.length > 0 && (
+                <CdsAlertList idPrefix="release-cds" alerts={cdsAlerts} acknowledged={form.cds_acknowledged} reason={form.cds_reason}
+                  onAcknowledge={checked => setForm(prev => ({ ...prev, cds_acknowledged: checked }))}
+                  onReasonChange={text => setForm(prev => ({ ...prev, cds_reason: text }))} />
               )}
 
               <div>
@@ -455,9 +484,31 @@ function ReleaseModal({ state, getRxMeta, hospitalName, pharmacistName, pharmacy
                 />
               </div>
 
-              <div style={{ background: '#F8FAFC', border: `1px solid ${C.border}`, borderRadius: '12px', padding: '12px 13px', fontSize: '12px', color: C.sub }}>
-                Cash and M-Pesa close the pharmacy invoice immediately. SHA, Insurance, and Credit stay visible as unpaid pharmacy billing until follow-up happens in the other finance screens.
-              </div>
+              {stage === 'bill' && (
+                <div style={{ background: '#EFF8FF', border: '1px solid #B2DDFF', borderRadius: '12px', padding: '12px 13px', fontSize: '12px', color: '#175CD3' }}>
+                  <strong>Step 1 of 2.</strong> This sends a bill of {formatKES(total)} to the cashier. Nothing is dispensed and stock is not touched until the patient has paid.
+                </div>
+              )}
+              {stage === 'waiting' && (
+                <div style={{ background: '#FFFAEB', border: '1px solid #FEDF89', borderRadius: '12px', padding: '12px 13px', fontSize: '12px', color: '#B54708' }}>
+                  <strong>Waiting for payment.</strong> Bill {quote.invoice_no} ({formatKES(quote.balance_kes)} due) is at the cashier. Send the patient to pay, then come back to release.
+                </div>
+              )}
+              {stage === 'paid' && (
+                <div style={{ background: '#ECFDF3', border: '1px solid #ABEFC6', borderRadius: '12px', padding: '12px 13px', fontSize: '12px', color: '#027A48' }}>
+                  <strong>Paid at the cashier</strong> (bill {quote.invoice_no}). Step 2 of 2: release exactly these items.
+                </div>
+              )}
+              {stage === 'mixed' && (
+                <div style={{ background: '#FEF3F2', border: '1px solid #FECDCA', borderRadius: '12px', padding: '12px 13px', fontSize: '12px', color: '#B42318' }}>
+                  These items are on different cashier bills. Release each bill's items separately.
+                </div>
+              )}
+              {stage === 'direct' && (
+                <div style={{ background: '#F8FAFC', border: `1px solid ${C.border}`, borderRadius: '12px', padding: '12px 13px', fontSize: '12px', color: C.sub }}>
+                  {normalizePaymentMethod(form.payment_method)} is billed to the payer: drugs are released now and the bill follows up in the claims / credit screens.
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -472,11 +523,11 @@ function ReleaseModal({ state, getRxMeta, hospitalName, pharmacistName, pharmacy
             <button style={{ ...css.btn, ...css.btnGhost }} onClick={onClose}>Cancel</button>
             <button
               style={{ ...css.btn, ...css.btnBlue }}
-              disabled={saving || cartItems.length === 0 || !canReleaseDrugs}
+              disabled={saving || cartItems.length === 0 || !canReleaseDrugs || stage === 'waiting' || stage === 'mixed' || (cdsDanger && (!form.cds_acknowledged || form.cds_reason.trim().length < 5))}
               title={!canReleaseDrugs ? 'Only pharmacists can release drugs' : ''}
               onClick={() => onConfirm({ ...form, lines: posLines })}
             >
-              {saving ? 'Processing...' : `Release Cart and Create Receipt (${formatKES(total)})`}
+              {saving ? 'Processing...' : confirmLabel}
             </button>
           </div>
         </div>

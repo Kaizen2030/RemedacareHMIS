@@ -1,8 +1,14 @@
 import { useEffect, useState, useMemo } from 'react'
+import { useLocation } from 'react-router-dom'
 import SkeletonLoader from '../components/SkeletonLoader'
 import supabase from '../supabase'
 import { useHospital } from '../context'
 import { colors as C, typography } from '../theme'
+import Payroll from './Payroll'
+import { canAccessPayroll, resolveRole } from '../access'
+import { HrLicences, HrRoster, LeaveBalances, LeaveStatusCell } from './hr/HrExtras'
+import { notifyError, notifyFromLegacyAlert, notifyInfo, notifyWarning } from '../notifications'
+import { canonicalDepartmentName, findExistingDepartment } from '../utils/departmentNames'
 
 /* ══════════════════════════════════════════════════════════════════
  DESIGN TOKENS — matches Remedacare system-wide palette
@@ -383,7 +389,7 @@ function StaffModal({ staff, allStaff, departmentOptions, onClose, onSave, savin
       <div style={css.modalH}>{editing ? ' Edit Staff' : ' Add New Staff'}</div>
       <div style={{fontSize:'11px', color:C.sub, marginTop:'2px'}}>Staff No: <strong>{form.staff_no}</strong></div>
      </div>
-     <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={onClose}></button>
+     <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={onClose} aria-label="Close" title="Close">✕</button>
     </div>
     <div style={{display:'flex', gap:'4px', padding:'10px 24px', borderBottom:`1px solid ${C.border}`, background:'#FAFBFD', flexShrink:0}}>
      {sections.map(s => (
@@ -537,7 +543,7 @@ function ViewModal({ s, allStaff, onClose, onEdit }) {
        {s.current_shift && <span style={{...css.badge, ...shiftStyle(s.current_shift)}}>{s.current_shift}</span>}
       </div>
      </div>
-     <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={onClose}></button>
+     <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={onClose} aria-label="Close" title="Close">✕</button>
     </div>
     <div style={{padding:'16px 24px', overflowY:'auto', flex:1}}>
      <div style={css.sectionHd}>Personal</div>
@@ -591,7 +597,7 @@ function DepartmentModal({ visible, form, onClose, onChange, onSave, saving }) {
       <div style={css.modalH}>Manage Department</div>
       <div style={{fontSize:'11px', color:C.sub, marginTop:'2px'}}>Create or update departments stored in the hospital database.</div>
      </div>
-     <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={onClose}></button>
+     <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={onClose} aria-label="Close" title="Close">✕</button>
     </div>
     <div style={{padding:'20px 24px', overflowY:'auto', flex:1}}>
      <div style={{display:'grid', gridTemplateColumns:'1fr 1fr', gap:'12px'}}>
@@ -631,17 +637,38 @@ function DepartmentModal({ visible, form, onClose, onChange, onSave, saving }) {
 ══════════════════════════════════════════════════════════════════ */
 export default function HRStaff({ onNavigateDepartment }) {
  const ctx = useHospital()
+ const location = useLocation()
  const hospitalId = ctx?.hospitalId
  const userRole = ctx?.userRole
  const configuredDepartments = ctx?.departments || []
  const refreshDepartments = ctx?.refreshDepartments
 
  const isAdmin = ['Admin','admin'].includes(userRole || '')
+ const canDecideLeave = isAdmin || resolveRole(userRole) === 'HR'
+ const canViewPayroll = canAccessPayroll(userRole)
  const [staff, setStaff] = useState([])
  const [loading, setLoading] = useState(true)
  const [saving, setSaving] = useState(false)
- const [tab, setTab] = useState('directory')
+ const requestedTab = new URLSearchParams(location.search).get('tab')
+ const [tab, setTab] = useState(canViewPayroll && requestedTab === 'payroll' ? 'payroll' : 'directory')
  const [search, setSearch] = useState('')
+ const hrTabs = [
+  { key: 'directory', label: 'Staff Directory' },
+  { key: 'attendance', label: 'Attendance' },
+  { key: 'roster', label: 'Duty roster' },
+  { key: 'leave', label: 'Leave' },
+  { key: 'licences', label: 'Licences & CPD' },
+  { key: 'departments', label: 'Departments' },
+  ...(canViewPayroll ? [{ key: 'payroll', label: 'Payroll' }] : []),
+ ]
+
+ useEffect(() => {
+  if (canViewPayroll && requestedTab === 'payroll') setTab('payroll')
+ }, [canViewPayroll, requestedTab])
+
+ useEffect(() => {
+  if (!isAdmin && canViewPayroll) setTab('payroll')
+ }, [isAdmin, canViewPayroll])
  const [deptFilter, setDeptFilter] = useState('all')
  const [catFilter, setCatFilter] = useState('all')
  const [statusFilter, setStatusFilter] = useState('all')
@@ -664,6 +691,10 @@ export default function HRStaff({ onNavigateDepartment }) {
 
  // ── THE FIX: safe useEffect with timeout fallback ──────────────
  useEffect(() => {
+  if (canViewPayroll && !isAdmin) {
+   setLoading(false)
+   return
+  }
   if (hospitalId) {
    fetchAll()
   } else {
@@ -671,7 +702,7 @@ export default function HRStaff({ onNavigateDepartment }) {
    const t = setTimeout(() => setLoading(false), 5000)
    return () => clearTimeout(t)
   }
- }, [hospitalId])
+ }, [hospitalId, isAdmin, canViewPayroll])
 
  // ── THE FIX: try/catch/finally so setLoading(false) ALWAYS runs ─
  async function fetchAll() {
@@ -744,8 +775,12 @@ export default function HRStaff({ onNavigateDepartment }) {
 
  async function handleSaveDepartment() {
   if (!hospitalId) return
-  const name = departmentForm.name.trim()
-  if (!name) return window.notifyFromLegacyAlert('Department name is required.')
+  // Save the proper name and refuse a second copy of a department ("Psychiatry" when "Mental Health & Psychiatry" exists).
+  const name = canonicalDepartmentName(departmentForm.name)
+  if (!name) return notifyWarning('Department name is required.')
+  const editingName = editDepartment ? (departmentRecords.find(d => d.id === editDepartment)?.name || '') : ''
+  const duplicate = findExistingDepartment(name, departmentRecords.map(d => d.name), editingName)
+  if (duplicate) return notifyWarning(`"${departmentForm.name.trim()}" is the same department as "${duplicate}", which already exists. Edit "${duplicate}" instead.`)
   const departmentLayout = departmentForm.dept_type === 'diagnostic'
    ? { data_sources: ['lab_tests', 'staff'], ui_sections: ['lab_queue', 'completed_tests', 'staff'] }
    : departmentForm.dept_type === 'pharmacy'
@@ -771,7 +806,7 @@ export default function HRStaff({ onNavigateDepartment }) {
    ? await supabase.from('departments').update(payload).eq('id', editDepartment)
    : await supabase.from('departments').insert(payload)
   setDeptSaving(false)
-  if (error) { window.notifyFromLegacyAlert(error.message); return }
+  if (error) { notifyFromLegacyAlert(error.message); return }
   setShowDeptModal(false)
   setEditDepartment(null)
   setDepartmentForm({ name: '', dept_type: 'clinical', icon: '🏥', color_hex: '#2563EB', bg: '#EFF6FF', description: '', can_refer: true, can_order_lab: true, can_prescribe: true })
@@ -779,13 +814,13 @@ export default function HRStaff({ onNavigateDepartment }) {
  }
 
  async function handleDeleteDepartment(dept) {
-  if (!isAdmin) return window.notifyFromLegacyAlert('Only Admin users can manage departments.')
+  if (!isAdmin) return notifyWarning('Only Admin users can manage departments.')
   const deptName = typeof dept === 'string' ? dept : dept?.name
   if (!deptName) return
   if (!await window.openConfirmDialog(`Delete department '${deptName}'? This will not remove existing staff assignments.`)) return
   const query = supabase.from('departments').delete().eq('hospital_id', hospitalId)
   const { error } = dept?.id ? await query.eq('id', dept.id) : await query.eq('name', deptName)
-  if (error) { window.notifyFromLegacyAlert(error.message); return }
+  if (error) { notifyFromLegacyAlert(error.message); return }
   if (selectedDept === deptName) setSelectedDept(null)
   if (deptFilter === deptName) setDeptFilter('all')
   await refreshDepartments?.()
@@ -805,18 +840,18 @@ export default function HRStaff({ onNavigateDepartment }) {
  async function seedDepartmentStaff(department) {
   if (!hospitalId) return
   const template = STAFF_TEMPLATES[department]
-  if (!template) return window.notifyFromLegacyAlert(`No auto-staff template exists for ${department}.`)
+  if (!template) return notifyWarning(`No auto-staff template exists for ${department}.`)
   const existingNames = new Set(staff.map(s => s.full_name))
   const payload = template.filter(p => !existingNames.has(p.name)).map(p => {
    const cat = getRoleCategory(p.role)
    const rb = getRegBody(cat)
    return { hospital_id: hospitalId, staff_no: genStaffNo(), full_name: p.name, role: p.role, role_category: cat, department, employment_type: 'Full-time', current_shift: 'Day (07:00–19:00)', status: 'Active', registration_body: rb ? `${rb.code} — ${rb.full}` : null }
   })
-  if (payload.length === 0) return window.notifyFromLegacyAlert(`Template staff for ${department} already exist.`)
+  if (payload.length === 0) return notifyWarning(`Template staff for ${department} already exist.`)
   setSeeding(true)
   const { error } = await supabase.from('staff').insert(payload)
   setSeeding(false)
-  if (error) return window.notifyFromLegacyAlert(error.message)
+  if (error) return notifyFromLegacyAlert(error.message)
   fetchAll()
  }
 
@@ -833,17 +868,17 @@ export default function HRStaff({ onNavigateDepartment }) {
     }
    })
   })
-  if (payload.length === 0) return window.notifyFromLegacyAlert('All core template staff already exist.')
+  if (payload.length === 0) return notifyWarning('All core template staff already exist.')
   setSeeding(true)
   const { error } = await supabase.from('staff').insert(payload)
   setSeeding(false)
-  if (error) return window.notifyFromLegacyAlert(error.message)
+  if (error) return notifyFromLegacyAlert(error.message)
   fetchAll()
  }
 
  async function handleSave(form, id) {
-  if (!id) return window.notifyFromLegacyAlert('Create new staff accounts from Settings → Staff & Users.')
-  if (!form.full_name || !form.phone) return window.notifyFromLegacyAlert('Full name and phone are required.')
+  if (!id) return notifyInfo('Create new staff accounts from Settings → Staff & Users.')
+  if (!form.full_name || !form.phone) return notifyWarning('Full name and phone are required.')
   setSaving(true)
   const payload = {
    full_name: form.full_name,
@@ -851,13 +886,13 @@ export default function HRStaff({ onNavigateDepartment }) {
    speciality: form.speciality || null,
   }
   const { error } = await supabase.from('staff').update(payload).eq('id', id).eq('hospital_id', hospitalId)
-  if (error) { window.notifyFromLegacyAlert('Error: ' + error.message); setSaving(false); return }
+  if (error) { notifyError('Error: ' + error.message); setSaving(false); return }
   setShowModal(false); setEditStaff(null)
   await fetchAll(); setSaving(false)
  }
 
  async function handleDelete(s) {
-  if (!isAdmin) { window.notifyFromLegacyAlert('Only Admin users can delete staff records.'); return }
+  if (!isAdmin) { notifyWarning('Only Admin users can delete staff records.'); return }
   if (!await window.openConfirmDialog(`Remove ${s.full_name} from the system? This cannot be undone.`)) return
   await supabase.from('staff').delete().eq('id', s.id)
   fetchAll()
@@ -876,9 +911,10 @@ export default function HRStaff({ onNavigateDepartment }) {
  }
 
  async function saveLeave(form) {
+  // HR approves in the Leave tab; the staff member is marked On Leave when approved leave starts (database).
   const { error } = await supabase.from('staff_leave').insert({ hospital_id: hospitalId, ...form, created_at: new Date().toISOString() })
-  if (error) { window.notifyFromLegacyAlert('Error: ' + error.message); return }
-  await supabase.from('staff').update({ status: 'On Leave' }).eq('id', form.staff_id)
+  if (error) { notifyError('Error: ' + error.message); return }
+  notifyInfo('Leave requested. HR approves it in the Leave tab.')
   setLeaveForm(null); fetchAll()
  }
 
@@ -947,19 +983,20 @@ export default function HRStaff({ onNavigateDepartment }) {
     <div style={css.header}>
      <div><h1 style={css.h1}>HR & Staff</h1></div>
      <div style={{ display:'flex', gap:'8px', flexWrap:'wrap', alignItems:'center' }}>
+      {canViewPayroll && tab !== 'payroll' && <button type="button" style={{...css.btn,...css.btnPri}} onClick={() => setTab('payroll')}>Open Payroll</button>}
       <div style={{ background:C.blueL, border:`1px solid ${C.blue}22`, borderRadius:'8px', padding:'10px 14px', fontSize:'12px', color:C.blue, maxWidth:'320px' }}>
        To add new staff members and give them app access, go to Settings → Staff & Users.
       </div>
      </div>
     </div>
 
-    <div style={css.subtext}>
+    {isAdmin && <div style={css.subtext}>
      {totalStaff} staff registered · {onDuty} on duty · {onLeave} on leave
      {expiringReg > 0 && <span style={{ color:C.warn, fontWeight:600 }}> · {expiringReg} registration(s) expiring soon</span>}
-    </div>
+    </div>}
 
     {/* Stats */}
-    <div style={css.statsRow}>
+    {isAdmin && <div style={css.statsRow}>
      {[
       { lbl:'Total Staff', val:totalStaff, sub:'all employment types', color:C.text },
       { lbl:'On Duty Now', val:onDuty, sub:'active shifts', color:C.blue },
@@ -973,7 +1010,7 @@ export default function HRStaff({ onNavigateDepartment }) {
        <div style={css.statSub}>{s.sub}</div>
       </div>
      ))}
-    </div>
+    </div>}
 
     {/* Tabs */}
     <div style={css.tabRow}>
@@ -982,12 +1019,14 @@ export default function HRStaff({ onNavigateDepartment }) {
       { key:'departments', label:' Departments' },
       { key:'onduty', label:'⏰ On Duty Today' },
       { key:'leave', label:`🌴 Leave (${onLeave})` },
-     ].map(t => (
+     ].filter(() => isAdmin).concat(canViewPayroll ? [{ key:'payroll', label:'Payroll' }] : []).map(t => (
       <button key={t.key} style={{...css.tab,...(tab===t.key?css.tabActive:{})}} onClick={() => setTab(t.key)}>{t.label}</button>
      ))}
     </div>
 
     {/* ════ TAB: DIRECTORY ════ */}
+    {tab === 'payroll' && canViewPayroll && <Payroll compact />}
+
     {tab === 'directory' && (
      <>
       {selectedDept && (
@@ -1089,6 +1128,9 @@ export default function HRStaff({ onNavigateDepartment }) {
     )}
 
     {/* ════ TAB: DEPARTMENTS ════ */}
+    {tab === 'roster' && <HrRoster hospitalId={hospitalId} staff={staff} />}
+    {tab === 'licences' && <HrLicences hospitalId={hospitalId} staff={staff} />}
+
     {tab === 'departments' && (
      <div>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:'12px', flexWrap:'wrap', gap:8 }}>
@@ -1235,7 +1277,7 @@ export default function HRStaff({ onNavigateDepartment }) {
          {leaves.length === 0 && <tr><td colSpan={7} style={{...css.td, textAlign:'center', color:C.muted, padding:'40px'}}>No leave records yet.</td></tr>}
          {leaves.map(l => {
           const member = staff.find(s => s.id === l.staff_id)
-          const days = l.start_date && l.end_date ? Math.ceil((new Date(l.end_date) - new Date(l.start_date)) / 86400000) + 1 : '—'
+          const days = l.working_days ?? (l.start_date && l.end_date ? Math.ceil((new Date(l.end_date) - new Date(l.start_date)) / 86400000) + 1 : '—')
           return (
            <tr key={l.id} onMouseEnter={e => e.currentTarget.style.background='#FAFBFD'} onMouseLeave={e => e.currentTarget.style.background=''}>
             <td style={css.td}><div style={{ fontWeight:600 }}>{member?.full_name || 'Unknown'}</div><div style={{ fontSize:'11px', color:C.sub }}>{member?.role}</div></td>
@@ -1244,7 +1286,7 @@ export default function HRStaff({ onNavigateDepartment }) {
             <td style={{...css.td, fontSize:'12px', color:C.sub}}>{l.end_date || '—'}</td>
             <td style={{...css.td, fontWeight:700}}>{days}</td>
             <td style={{...css.td, fontSize:'12px', color:C.sub, maxWidth:'180px'}}>{l.reason || '—'}</td>
-            <td style={css.td}><span style={{...css.badge, background:C.warnL, color:C.warn}}>On Leave</span></td>
+            <td style={css.td}><LeaveStatusCell leave={l} canDecide={canDecideLeave} onChanged={fetchAll} /></td>
            </tr>
           )
          })}
@@ -1262,7 +1304,7 @@ export default function HRStaff({ onNavigateDepartment }) {
      <div style={{...css.modal, width:'460px', height:'auto'}} onClick={e => e.stopPropagation()}>
       <div style={{ padding:'18px 24px', borderBottom:`1px solid ${C.border}`, display:'flex', justifyContent:'space-between', alignItems:'center', flexShrink:0 }}>
        <div style={css.modalH}>🌴 Leave Request</div>
-       <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setLeaveForm(null)}></button>
+       <button style={{...css.btn,...css.btnGhost,padding:'5px 10px'}} onClick={() => setLeaveForm(null)} aria-label="Close" title="Close">✕</button>
       </div>
       <div style={{ padding:'20px 24px' }}>
        <label style={css.lbl}>Staff Member *</label>
@@ -1274,6 +1316,7 @@ export default function HRStaff({ onNavigateDepartment }) {
        <select style={css.input} value={leaveForm.leave_type} onChange={e => setLeaveForm(f => ({...f, leave_type: e.target.value}))}>
         {LEAVE_TYPES.map(t => <option key={t}>{t}</option>)}
        </select>
+       <LeaveBalances hospitalId={hospitalId} staffId={leaveForm.staff_id} />
        <div style={css.grid2}>
         <div><label style={css.lbl}>From *</label><input style={css.input} type="date" value={leaveForm.start_date} onChange={e => setLeaveForm(f => ({...f, start_date: e.target.value}))} /></div>
         <div><label style={css.lbl}>To *</label><input style={css.input} type="date" value={leaveForm.end_date} onChange={e => setLeaveForm(f => ({...f, end_date: e.target.value}))} /></div>
@@ -1282,7 +1325,7 @@ export default function HRStaff({ onNavigateDepartment }) {
        <textarea style={{...css.input, height:'60px', resize:'vertical'}} placeholder="Brief reason for leave..." value={leaveForm.reason} onChange={e => setLeaveForm(f => ({...f, reason: e.target.value}))} />
        <div style={{ display:'flex', gap:'8px', marginTop:'4px' }}>
         <button style={{...css.btn,...css.btnGhost,flex:1,padding:'10px'}} onClick={() => setLeaveForm(null)}>Cancel</button>
-        <button style={{...css.btn,...css.btnPri,flex:2,padding:'10px'}} onClick={() => { if (!leaveForm.staff_id || !leaveForm.start_date || !leaveForm.end_date) return window.notifyFromLegacyAlert('Fill in all required fields.'); saveLeave(leaveForm) }}>Approve Leave</button>
+        <button style={{...css.btn,...css.btnPri,flex:2,padding:'10px'}} onClick={() => { if (!leaveForm.staff_id || !leaveForm.start_date || !leaveForm.end_date) return notifyWarning('Fill in all required fields.'); saveLeave(leaveForm) }}>Request leave</button>
        </div>
       </div>
      </div>

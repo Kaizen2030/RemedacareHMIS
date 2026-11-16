@@ -70,6 +70,11 @@ export function getAwareClassification(value) {
   return ''
 }
 
+export function isAntibioticDrug(value) {
+  const drugName = normalizeText(value)
+  return Boolean(drugName) && Object.values(AWARE_GROUPS).flat().some(agent => drugName.includes(agent))
+}
+
 export function getAbnormalVitalAlerts(vitals = {}) {
   if (!vitals || typeof vitals !== 'object') return []
 

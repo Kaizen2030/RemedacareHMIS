@@ -1,10 +1,17 @@
 import { useEffect, useMemo, useState } from 'react'
+import { ACTIVE_STATUSES, fetchSlots, friendlyScheduleError, insideTemplate, localDateKey, recurrenceDates, telehealthLink } from '../utils/scheduling'
+import ScheduleManager from './appointments/ScheduleManager'
+import WaitlistPanel from './appointments/WaitlistPanel'
 import supabase from '../supabase'
 import { useHospital } from '../context'
 import { executeWithFallback, omitKeys } from '../utils/dbCompat'
 import { buildWorkflowInvoiceNote, createServiceLine, SERVICE_SOURCES, stringifyServiceLines } from '../utils/workflowBilling'
 import { buildMessage, DEFAULT_TEMPLATES, fetchNotificationConfig, getNotificationSetting, sendPatientNotification } from '../utils/notifications'
 import { colors as C, typography } from '../theme'
+import { isSelfPayMethod, unpaidInvoiceFields } from '../utils/payments/invoices'
+import { notifyError, notifyFromLegacyAlert, notifyWarning } from '../notifications'
+import { openPromptDialog } from '../confirmDialog'
+import ResourcePicker from './appointments/ResourcePicker'
 
 const APPOINTMENT_TYPES = ['Consultation', 'Follow-up', 'Procedure', 'Lab Review', 'Antenatal', 'Vaccination', 'Dental', 'Other']
 const DURATIONS = [15, 30, 45, 60]
@@ -90,7 +97,7 @@ function formatDateShort(date) {
 }
 
 function formatDateInput(date) {
-  return new Date(date).toISOString().slice(0, 10)
+  return localDateKey(date)
 }
 
 function formatTimeDisplay(value) {
@@ -175,7 +182,7 @@ async function notifyAppointmentBooked({ appointment, patient, hospitalId, hospi
 
     const message = buildMessage(setting.template || DEFAULT_TEMPLATES.appointment_reminder, {
       patient_name: patient.full_name || 'Patient',
-      hospital_name: hospitalName || 'Brightpath Travel Scholars',
+      hospital_name: hospitalName || 'RemedacareHMS',
       date_time: `${formatDate(appointment.appointment_date)} ${formatTimeDisplay(appointment.start_time)}`,
     })
 
@@ -210,6 +217,8 @@ function buildAppointmentForm(appointment = {}) {
     duration_minutes: Number(appointment.duration_minutes || 30),
     notes: appointment.notes || '',
     visit_id: appointment.visit_id || '',
+    room: appointment.room || '',
+    resources: Array.isArray(appointment.resources) ? appointment.resources : [],
   }
 }
 
@@ -233,11 +242,15 @@ async function appendVisitInvoiceCharge({ hospitalId, patientId, visitId, patien
     .select('*')
     .eq('hospital_id', hospitalId)
     .eq('visit_id', visitId)
+    .not('status', 'in', '("Cancelled","Paid")')
     .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle()
 
-  if (existingInvoice) {
+  // Add to the visit's open self-pay bill. The original note is kept: it tells other screens
+  // (e.g. consultation) which service created the bill, so overwriting it caused double billing.
+  const billedToInsurer = !isSelfPayMethod(paymentMethod)
+  if (existingInvoice && Boolean(existingInvoice.insurer) === billedToInsurer) {
     const currentLines = safeJsonParse(existingInvoice.services, [])
     const nextLines = [...currentLines, serviceLine]
     const nextAmount = currentLines.reduce((sum, item) => sum + Number(item.total || 0), 0) + amount
@@ -246,13 +259,6 @@ async function appendVisitInvoiceCharge({ hospitalId, patientId, visitId, patien
       .update({
         services: stringifyServiceLines(nextLines),
         amount_kes: nextAmount,
-        balance_kes: Math.max(0, nextAmount - Number(existingInvoice.paid_kes || 0)),
-        notes: buildWorkflowInvoiceNote({
-          source: SERVICE_SOURCES.PROCEDURE,
-          sourceId: appointmentId,
-          visitId,
-          summary: `${appointmentType} appointment charge appended`,
-        }),
       })
       .eq('id', existingInvoice.id)
       .eq('hospital_id', hospitalId)
@@ -266,19 +272,15 @@ async function appendVisitInvoiceCharge({ hospitalId, patientId, visitId, patien
     patient_name: patientName,
     invoice_no: `INV-${Date.now().toString().slice(-6)}`,
     services: stringifyServiceLines([serviceLine]),
-    amount_kes: amount,
-    paid_kes: ['Cash', 'M-Pesa'].includes(paymentMethod) ? amount : 0,
-    balance_kes: ['Cash', 'M-Pesa'].includes(paymentMethod) ? 0 : amount,
+    ...unpaidInvoiceFields(amount),
     payment_method: paymentMethod,
-    insurer: !['Cash', 'M-Pesa'].includes(paymentMethod) ? paymentMethod : null,
-    status: ['Cash', 'M-Pesa'].includes(paymentMethod) ? 'Paid' : 'Pending',
+    insurer: !isSelfPayMethod(paymentMethod) ? paymentMethod : null,
     notes: buildWorkflowInvoiceNote({
       source: SERVICE_SOURCES.PROCEDURE,
       sourceId: appointmentId,
       visitId,
       summary: `${appointmentType} appointment charge`,
     }),
-    paid_at: ['Cash', 'M-Pesa'].includes(paymentMethod) ? new Date().toISOString() : null,
     created_at: new Date().toISOString(),
   }
 
@@ -343,16 +345,27 @@ function BookingModal({
   onSelectPatient,
   doctors,
   visitOptions,
-  slotCounts,
+  slots,
+  slotsLoading,
+  types = [],
+  saveError,
   onClose,
   onSave,
   saving,
   editing,
+  hospitalId,
 }) {
-  const availableSlots = TIME_SLOTS.map((slot) => {
-    const count = slotCounts[slot] || 0
-    return { slot, count, disabled: count >= 3 }
-  })
+  // Slots come from the clinician's schedule in the database. Without a clinician, show the plain grid.
+  const slotList = form.doctor_id && slots?.length
+    ? [...slots]
+    : TIME_SLOTS.map((slot) => ({ slot, available: true, reason: null }))
+  if (form.start_time && !slotList.some((s) => s.slot === form.start_time)) {
+    slotList.unshift({ slot: form.start_time, available: false, reason: 'not a regular slot' })
+  }
+  const chosen = slotList.find((s) => s.slot === form.start_time)
+  const blockedHard = chosen && !chosen.available && ['booked', 'in the past'].includes(chosen.reason)
+  const needsOverride = Boolean((chosen && !chosen.available && !blockedHard) || saveError?.needsOverride)
+  const typeNames = types.length ? types.map((t) => t.name) : APPOINTMENT_TYPES
 
   return (
     <div style={css.overlay}>
@@ -403,6 +416,7 @@ function BookingModal({
               <input style={css.input} value={form.department} onChange={(event) => setForm((current) => ({ ...current, department: event.target.value }))} />
             </div>
           </div>
+          <ResourcePicker hospitalId={hospitalId} form={form} setForm={setForm} css={css} />
 
           <div style={css.grid2}>
             <div>
@@ -416,8 +430,11 @@ function BookingModal({
             </div>
             <div>
               <label style={css.label}>Type</label>
-              <select style={css.select} value={form.appointment_type} onChange={(event) => setForm((current) => ({ ...current, appointment_type: event.target.value }))}>
-                {APPOINTMENT_TYPES.map((option) => <option key={option}>{option}</option>)}
+              <select style={css.select} value={form.appointment_type} onChange={(event) => {
+                const t = types.find((x) => x.name === event.target.value)
+                setForm((current) => ({ ...current, appointment_type: event.target.value, duration_minutes: t?.default_minutes || current.duration_minutes, department: current.department || t?.department || '' }))
+              }}>
+                {typeNames.map((option) => <option key={option}>{option}</option>)}
               </select>
             </div>
           </div>
@@ -434,14 +451,17 @@ function BookingModal({
               />
             </div>
             <div>
-              <label style={css.label}>Time Slot</label>
-              <select style={css.select} value={form.start_time} onChange={(event) => setForm((current) => ({ ...current, start_time: event.target.value }))}>
-                {availableSlots.map((entry) => (
-                  <option key={entry.slot} value={entry.slot} disabled={entry.disabled}>
-                    {formatTimeDisplay(entry.slot)}{entry.disabled ? ' — full' : entry.count > 0 ? ` — ${entry.count} booked` : ''}
+              <label style={css.label} htmlFor="appt-slot">Time Slot {slotsLoading ? '…' : ''}</label>
+              <select id="appt-slot" style={css.select} value={form.start_time} onChange={(event) => setForm((current) => ({ ...current, start_time: event.target.value, schedule_override_reason: '' }))}>
+                {slotList.map((entry) => (
+                  <option key={entry.slot} value={entry.slot} disabled={!entry.available && ['booked', 'in the past'].includes(entry.reason)}>
+                    {formatTimeDisplay(entry.slot)}{entry.available ? '' : ` — ${entry.reason}`}
                   </option>
                 ))}
               </select>
+              {form.doctor_id && !slotsLoading && slots?.length > 0 && !slots.some((s) => s.available) && (
+                <div style={{ fontSize: '11px', color: C.danger, marginTop: '4px' }}>No free time on this day — try another date or add the patient to the waiting list.</div>
+              )}
             </div>
             <div>
               <label style={css.label}>Duration</label>
@@ -450,15 +470,45 @@ function BookingModal({
                 value={form.duration_minutes}
                 onChange={(event) => setForm((current) => ({ ...current, duration_minutes: Number(event.target.value) }))}
               >
-                {DURATIONS.map((option) => <option key={option} value={option}>{option} min</option>)}
+                {[...new Set([...DURATIONS, Number(form.duration_minutes) || 30])].sort((a, b) => a - b).map((option) => <option key={option} value={option}>{option} min</option>)}
               </select>
             </div>
           </div>
+
+          {needsOverride && (
+            <div style={{ background: C.warnL, border: `1px solid ${C.warn}`, borderRadius: '10px', padding: '10px 12px' }}>
+              <label style={{ ...css.label, color: C.warn }} htmlFor="appt-override">The clinician is not scheduled then ({chosen?.reason || 'outside hours'}). Reason to book anyway</label>
+              <input id="appt-override" style={css.input} value={form.schedule_override_reason || ''} placeholder="e.g. Agreed with Dr Otieno — urgent review"
+                onChange={(event) => setForm((current) => ({ ...current, schedule_override_reason: event.target.value }))} />
+            </div>
+          )}
+
+          {!editing && (
+            <div style={css.grid2}>
+              <div>
+                <label style={css.label} htmlFor="appt-repeat">Repeat</label>
+                <select id="appt-repeat" style={css.select} value={form.repeat_weeks || 0} onChange={(event) => setForm((current) => ({ ...current, repeat_weeks: Number(event.target.value), repeat_count: Number(event.target.value) ? Math.max(2, current.repeat_count || 2) : 1 }))}>
+                  <option value={0}>Does not repeat</option>
+                  <option value={1}>Every week</option>
+                  <option value={2}>Every 2 weeks</option>
+                  <option value={4}>Every 4 weeks (monthly clinic)</option>
+                  <option value={12}>Every 12 weeks (3-monthly refill)</option>
+                </select>
+              </div>
+              {Number(form.repeat_weeks) > 0 && (
+                <div>
+                  <label style={css.label} htmlFor="appt-count">Number of visits</label>
+                  <input id="appt-count" type="number" min={2} max={52} style={css.input} value={form.repeat_count || 2} onChange={(event) => setForm((current) => ({ ...current, repeat_count: Number(event.target.value) }))} />
+                </div>
+              )}
+            </div>
+          )}
 
           <div>
             <label style={css.label}>Notes</label>
             <textarea style={{ ...css.input, minHeight: '96px', resize: 'vertical' }} value={form.notes} onChange={(event) => setForm((current) => ({ ...current, notes: event.target.value }))} />
           </div>
+          {saveError && <div role="alert" style={{ background: C.dangerL, color: C.danger, borderRadius: '10px', padding: '10px 12px', fontSize: '12px', fontWeight: 600 }}>{saveError.message}</div>}
         </div>
 
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', marginTop: '18px' }}>
@@ -468,6 +518,33 @@ function BookingModal({
           </button>
         </div>
       </div>
+    </div>
+  )
+}
+
+function ReminderList({ appointmentId }) {
+  const [rows, setRows] = useState(null)
+  useEffect(() => {
+    let live = true
+    if (!appointmentId) return undefined
+    void supabase.from('appointment_reminders').select('kind, status, due_at, sent_at, last_error').eq('appointment_id', String(appointmentId)).order('due_at')
+      .then(({ data }) => { if (live) setRows(data || []) })
+    return () => { live = false }
+  }, [appointmentId])
+  if (!rows) return null
+  const label = { '48h': '48 hours before', '2h': '2 hours before', missed: 'Missed-visit message', offer: 'Slot offer' }
+  return (
+    <div style={{ marginBottom: '16px' }}>
+      <div style={css.sectionTitle}>SMS reminders</div>
+      {rows.length === 0 && <div style={{ fontSize: '12px', color: C.sub }}>None queued (no phone number, opted out, or the appointment is too soon).</div>}
+      {rows.map((r) => (
+        <div key={`${r.kind}-${r.due_at}`} style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', fontSize: '12px', padding: '6px 0', borderBottom: `1px solid ${C.border}` }}>
+          <span>{label[r.kind] || r.kind}</span>
+          <span style={{ color: r.status === 'sent' ? C.success : r.status === 'failed' ? C.danger : C.sub, fontWeight: 700 }} title={r.last_error || ''}>
+            {r.status === 'sent' ? `sent ${new Date(r.sent_at).toLocaleString('en-KE')}` : r.status === 'queued' ? `due ${new Date(r.due_at).toLocaleString('en-KE')}` : r.status}
+          </span>
+        </div>
+      ))}
     </div>
   )
 }
@@ -503,6 +580,14 @@ function AppointmentDetailPanel({ appointment, onClose, onAction, actionBusy, na
             </div>
           ))}
         </div>
+
+        {appointment.telehealth_url && (
+          <a href={appointment.telehealth_url} target="_blank" rel="noreferrer" style={{ ...css.btn, ...css.btnSoft, display: 'inline-block', textDecoration: 'none', marginBottom: '14px' }}>Join video call</a>
+        )}
+        {appointment.schedule_override_reason && (
+          <div style={{ fontSize: '12px', color: C.warn, marginBottom: '12px' }}>Booked outside clinic hours: {appointment.schedule_override_reason}</div>
+        )}
+        <ReminderList appointmentId={appointment.id} />
 
         <div style={{ marginBottom: '16px' }}>
           <div style={css.sectionTitle}>Notes</div>
@@ -560,8 +645,20 @@ function AppointmentDetailPanel({ appointment, onClose, onAction, actionBusy, na
 }
 
 export default function Appointments() {
-  const { hospitalId, hospitalName, userRole, navigate } = useHospital()
+  const { hospitalId, hospitalName, userRole, navigate, navigationState, clearNavigationState } = useHospital()
   const [appointments, setAppointments] = useState([])
+  const [slots, setSlots] = useState([])
+  const [slotsLoading, setSlotsLoading] = useState(false)
+  const [saveError, setSaveError] = useState(null)
+  const [apptTypes, setApptTypes] = useState([])
+  const [schedules, setSchedules] = useState([])
+  const [scheduleExceptions, setScheduleExceptions] = useState([])
+  const [waitlistCount, setWaitlistCount] = useState(0)
+  const [showSchedule, setShowSchedule] = useState(false)
+  const [showWaitlist, setShowWaitlist] = useState(false)
+  const [offerSource, setOfferSource] = useState(null)
+  const [dayDate, setDayDate] = useState(() => localDateKey())
+  const [dragId, setDragId] = useState(null)
   const [patients, setPatients] = useState([])
   const [staff, setStaff] = useState([])
   const [loading, setLoading] = useState(true)
@@ -599,6 +696,9 @@ export default function Appointments() {
     duration_minutes: 30,
     notes: '',
     visit_id: '',
+    schedule_override_reason: '',
+    repeat_weeks: 0,
+    repeat_count: 1,
   }))
 
   useEffect(() => {
@@ -608,6 +708,41 @@ export default function Appointments() {
     }
     void fetchAll()
   }, [hospitalId])
+
+  // Live slots for the chosen clinician / day / duration, straight from the database schedule.
+  useEffect(() => {
+    if (!showModal || !hospitalId || !form.doctor_id || !form.appointment_date) { setSlots([]); return undefined }
+    let live = true
+    setSlotsLoading(true)
+    const source = editingAppointment || rescheduleSource
+    fetchSlots({ hospitalId, clinicianId: form.doctor_id, date: form.appointment_date, minutes: form.duration_minutes })
+      .then((rows) => {
+        if (!live) return
+        // when rescheduling, the patient's own current booking does not block the new time
+        const own = source && String(source.doctor_id) === String(form.doctor_id) && source.appointment_date === form.appointment_date
+          ? [String(source.start_time || '').slice(0, 5), addMinutes(source.start_time, source.duration_minutes || 30)] : null
+        setSlots(rows.map((r) => (own && r.reason === 'booked' && r.slot < own[1] && r.end > own[0] ? { ...r, available: true, reason: null } : r)))
+      })
+      .catch(() => { if (live) setSlots([]) })
+      .finally(() => { if (live) setSlotsLoading(false) })
+    return () => { live = false }
+  }, [showModal, hospitalId, form.doctor_id, form.appointment_date, form.duration_minutes, editingAppointment, rescheduleSource])
+
+  // "Book follow-up" from Consultation / NCD: open the booking form pre-filled.
+  useEffect(() => {
+    const nav = navigationState
+    if (!nav || nav.screen !== 'appointments' || !nav.patientId || loading) return
+    const date = nav.followUpDate || localDateKey(Date.now() + 86400000 * (Number(nav.followUpInDays) || 14))
+    setEditingAppointment(null); setRescheduleSource(null)
+    resetForm({
+      patient_id: nav.patientId, patient_name: nav.patientName || '', doctor_id: nav.doctorId || '', doctor_name: nav.doctorName || '',
+      department: nav.department || '', appointment_type: nav.appointmentType || 'Follow-up', appointment_date: date,
+      notes: nav.notes || '', repeat_weeks: Number(nav.repeatWeeks) || 0, repeat_count: Number(nav.repeatCount) || 1,
+      care_plan_ref: nav.carePlanRef || '',
+    })
+    setShowModal(true)
+    clearNavigationState?.()
+  }, [navigationState, loading]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(new Date()), 60000)
@@ -680,6 +815,17 @@ export default function Appointments() {
     setAppointments(appointmentRows)
     setPatients(patientResponse.data || [])
     setStaff(staffResponse.data || [])
+    // Scheduling engine tables (absent until the scheduling migration is installed — screen still works).
+    const [typesRes, schedRes, excRes, waitRes] = await Promise.all([
+      supabase.from('appointment_types').select('*').eq('hospital_id', hospitalId).eq('active', true).order('name'),
+      supabase.from('provider_schedules').select('*').eq('hospital_id', hospitalId).eq('active', true),
+      supabase.from('provider_schedule_exceptions').select('*').eq('hospital_id', hospitalId).gte('ends_on', localDateKey(Date.now() - 86400000 * 31)),
+      supabase.from('appointment_waitlist').select('id', { count: 'exact', head: true }).eq('hospital_id', hospitalId).in('status', ['waiting', 'offered']),
+    ])
+    setApptTypes(typesRes.data || [])
+    setSchedules(schedRes.data || [])
+    setScheduleExceptions(excRes.data || [])
+    setWaitlistCount(waitRes.count || 0)
     setLoading(false)
     return appointmentRows
   }
@@ -699,8 +845,12 @@ export default function Appointments() {
       duration_minutes: 30,
       notes: '',
       visit_id: '',
+      schedule_override_reason: '',
+      repeat_weeks: 0,
+      repeat_count: 1,
       ...next,
     })
+    setSaveError(null)
     setPatientSearch(next.patient_name || '')
     setPatientResults([])
   }
@@ -763,19 +913,6 @@ export default function Appointments() {
     return map
   }, [weekAppointments])
 
-  const slotCountsForDoctor = useMemo(() => {
-    const map = {}
-    if (!form.doctor_id || !form.appointment_date) return map
-    appointments.forEach((appointment) => {
-      if (String(appointment.doctor_id || '') !== String(form.doctor_id) || appointment.appointment_date !== form.appointment_date) return
-      if (editingAppointment && appointment.id === editingAppointment.id) return
-      if (rescheduleSource && appointment.id === rescheduleSource.id) return
-      const slot = String(appointment.start_time || '').slice(0, 5)
-      map[slot] = (map[slot] || 0) + 1
-    })
-    return map
-  }, [appointments, form.doctor_id, form.appointment_date, editingAppointment, rescheduleSource])
-
   const stats = useMemo(() => {
     const today = formatDateInput(new Date())
     const weekStartDate = getMonday(new Date())
@@ -806,12 +943,14 @@ export default function Appointments() {
 
   async function handleSaveAppointment() {
     if (!form.patient_id || !form.doctor_id || !form.appointment_date || !form.start_time) {
-      window.notifyFromLegacyAlert('Patient, doctor, date, and time are required.')
+      setSaveError({ message: 'Patient, clinician, date and time are required.' })
       return
     }
 
     setSaving(true)
+    setSaveError(null)
     const endTime = addMinutes(form.start_time, form.duration_minutes)
+    const isTele = /tele/i.test(form.appointment_type || '')
     const payload = {
       hospital_id: hospitalId,
       patient_id: form.patient_id,
@@ -827,30 +966,54 @@ export default function Appointments() {
       notes: form.notes || null,
       visit_id: form.visit_id || null,
       created_by: userRole || 'Staff',
+      schedule_override_reason: form.schedule_override_reason?.trim() || null,
+      ...(form.resources_enabled ? { room: form.room || null, resources: form.resources || [] } : {}),
+      ...(isTele ? { telehealth_url: (editingAppointment || rescheduleSource)?.telehealth_url || telehealthLink(form.patient_name) } : {}),
+      ...(form.care_plan_ref ? { care_plan_ref: form.care_plan_ref } : {}),
     }
 
     const isEditing = Boolean(editingAppointment?.id)
-    const query = isEditing
-      ? supabase.from('appointments').update(payload).eq('id', editingAppointment.id).eq('hospital_id', hospitalId)
-      : supabase.from('appointments').insert({ ...payload, created_at: new Date().toISOString() })
+    let firstError = null
+    let skipped = []
+    if (isEditing) {
+      const { error } = await supabase.from('appointments').update(payload).eq('id', editingAppointment.id).eq('hospital_id', hospitalId)
+      firstError = error
+    } else {
+      // Rescheduling: free the old slot first so the patient can move by 15 minutes with the same clinician;
+      // put it back if the new booking is refused.
+      const source = rescheduleSource?.id ? rescheduleSource : null
+      if (source) {
+        await supabase.from('appointments').update({ status: 'Cancelled', cancellation_reason: `Rescheduled to ${form.appointment_date} ${form.start_time}` })
+          .eq('id', source.id).eq('hospital_id', hospitalId)
+      }
+      const dates = source ? [form.appointment_date] : recurrenceDates(form.appointment_date, form.repeat_weeks, Number(form.repeat_weeks) > 0 ? form.repeat_count : 1)
+      let parentId = null
+      for (const [i, date] of dates.entries()) {
+        const row = { ...payload, appointment_date: date, created_at: new Date().toISOString(),
+          ...(dates.length > 1 ? { recurrence_rule: { every_weeks: Number(form.repeat_weeks), count: dates.length }, recurrence_parent_id: parentId } : {}),
+          ...(isTele && i > 0 ? { telehealth_url: telehealthLink(form.patient_name) } : {}) }
+        const { data, error } = await supabase.from('appointments').insert(row).select('id').single()
+        if (error) {
+          if (i === 0) { firstError = error; break }
+          skipped.push(`${date}: ${friendlyScheduleError(error.message).message}`)
+        } else if (i === 0) parentId = data?.id ? String(data.id) : null
+      }
+      if (firstError && source) {
+        await supabase.from('appointments').update({ status: source.status || 'Scheduled', cancellation_reason: source.cancellation_reason || null })
+          .eq('id', source.id).eq('hospital_id', hospitalId)
+      }
+      if (!firstError && offerSource?.id) {
+        await supabase.from('appointment_waitlist').update({ status: 'booked', booked_appointment_id: parentId }).eq('id', offerSource.id)
+      }
+    }
 
-    const { error } = await query
-    if (error) {
+    if (firstError) {
       setSaving(false)
-      window.notifyFromLegacyAlert(`Error saving appointment: ${error.message}`)
+      setSaveError(friendlyScheduleError(firstError.message))
       return
     }
-
-    if (rescheduleSource?.id && !isEditing) {
-      await supabase
-        .from('appointments')
-        .update({
-          status: 'Cancelled',
-          cancellation_reason: `Rescheduled to ${form.appointment_date} ${form.start_time}`,
-        })
-        .eq('id', rescheduleSource.id)
-        .eq('hospital_id', hospitalId)
-    }
+    if (skipped.length) notifyError(`Series booked, but these visits could not be booked:\n${skipped.join('\n')}`)
+    setOfferSource(null)
 
     const patient = patients.find((entry) => entry.id === form.patient_id) || {
       full_name: form.patient_name,
@@ -878,6 +1041,46 @@ export default function Appointments() {
     resetForm()
     await fetchAll()
   }
+
+  async function moveAppointment(appointmentId, date, slot, clinician = null) {
+    const appt = appointments.find((a) => String(a.id) === String(appointmentId))
+    if (!appt || !ACTIVE_STATUSES.includes(appt.status)) return
+    const sameTime = appt.appointment_date === date && String(appt.start_time).slice(0, 5) === slot
+    const sameDoc = !clinician || String(clinician.id) === String(appt.doctor_id)
+    if (sameTime && sameDoc) return
+    const label = `${appt.patient?.full_name || 'this patient'} to ${formatDate(date)} ${formatTimeDisplay(slot)}${!sameDoc ? ` with ${clinician.full_name}` : ''}`
+    if (!await window.openConfirmDialog?.(`Move ${label}?`) && window.openConfirmDialog) return
+    const patch = {
+      appointment_date: date, start_time: slot, end_time: addMinutes(slot, appt.duration_minutes || 30),
+      ...(!sameDoc ? { doctor_id: clinician.id, doctor_name: clinician.full_name, department: clinician.department || appt.department } : {}),
+    }
+    const { error } = await supabase.from('appointments').update(patch).eq('id', appt.id).eq('hospital_id', hospitalId)
+    if (error) notifyFromLegacyAlert(friendlyScheduleError(error.message).message)
+    await fetchAll()
+  }
+
+  function bookWaitlistOffer(entry) {
+    const slot = entry.offered_slot || {}
+    setShowWaitlist(false)
+    setEditingAppointment(null); setRescheduleSource(null)
+    resetForm({
+      patient_id: entry.patient_id || '', patient_name: entry.patient_name || '', patient_phone: entry.phone || '',
+      doctor_id: slot.doctor_id || '', doctor_name: slot.doctor_name || '', department: slot.department || entry.department || '',
+      appointment_type: slot.appointment_type || entry.appointment_type || 'Consultation', appointment_date: slot.appointment_date || localDateKey(),
+      start_time: String(slot.start_time || '').slice(0, 5) || TIME_SLOTS[0], duration_minutes: Number(slot.duration_minutes) || 30,
+      notes: entry.notes || 'Booked from the waiting list',
+    })
+    setOfferSource(entry)
+    setShowModal(true)
+    if (!entry.patient_id) notifyWarning(`${entry.patient_name} is not registered yet. Search for the patient or register them first, then save.`)
+  }
+
+  const dayClinicians = useMemo(() => {
+    const busy = new Set(appointments.filter((a) => a.appointment_date === dayDate && ACTIVE_STATUSES.includes(a.status)).map((a) => String(a.doctor_id)))
+    const working = new Set(schedules.filter((s) => Number(s.weekday) === new Date(`${dayDate}T12:00:00`).getDay()).map((s) => String(s.staff_id)))
+    const list = clinicalStaff.filter((c) => (doctorFilter === 'all' ? busy.has(String(c.id)) || working.has(String(c.id)) : String(c.id) === doctorFilter))
+    return list.length ? list.slice(0, 12) : clinicalStaff.slice(0, 6)
+  }, [appointments, schedules, clinicalStaff, dayDate, doctorFilter])
 
   async function handleDetailAction(action) {
     if (!selectedAppointment) return
@@ -951,7 +1154,7 @@ export default function Appointments() {
       }
 
       if (action === 'cancel') {
-        const reason = window.prompt('Enter cancellation reason:', appointment.cancellation_reason || '')
+        const reason = await openPromptDialog('Why is this appointment being cancelled?', { title: 'Cancel appointment', defaultValue: appointment.cancellation_reason || '', placeholder: 'e.g. patient travelled', tone: 'danger', confirmLabel: 'Cancel appointment', cancelLabel: 'Keep it' })
         if (reason === null) {
           setActionBusy(false)
           return
@@ -974,7 +1177,7 @@ export default function Appointments() {
       const refreshed = refreshedRows.find((entry) => entry.id === appointment.id)
       setSelectedAppointment(refreshed ? { ...refreshed } : null)
     } catch (error) {
-      window.notifyFromLegacyAlert(`Error updating appointment: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      notifyError(`Error updating appointment: ${error instanceof Error ? error.message : 'Unknown error'}`)
     }
 
     setActionBusy(false)
@@ -1008,7 +1211,16 @@ export default function Appointments() {
 
         <div style={css.toolbar}>
           <button type="button" style={{ ...css.btn, ...(view === 'week' ? css.btnPri : css.btnGhost) }} onClick={() => setView('week')}>Week View</button>
+          <button type="button" style={{ ...css.btn, ...(view === 'day' ? css.btnPri : css.btnGhost) }} onClick={() => setView('day')}>Day by clinician</button>
           <button type="button" style={{ ...css.btn, ...(view === 'list' ? css.btnPri : css.btnGhost) }} onClick={() => setView('list')}>List View</button>
+          <button type="button" style={{ ...css.btn, ...css.btnGhost }} onClick={() => setShowSchedule(true)} disabled={!clinicalStaff.length}>Clinic hours</button>
+          <button type="button" style={{ ...css.btn, ...(waitlistCount ? css.btnSoft : css.btnGhost) }} onClick={() => setShowWaitlist(true)}>Waiting list ({waitlistCount})</button>
+          {view !== 'list' && (
+            <select aria-label="Clinician" style={{ ...css.select, width: 'auto' }} value={doctorFilter} onChange={(event) => setDoctorFilter(event.target.value)}>
+              <option value="all">All clinicians</option>
+              {clinicalStaff.map((doctor) => <option key={doctor.id} value={doctor.id}>{doctor.full_name}</option>)}
+            </select>
+          )}
           <button type="button" style={{ ...css.btn, ...css.btnGhost }} onClick={() => setWeekStart((current) => addDays(current, -7))}>←</button>
           <div style={{ fontSize: '13px', fontWeight: 700, color: C.text }}>{formatWeekLabel(weekStart)}</div>
           <button type="button" style={{ ...css.btn, ...css.btnGhost }} onClick={() => setWeekStart((current) => addDays(current, 7))}>→</button>
@@ -1044,7 +1256,10 @@ export default function Appointments() {
                       const visibleItems = expanded ? items : items.slice(0, 2)
 
                       return (
-                        <div key={key} style={{ position: 'relative', height: `${SLOT_HEIGHT}px`, borderLeft: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`, padding: '2px 4px', overflow: 'hidden' }}>
+                        <div key={key}
+                          onDragOver={(event) => { if (dragId) event.preventDefault() }}
+                          onDrop={(event) => { event.preventDefault(); const id = dragId; setDragId(null); if (id) void moveAppointment(id, formatDateInput(day), slot) }}
+                          style={{ position: 'relative', height: `${SLOT_HEIGHT}px`, borderLeft: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`, padding: '2px 4px', overflow: 'hidden', background: doctorFilter !== 'all' && insideTemplate(schedules, scheduleExceptions, doctorFilter, formatDateInput(day), slot, 30) === false ? '#F3F4F6' : undefined }}>
                           <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
                             {visibleItems.map((appointment) => {
                               const status = statusBadge(appointment.status)
@@ -1052,6 +1267,10 @@ export default function Appointments() {
                                 <button
                                   key={appointment.id}
                                   type="button"
+                                  draggable={ACTIVE_STATUSES.includes(appointment.status)}
+                                  onDragStart={() => setDragId(appointment.id)}
+                                  onDragEnd={() => setDragId(null)}
+                                  title="Drag to another time to reschedule"
                                   onClick={() => setSelectedAppointment(appointment)}
                                   style={{ border: 'none', borderRadius: '8px', background: status.bg, color: status.color, textAlign: 'left', padding: '4px 6px', fontSize: '10px', fontWeight: 700, cursor: 'pointer' }}
                                 >
@@ -1086,6 +1305,53 @@ export default function Appointments() {
                   }}
                 />
               )}
+            </div>
+          </div>
+        ) : view === 'day' ? (
+          <div style={{ ...css.card, overflow: 'auto' }}>
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', padding: '10px 12px', borderBottom: `1px solid ${C.border}`, flexWrap: 'wrap' }}>
+              <button type="button" style={{ ...css.btn, ...css.btnGhost }} onClick={() => setDayDate((d) => localDateKey(addDays(new Date(`${d}T12:00:00`), -1)))} aria-label="Previous day">←</button>
+              <input type="date" aria-label="Day" style={{ ...css.input, width: 'auto' }} value={dayDate} onChange={(event) => setDayDate(event.target.value)} />
+              <button type="button" style={{ ...css.btn, ...css.btnGhost }} onClick={() => setDayDate((d) => localDateKey(addDays(new Date(`${d}T12:00:00`), 1)))} aria-label="Next day">→</button>
+              <button type="button" style={{ ...css.btn, ...css.btnGhost }} onClick={() => setDayDate(localDateKey())}>Today</button>
+              <span style={{ fontSize: '12px', color: C.sub }}>Grey = outside clinic hours or on leave. Drag a booking to move it to another time or clinician.</span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: `80px repeat(${dayClinicians.length || 1}, minmax(150px, 1fr))`, minWidth: `${80 + 150 * (dayClinicians.length || 1)}px` }}>
+              <div style={{ padding: '10px', fontSize: '11px', color: C.sub, fontWeight: 700, borderBottom: `1px solid ${C.border}` }}>Time</div>
+              {dayClinicians.map((doc) => (
+                <div key={doc.id} style={{ padding: '10px', borderLeft: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`, fontWeight: 800, fontSize: '12px' }}>
+                  {doc.full_name}<div style={{ fontWeight: 600, color: C.sub, fontSize: '11px' }}>{doc.department || doc.role || ''}</div>
+                </div>
+              ))}
+              {TIME_SLOTS.map((slot) => (
+                <div key={slot} style={{ display: 'contents' }}>
+                  <div style={{ height: `${SLOT_HEIGHT}px`, padding: '8px 10px', fontSize: '11px', color: C.sub, borderBottom: `1px solid ${C.border}` }}>{formatTimeDisplay(slot)}</div>
+                  {dayClinicians.map((doc) => {
+                    const inHours = insideTemplate(schedules, scheduleExceptions, doc.id, dayDate, slot, 30)
+                    const items = filteredAppointments.filter((a) => a.appointment_date === dayDate && String(a.doctor_id) === String(doc.id) && String(a.start_time || '').slice(0, 5) === slot)
+                    return (
+                      <div key={doc.id}
+                        onDragOver={(event) => { if (dragId) event.preventDefault() }}
+                        onDrop={(event) => { event.preventDefault(); const id = dragId; setDragId(null); if (id) void moveAppointment(id, dayDate, slot, doc) }}
+                        onDoubleClick={() => { resetForm({ doctor_id: doc.id, doctor_name: doc.full_name, department: doc.department || '', appointment_date: dayDate, start_time: slot }); setEditingAppointment(null); setRescheduleSource(null); setShowModal(true) }}
+                        title={inHours === false ? 'Outside clinic hours' : 'Double-click to book'}
+                        style={{ height: `${SLOT_HEIGHT}px`, borderLeft: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`, padding: '2px 4px', overflow: 'hidden', background: inHours === false ? '#F3F4F6' : undefined }}>
+                        {items.map((a) => {
+                          const st = statusBadge(a.status)
+                          return (
+                            <button key={a.id} type="button" draggable={ACTIVE_STATUSES.includes(a.status)}
+                              onDragStart={() => setDragId(a.id)} onDragEnd={() => setDragId(null)} onClick={() => setSelectedAppointment(a)}
+                              style={{ width: '100%', border: 'none', borderRadius: '8px', background: st.bg, color: st.color, textAlign: 'left', padding: '4px 6px', fontSize: '10px', fontWeight: 700, cursor: 'pointer', marginBottom: '2px' }}>
+                              <div style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{a.patient?.full_name || a.patient_name}</div>
+                              <div style={{ fontWeight: 600 }}>{a.appointment_type} · {a.duration_minutes || 30} min{a.status !== 'Scheduled' ? ` · ${a.status}` : ''}</div>
+                            </button>
+                          )
+                        })}
+                      </div>
+                    )
+                  })}
+                </div>
+              ))}
             </div>
           </div>
         ) : (
@@ -1181,6 +1447,7 @@ export default function Appointments() {
 
         {showModal && (
           <BookingModal
+            hospitalId={hospitalId}
             form={form}
             setForm={setForm}
             patientResults={patientResults}
@@ -1199,12 +1466,25 @@ export default function Appointments() {
             }}
             doctors={clinicalStaff}
             visitOptions={patientVisits}
-            slotCounts={slotCountsForDoctor}
-            onClose={() => { setShowModal(false); setEditingAppointment(null); setRescheduleSource(null) }}
+            slots={slots}
+            slotsLoading={slotsLoading}
+            types={apptTypes}
+            saveError={saveError}
+            onClose={() => { setShowModal(false); setEditingAppointment(null); setRescheduleSource(null); setOfferSource(null); setSaveError(null) }}
             onSave={handleSaveAppointment}
             saving={saving}
             editing={Boolean(editingAppointment || rescheduleSource)}
           />
+        )}
+
+        {showSchedule && (
+          <ScheduleManager hospitalId={hospitalId} clinicians={clinicalStaff}
+            initialClinicianId={doctorFilter !== 'all' ? doctorFilter : ''}
+            onClose={() => setShowSchedule(false)} onChanged={() => void fetchAll()} />
+        )}
+        {showWaitlist && (
+          <WaitlistPanel hospitalId={hospitalId} clinicians={clinicalStaff} patients={patients}
+            onClose={() => { setShowWaitlist(false); void fetchAll() }} onBookOffer={bookWaitlistOffer} onChanged={() => void fetchAll()} />
         )}
 
         <AppointmentDetailPanel

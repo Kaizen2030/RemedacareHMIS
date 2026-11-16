@@ -6,7 +6,7 @@ PLEASE READ THIS AGREEMENT CAREFULLY BEFORE INSTALLING OR USING REMEDACAREOS.
 BY CLICKING "I AGREE" YOU ACCEPT THESE TERMS.
 
 1. DEFINITIONS
-"Software" refers to Brightpath Travel Scholars Hospital Management System.
+"Software" refers to RemedacareHMS Hospital Management System.
 "Licensee" refers to the hospital or healthcare facility using this Software.
 "User" refers to any individual authorized by the Licensee.
 "Patient Data" refers to any health information entered into the Software.
@@ -43,5 +43,5 @@ This Agreement is governed by the laws of the Republic of Kenya.
 Email: support@remedacare.co.ke
 Website: www.remedacare.co.ke
 
-Copyright 2026 Brightpath Travel Scholars. All Rights Reserved.
+Copyright 2026 RemedacareHMS. All Rights Reserved.
 

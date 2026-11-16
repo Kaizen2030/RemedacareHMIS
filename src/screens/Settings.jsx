@@ -1,10 +1,16 @@
 import { Fragment, useEffect, useMemo, useState } from 'react'
 import supabase from '../supabase'
 import { useHospital } from '../context'
-import { notifySuccess } from '../notifications'
+import { notifyError, notifySuccess, notifyWarning } from '../notifications'
 import { DEPARTMENT_CONFIG } from './department'
 import { logAudit } from '../utils/audit'
 import { broadcastWorkflowChanged } from '../utils/workflowEvents'
+import SettingsPayments from './settings/SettingsPayments'
+import SettingsPrivacy from './settings/SettingsPrivacy'
+import SettingsConfiguration from './settings/SettingsConfiguration'
+import SettingsFhir from './settings/SettingsFhir'
+import SettingsPortal from './settings/SettingsPortal'
+import { canonicalDepartmentName, findExistingDepartment } from '../utils/departmentNames'
 
 const CURRENCIES = ['KES — Kenyan Shilling','UGX — Ugandan Shilling','TZS — Tanzanian Shilling','USD — US Dollar','GBP — British Pound','EUR — Euro']
 const ROLES = ['Admin','Doctor','Nurse','Pharmacist','Lab Technician','Receptionist','Radiologist','Accountant']
@@ -13,7 +19,7 @@ const ROLE_COLORS = {
  Doctor: { bg:'#E3F0FB', color:'#1a6fb5' },
  Nurse: { bg:'#E1F5EE', color:'#0F6E56' },
  Pharmacist: { bg:'#FFF3DC', color:'#C07000' },
- 'Lab Technician': { bg:'#F0EAFC', color:'#7B5EA7' },
+ 'Lab Technician': { bg:'#EAF5EF', color:'#7B5EA7' },
  Receptionist: { bg:'#f0f0f0', color:'#555' },
  Radiologist: { bg:'#E3F0FB', color:'#1a6fb5' },
  Accountant: { bg:'#FFF9E6', color:'#8A6A00' },
@@ -106,6 +112,9 @@ const INTEGRATION_DEFS = [
  fields: [
  { key:'sha_facility_code', label:'SHA Facility Code', placeholder:'e.g. 001234' },
  { key:'sha_api_key', label:'SHA API Key', placeholder:'Enter API key from SHA portal' },
+ { key:'sha_fhir_endpoint', label:'SHA FHIR Claim Endpoint', placeholder:'https://… (from SHA)' },
+ { key:'sha_fhir_client_id', label:'SHA FHIR Client ID', placeholder:'Client ID from SHA' },
+ { key:'sha_fhir_client_secret', label:'SHA FHIR Client Secret', placeholder:'Client secret from SHA' },
  ]
  },
  {
@@ -130,6 +139,7 @@ const INTEGRATION_DEFS = [
  { key:'dicom_host', label:'DICOM Server Host / IP', placeholder:'e.g. 192.168.1.100' },
  { key:'dicom_port', label:'Port', placeholder:'e.g. 4242' },
  { key:'dicom_aet', label:'AE Title', placeholder:'e.g. NEXUS_HMS' },
+ { key:'pacs_viewer_url', label:'PACS viewer link ({accession} is replaced)', placeholder:'https://pacs.yourhospital/viewer?accession={accession}' },
  ]
  },
  {
@@ -156,11 +166,19 @@ const INTEGRATION_DEFS = [
  },
 ]
 
+// Integration fields that are credentials: stored server-side only (hospital_secrets / Vault), never in system_settings
+const SECRET_KEYS = new Set(['etims_secret', 'sha_api_key', 'sha_fhir_client_secret', 'mpesa_consumer_key', 'mpesa_consumer_sec', 'mpesa_passkey', 'sms_api_key', 'nhif_password'])
+
 const TABS = [
  { key:'profile', label:' Hospital Profile', adminOnly: false },
  { key:'pricelist', label:'💰 Price List', adminOnly: true },
  { key:'staff', label:'👥 Staff & Users', adminOnly: true },
  { key:'audit', label:'📝 Audit Log', adminOnly: true },
+ { key:'payments', label:'💳 Payments', adminOnly: true },
+ { key:'privacy', label:'🔒 Privacy & access log', adminOnly: true },
+ { key:'config', label:'🧩 Configuration', adminOnly: true },
+ { key:'fhir', label:'🔌 FHIR API', adminOnly: true },
+ { key:'portal', label:'📱 Patient portal', adminOnly: true },
  { key:'integrations', label:'🔗 Integrations', adminOnly: true },
  { key:'system', label:'⚙ System Settings', adminOnly: true },
 ]
@@ -194,6 +212,10 @@ export default function Settings() {
  default_opd_fee: 500,
  default_ipd_fee: 1000,
  default_emergency_fee:1500,
+ default_lab_fee: 2500,
+ default_imaging_fee: 3500,
+ default_bed_fee: 2000,
+ default_pharmacy_markup_pct: 15,
  admin_pin: '',
  })
 
@@ -203,6 +225,10 @@ export default function Settings() {
  return init
  })
  const [intgConfig, setIntgConfig] = useState({})
+ // Credentials never come back to the browser: we only know which ones are saved, and send new values one-way
+ const [savedSecrets, setSavedSecrets] = useState([])
+ const [secretDrafts, setSecretDrafts] = useState({})
+ const [pinDraft, setPinDraft] = useState('')
  const [configModal, setConfigModal] = useState(null)
 
  const [staff, setStaff] = useState([])
@@ -398,7 +424,7 @@ export default function Settings() {
 
  async function addChargeCode() {
   if (!newCode.code || !newCode.name || !newCode.department) {
-   window.notifyFromLegacyAlert('Code, name and department are required.')
+   notifyWarning('Code, name and department are required.')
    return
   }
   const { error } = await supabase.from('charge_codes').insert({
@@ -410,7 +436,7 @@ export default function Settings() {
    unit_price_kes: parseFloat(newCode.unit_price_kes) || 0,
    is_active: true,
   })
-  if (error) { window.notifyFromLegacyAlert('Error: ' + error.message); return }
+  if (error) { notifyError('Error: ' + error.message); return }
   setShowAddCode(false)
   setNewCode({ code:'', name:'', department:'', category:'Consultation', unit_price_kes:'' })
   await fetchChargeCodes()
@@ -454,6 +480,11 @@ export default function Settings() {
      setSysSettings(prev => ({ ...prev, ...ss }))
      if (ss.integrations_enabled) setIntegrations(prev => ({ ...prev, ...ss.integrations_enabled }))
      if (ss.integrations_config) setIntgConfig(ss.integrations_config)
+     setSavedSecrets(Array.isArray(ss.integrations_secrets_saved) ? ss.integrations_secrets_saved : [])
+     if (isAdmin) {
+      const { data: status } = await supabase.rpc('hospital_secret_status', { p_hospital: hospitalId })
+      if (Array.isArray(status) && status.length) setSavedSecrets(status.map(r => r.name)) // empty for PIN-unlocked non-admins: keep the saved list
+     }
     }
    }
 
@@ -546,12 +577,15 @@ export default function Settings() {
   setActiveTab(tab.key)
  }
 
- function handlePinSubmit() {
-  if (!sysSettings.admin_pin) {
+ async function handlePinSubmit() {
+  const { data: pinResult, error: pinErr } = await supabase.rpc('admin_pin_check', { p_hospital: hospitalId, p_pin: pinInput })
+  if (pinErr) { setPinError('Could not check the PIN: ' + pinErr.message); return }
+  if (pinResult === 'locked') { setPinError('Too many wrong PINs. Try again in 15 minutes.'); setPinInput(''); return }
+  if (pinResult === 'not_set') {
    setPinError('No PIN set for this hospital yet. Go to System Settings → Admin Settings PIN to create one.')
    return
   }
-  if (pinInput === sysSettings.admin_pin) {
+  if (pinResult === 'ok') {
    setAdminUnlocked(true)
    setShowPinModal(false)
    if (pendingTab) setActiveTab(pendingTab)
@@ -563,11 +597,13 @@ export default function Settings() {
 
  async function handleSave() {
   if (!hospitalId || hospitalId === 'null') {
-   window.notifyFromLegacyAlert('Unable to save settings: invalid hospital identifier. Please refresh and try again.')
+   notifyError('Unable to save settings: invalid hospital identifier. Please refresh and try again.')
    return
   }
   setSaving(true)
   try {
+   const { admin_pin: _droppedPin, ...publicSettings } = sysSettings
+   const publicConfig = Object.fromEntries(Object.entries(intgConfig).filter(([k]) => !SECRET_KEYS.has(k)))
    const { error } = await supabase.from('hospitals').update({
     name: profile.name,
     location: profile.location,
@@ -577,25 +613,44 @@ export default function Settings() {
     mpesa_paybill: profile.mpesa_paybill,
     owner_email: profile.owner_email,
     system_settings: {
-     ...sysSettings,
+     ...publicSettings,
      integrations_enabled: integrations,
-     integrations_config: intgConfig,
+     integrations_config: publicConfig,
+     integrations_secrets_saved: savedSecrets,
+     admin_pin_set: Boolean(sysSettings.admin_pin_set || pinDraft),
     },
    }).eq('id', hospitalId)
-   if (error) window.notifyFromLegacyAlert('Error saving: ' + error.message)
+   let secretError = null
+   if (!error) {
+    for (const [name, value] of Object.entries(secretDrafts)) {
+     const { error: e } = await supabase.rpc('hospital_secret_set', { p_hospital: hospitalId, p_name: name, p_value: value })
+     if (e) { secretError = e; break }
+    }
+    if (!secretError && pinDraft) {
+     const { error: e } = await supabase.rpc('admin_pin_set', { p_hospital: hospitalId, p_pin: pinDraft })
+     if (e) secretError = e
+     else { setSysSettings(prev => ({ ...prev, admin_pin_set: true })); setPinDraft('') }
+    }
+    if (!secretError) {
+     setSavedSecrets(prev => [...new Set([...prev, ...Object.entries(secretDrafts).filter(([, v]) => v).map(([k]) => k)])].filter(k => secretDrafts[k] !== ''))
+     setSecretDrafts({})
+    }
+   }
+   if (error) notifyError('Error saving: ' + error.message)
+   else if (secretError) notifyError('Settings saved, but a credential was not: ' + secretError.message)
    else {
     setSaved(true); setTimeout(() => setSaved(false), 3000)
     broadcastWorkflowChanged({ source: 'settings-save' })
    }
   } catch (e) {
-   window.notifyFromLegacyAlert('Error saving: ' + e.message)
+   notifyError('Error saving: ' + e.message)
   }
   setSaving(false)
  }
 
  async function handleSaveUser() {
-  if (!userForm.full_name || !userForm.role) { window.notifyFromLegacyAlert('Name and role required'); return }
-  if (!editUser && !userForm.email) { window.notifyFromLegacyAlert('Email is required to invite a new staff member'); return }
+  if (!userForm.full_name || !userForm.role) { notifyWarning('Name and role required'); return }
+  if (!editUser && !userForm.email) { notifyWarning('Email is required to invite a new staff member'); return }
   setSavingUser(true)
   try {
    if (editUser) {
@@ -651,7 +706,7 @@ export default function Settings() {
       await ensureHospitalUserLink(userForm.email, huRole)
      }
 
-     window.notifyFromLegacyAlert(`✅ ${userForm.full_name} already exists. Their staff record has been updated and their role has been synced.`)
+     notifyWarning(`✅ ${userForm.full_name} already exists. Their staff record has been updated and their role has been synced.`)
     } else {
      // 1. Add to staff table
      await supabase.from('staff').insert({
@@ -683,9 +738,9 @@ export default function Settings() {
      })
      if (inviteErr) {
       console.warn('Could not send invite email:', inviteErr.message)
-      window.notifyFromLegacyAlert(`Staff added! Note: Could not send invite email — ${inviteErr.message}. Share the app link manually.`)
+      notifyError(`Staff added! Note: Could not send invite email — ${inviteErr.message}. Share the app link manually.`)
      } else {
-      window.notifyFromLegacyAlert(`✅ ${userForm.full_name} added! An invite link has been sent to ${userForm.email} so they can set their password and log in.`)
+      notifySuccess(`✅ ${userForm.full_name} added! An invite link has been sent to ${userForm.email} so they can set their password and log in.`)
      }
     }
    }
@@ -707,7 +762,7 @@ export default function Settings() {
    fetchAll()
    broadcastWorkflowChanged({ source: editUser ? 'staff-update' : 'staff-create', full_name: userForm.full_name, role: userForm.role })
   } catch (e) {
-   window.notifyFromLegacyAlert('Error: ' + e.message)
+   notifyError('Error: ' + e.message)
   }
   setSavingUser(false)
  }
@@ -787,12 +842,18 @@ export default function Settings() {
 
  async function handleSaveDepartment() {
   if (!hospitalId || hospitalId === 'null') {
-   window.notifyFromLegacyAlert('Unable to save department: invalid hospital identifier. Please refresh and try again.')
+   notifyError('Unable to save department: invalid hospital identifier. Please refresh and try again.')
    return
   }
-  const name = departmentForm.name.trim()
+  // Save the proper name ("psychiatry " → "Mental Health & Psychiatry") and refuse a second copy of a department.
+  const name = canonicalDepartmentName(departmentForm.name)
   if (!name) {
-   window.notifyFromLegacyAlert('Department name is required.')
+   notifyWarning('Department name is required.')
+   return
+  }
+  const duplicate = findExistingDepartment(name, departments.map(d => d.name), editDepartment?.name || '')
+  if (duplicate) {
+   notifyWarning(`"${departmentForm.name.trim()}" is the same department as "${duplicate}", which already exists. Edit "${duplicate}" instead.`)
    return
   }
 
@@ -820,7 +881,7 @@ export default function Settings() {
     : supabase.from('departments').insert(payload)
    const { data, error } = await query.select('id,name').single()
    if (error) {
-    window.notifyFromLegacyAlert(`Error: ${error.message}`)
+    notifyError(`Error: ${error.message}`)
     return
    }
 
@@ -843,7 +904,7 @@ export default function Settings() {
    setEditDepartment(null)
    setDepartmentForm(buildDepartmentForm())
   } catch (e) {
-   window.notifyFromLegacyAlert(`Error: ${e.message}`)
+   notifyError(`Error: ${e.message}`)
   } finally {
    setSavingDepartment(false)
   }
@@ -860,7 +921,7 @@ export default function Settings() {
     .eq('hospital_id', hospitalId)
     .eq('id', department.id)
    if (error) {
-    window.notifyFromLegacyAlert(`Error: ${error.message}`)
+    notifyError(`Error: ${error.message}`)
     return
    }
 
@@ -879,7 +940,7 @@ export default function Settings() {
    notifySuccess('Department removed.')
    broadcastWorkflowChanged({ source: 'department_deleted', department: department.name })
   } catch (e) {
-   window.notifyFromLegacyAlert(`Error: ${e.message}`)
+   notifyError(`Error: ${e.message}`)
   }
  }
 
@@ -1005,7 +1066,7 @@ export default function Settings() {
   {receiptMonitor.payMix.length === 0 ? (
   <span style={{fontSize:12,color:'#888'}}>No pharmacy receipts yet</span>
   ) : receiptMonitor.payMix.map(item => (
-  <span key={item.method} style={{...s.pill,background:item.method==='M-Pesa'?'#E1F5EE':item.method==='Credit'?'#F0EAFC':/sha/i.test(item.method)?'#FFF3DC':/insurance/i.test(item.method)?'#E3F0FB':'#f0f0f0',color:item.method==='M-Pesa'?'#0F6E56':item.method==='Credit'?'#7B5EA7':/sha/i.test(item.method)?'#C07000':/insurance/i.test(item.method)?'#1a6fb5':'#555'}}>
+  <span key={item.method} style={{...s.pill,background:item.method==='M-Pesa'?'#E1F5EE':item.method==='Credit'?'#EAF5EF':/sha/i.test(item.method)?'#FFF3DC':/insurance/i.test(item.method)?'#E3F0FB':'#f0f0f0',color:item.method==='M-Pesa'?'#0F6E56':item.method==='Credit'?'#7B5EA7':/sha/i.test(item.method)?'#C07000':/insurance/i.test(item.method)?'#1a6fb5':'#555'}}>
   {item.method}: KES {Number(item.amount || 0).toLocaleString()}
   </span>
   ))}
@@ -1042,9 +1103,12 @@ export default function Settings() {
   </div>
   </div>
   <div style={{marginTop:16}}>
-  <div style={s.sectionLabel}>Default Consultation Fees (KES)</div>
+  <div style={s.sectionLabel}>Default Pricing & Charges (KES)</div>
+  <div style={{fontSize:12,color:'#6B7280',marginBottom:12}}>
+  These values are the hospital default charges used when no specific charge code or service price is entered. They are editable here and can be overridden by the price list below.
+  </div>
   <div style={s.grid3}>
-  <Fld label="OPD Fee">
+  <Fld label="OPD Consultation Fee">
   <input style={s.input} type="number" value={sysSettings.default_opd_fee}
   onChange={e=>setSysSettings({...sysSettings,default_opd_fee:parseInt(e.target.value)||0})}/>
   </Fld>
@@ -1055,6 +1119,22 @@ export default function Settings() {
   <Fld label="Emergency Fee">
   <input style={s.input} type="number" value={sysSettings.default_emergency_fee}
   onChange={e=>setSysSettings({...sysSettings,default_emergency_fee:parseInt(e.target.value)||0})}/>
+  </Fld>
+  <Fld label="Lab Investigation Fee">
+  <input style={s.input} type="number" value={sysSettings.default_lab_fee}
+  onChange={e=>setSysSettings({...sysSettings,default_lab_fee:parseInt(e.target.value)||0})}/>
+  </Fld>
+  <Fld label="Imaging Fee">
+  <input style={s.input} type="number" value={sysSettings.default_imaging_fee}
+  onChange={e=>setSysSettings({...sysSettings,default_imaging_fee:parseInt(e.target.value)||0})}/>
+  </Fld>
+  <Fld label="Ward / Bed Fee (per night)">
+  <input style={s.input} type="number" value={sysSettings.default_bed_fee}
+  onChange={e=>setSysSettings({...sysSettings,default_bed_fee:parseInt(e.target.value)||0})}/>
+  </Fld>
+  <Fld label="Default Pharmacy Markup (%)">
+  <input style={s.input} type="number" value={sysSettings.default_pharmacy_markup_pct}
+  onChange={e=>setSysSettings({...sysSettings,default_pharmacy_markup_pct:parseInt(e.target.value)||0})}/>
   </Fld>
   </div>
   </div>
@@ -1398,6 +1478,12 @@ export default function Settings() {
   </div>
   )}
 
+  {activeTab==='payments' && <SettingsPayments hospitalId={hospitalId} />}
+  {activeTab==='privacy' && <SettingsPrivacy hospitalId={hospitalId} />}
+  {activeTab==='config' && <SettingsConfiguration hospitalId={hospitalId} />}
+  {activeTab==='fhir' && <SettingsFhir hospitalId={hospitalId} />}
+  {activeTab==='portal' && <SettingsPortal hospitalId={hospitalId} />}
+
   {activeTab==='integrations' && (
   <div style={s.card}>
   <div style={s.cardHeader}>🔗 Integrations</div>
@@ -1408,7 +1494,7 @@ export default function Settings() {
   <div style={{display:'flex',flexDirection:'column',gap:0}}>
   {INTEGRATION_DEFS.map((intg,i)=>{
   const isOn = integrations[intg.key]
-  const hasConfig = intg.fields.some(f => intgConfig[f.key])
+  const hasConfig = intg.fields.some(f => intgConfig[f.key] || savedSecrets.includes(f.key))
   return (
   <div key={intg.key} style={{display:'flex',alignItems:'center',justifyContent:'space-between',
   padding:'16px 4px', borderBottom:i<INTEGRATION_DEFS.length-1?'1px solid #f0f0f0':'none',gap:12}}>
@@ -1470,14 +1556,14 @@ export default function Settings() {
   </Fld>
   <Fld label="Admin Settings PIN">
   <div style={{ position:'relative' }}>
-  <input style={s.input} type={showAdminPin ? 'text' : 'password'} maxLength={6} value={sysSettings.admin_pin}
-  onChange={e=>setSysSettings({...sysSettings,admin_pin:e.target.value})}
-  placeholder="Set a unique 4–6 digit PIN for this hospital"/>
+  <input style={s.input} type={showAdminPin ? 'text' : 'password'} maxLength={6} inputMode="numeric" value={pinDraft}
+  onChange={e=>setPinDraft(e.target.value.replace(/\D/g, ''))}
+  placeholder={sysSettings.admin_pin_set ? 'PIN is set — type a new 4–6 digit PIN to change it' : 'Set a unique 4–6 digit PIN for this hospital'}/>
   <button type="button" style={s.eyeBtn} onClick={() => setShowAdminPin(v => !v)}>
   {showAdminPin ? 'Hide' : 'Show'}
   </button>
   </div>
-  <div style={s.hint}>{sysSettings.admin_pin ? 'Anyone who knows this PIN can access Staff, Integrations & System tabs — keep it confidential within your hospital.' : 'No PIN set yet — set a unique PIN so only authorised staff can access Staff, Integrations & System settings.'}</div>
+  <div style={s.hint}>{sysSettings.admin_pin_set ? 'The PIN is stored scrambled (hashed) and checked by the server; 5 wrong tries lock it for 15 minutes. Anyone who knows this PIN can access Staff, Integrations & System tabs — keep it confidential within your hospital.' : 'No PIN set yet — set a unique PIN so only authorised staff can access Staff, Integrations & System settings.'}</div>
   <div style={{ ...s.hint, marginTop: 4, color: '#555' }}>
   If you forget this PIN, an Admin user can log in and set a new one here in System Settings.
   </div>
@@ -1503,8 +1589,8 @@ export default function Settings() {
   <div style={{fontSize:13,fontWeight:700,color:'#A32D2D',marginBottom:8,textTransform:'uppercase',letterSpacing:.6}}> Danger Zone</div>
   <div style={{fontSize:13,color:'#555',marginBottom:14}}>These actions are irreversible. Proceed with extreme caution.</div>
   <div style={{display:'flex',gap:10,flexWrap:'wrap'}}>
-  <button style={s.dangerBtn} onClick={()=>window.notifyFromLegacyAlert('Contact support to reset test data.')} disabled={!isAdmin}>🗑 Clear Test Data</button>
-  <button style={s.dangerBtn} onClick={()=>window.notifyFromLegacyAlert('Contact support to export full database backup.')} disabled={!isAdmin}>📦 Export Full Backup</button>
+  <button style={s.dangerBtn} onClick={()=>notifyWarning('Contact support to reset test data.')} disabled={!isAdmin}>🗑 Clear Test Data</button>
+  <button style={s.dangerBtn} onClick={()=>notifyWarning('Contact support to export full database backup.')} disabled={!isAdmin}>📦 Export Full Backup</button>
   </div>
   </div>
   </div>
@@ -1518,7 +1604,7 @@ export default function Settings() {
   <div style={{...s.modal,maxWidth:640}} onClick={e=>e.stopPropagation()}>
   <div style={s.modalHeader}>
   <h2 style={s.modalTitle}>{editDepartment?' Edit Department':'+ Add Department'}</h2>
-  <button style={s.closeBtn} onClick={()=>setShowDepartmentModal(false)}></button>
+  <button style={s.closeBtn} onClick={()=>setShowDepartmentModal(false)} aria-label="Close" title="Close">✕</button>
   </div>
   <div style={s.modalBody}>
   <div style={s.grid2}>
@@ -1584,7 +1670,7 @@ export default function Settings() {
   <div style={{...s.modal,maxWidth:380}} onClick={e=>e.stopPropagation()}>
   <div style={s.modalHeader}>
   <h2 style={s.modalTitle}>🔒 Protected Section</h2>
-  <button style={s.closeBtn} onClick={()=>setShowPinModal(false)}></button>
+  <button style={s.closeBtn} onClick={()=>setShowPinModal(false)} aria-label="Close" title="Close">✕</button>
   </div>
   <div style={s.modalBody}>
   <div style={{textAlign:'center',padding:'10px 0 20px'}}>
@@ -1622,11 +1708,11 @@ export default function Settings() {
   <div style={{...s.modal,maxWidth:480}} onClick={e=>e.stopPropagation()}>
   <div style={s.modalHeader}>
   <h2 style={s.modalTitle}>{configModal.icon} Configure {configModal.label}</h2>
-  <button style={s.closeBtn} onClick={()=>setConfigModal(null)}></button>
+  <button style={s.closeBtn} onClick={()=>setConfigModal(null)} aria-label="Close" title="Close">✕</button>
   </div>
   <div style={s.modalBody}>
   <div style={{background:'#FFF3DC',borderRadius:8,padding:'10px 14px',fontSize:12,color:'#C07000',marginBottom:16}}>
-  🔑 These credentials are stored encrypted in your hospital settings. Never share them with unauthorized staff.
+  🔑 Keys, secrets and passwords are sent to the server and stored where staff screens cannot read them (encrypted in Supabase Vault when it is enabled). They are never shown again: type a new value to replace one.
   </div>
   {configModal.fields.map(f=>(
   <Fld key={f.key} label={f.label}>
@@ -1636,6 +1722,14 @@ export default function Settings() {
   <option value="">-- Select --</option>
   {f.options.map(o=><option key={o}>{o}</option>)}
   </select>
+  ) : SECRET_KEYS.has(f.key) ? (
+  <div style={{display:'flex',gap:6}}>
+  <input style={s.input} type="password" autoComplete="new-password"
+  placeholder={secretDrafts[f.key] === '' ? 'Will be removed when you save' : savedSecrets.includes(f.key) ? 'Saved — type a new value to replace' : f.placeholder}
+  value={secretDrafts[f.key]||''}
+  onChange={e=>setSecretDrafts(prev=>({...prev,[f.key]:e.target.value}))}/>
+  {savedSecrets.includes(f.key) && <button type="button" style={s.cancelBtn} onClick={()=>setSecretDrafts(prev=>({...prev,[f.key]:''}))}>Remove</button>}
+  </div>
   ) : (
   <input style={s.input} type={f.type||'text'} placeholder={f.placeholder}
   value={intgConfig[f.key]||''}
@@ -1646,7 +1740,7 @@ export default function Settings() {
   </div>
   <div style={s.modalFooter}>
   <button style={s.cancelBtn} onClick={()=>setConfigModal(null)}>Cancel</button>
-  <button style={s.submitBtn} onClick={()=>setConfigModal(null)}> Save Config</button>
+  <button style={s.submitBtn} onClick={()=>setConfigModal(null)}> Done — then Save Changes</button>
   </div>
   </div>
   </div>
@@ -1658,7 +1752,7 @@ export default function Settings() {
   <div style={{...s.modal,maxWidth:500}} onClick={e=>e.stopPropagation()}>
   <div style={s.modalHeader}>
   <h2 style={s.modalTitle}>{editUser?' Edit Staff Member':'+ Add Staff Member'}</h2>
-  <button style={s.closeBtn} onClick={()=>setShowAddUser(false)}></button>
+  <button style={s.closeBtn} onClick={()=>setShowAddUser(false)} aria-label="Close" title="Close">✕</button>
   </div>
   <div style={s.modalBody}>
   <div style={s.grid2}>

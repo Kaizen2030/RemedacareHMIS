@@ -45,3 +45,21 @@ export async function fetchFhirBundle({ hospitalId, visitId }) {
   if (!payload) throw new Error('FHIR bundle endpoint returned an empty response.')
   return payload
 }
+
+export async function submitShaClaimViaFhir({ hospitalId, invoiceId }) {
+  if (!hospitalId || !invoiceId) {
+    throw new Error('Hospital and invoice are required to submit a SHA claim via FHIR.')
+  }
+
+  const { data, error } = await supabase.functions.invoke('fhir-claim', {
+    body: { hospitalId, invoiceId },
+  })
+
+  if (error) throw error
+  if (!data) throw new Error('FHIR claim endpoint returned an empty response.')
+  if (data.success === false) {
+    throw new Error(data.message || data.issue?.[0]?.diagnostics || 'FHIR claim submission failed.')
+  }
+
+  return data
+}

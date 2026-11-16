@@ -25,7 +25,7 @@ export default function AI() {
   const [messages, setMessages] = useState([
     {
       type: 'bot',
-      text: `Hello! I'm your AI Clinical Assistant for ${hospitalName || 'Brightpath Travel Scholars'}.\n\nAsk me about prescriptions, ward occupancy, staff availability, pharmacy stock, lab status, or upload a prescription/image, PDF, CSV, or Excel file.\n\nI can also answer general clinical questions — drug side effects, dosages, contraindications, treatment guidelines, and more.`
+      text: `Hello! I'm your AI Clinical Assistant for ${hospitalName || 'RemedacareHMS'}.\n\nAsk me about prescriptions, ward occupancy, staff availability, pharmacy stock, lab status, or upload a prescription/image, PDF, CSV, or Excel file.\n\nI can also answer general clinical questions — drug side effects, dosages, contraindications, treatment guidelines, and more.`
     }
   ])
   const [input, setInput] = useState('')
@@ -406,7 +406,7 @@ export default function AI() {
       : 'No recent microbiology stewardship alerts in the loaded data.'
 
     return [
-      `Hospital Data Snapshot for ${hospitalName || 'Brightpath Travel Scholars'}:`,
+      `Hospital Data Snapshot for ${hospitalName || 'RemedacareHMS'}:`,
       `- Wards: ${hospitalData.wards.length}. ${wardSummary}`,
       `- Beds: ${hospitalData.beds.length} total, ${freeBeds.length} free, ${occupiedBeds.length} occupied.`,
       `- Free wards: ${freeWardNames.length > 0 ? freeWardNames.join(', ') : 'None.'}`,
@@ -443,12 +443,12 @@ export default function AI() {
 
   const buildPrompt = (question, role = 'master') => {
     const rolePrompts = {
-      master: `You are ARIA — Advanced Brightpath Travel Scholars Intelligence Assistant — a hospital-grade AI clinical and operations assistant deployed at ${hospitalName || 'this hospital'} in Kenya.
+      master: `You are ARIA — Advanced RemedacareHMS Intelligence Assistant — a hospital-grade AI clinical and operations assistant deployed at ${hospitalName || 'this hospital'} in Kenya.
 
 You operate with the precision of a senior clinical pharmacist, the situational awareness of a hospital administrator, and the diagnostic reasoning of a specialist physician. You are deeply familiar with Kenya's healthcare system: SHA (Social Health Authority), NHIF legacy claims, eTIMS/KRA compliance, M-Pesa payment workflows, MOH treatment protocols, Kenya Essential Medicines List (KEML), Kenya Standard Treatment Guidelines (KSTG), and ICD-10 coding as used in Kenya.
 
 ## YOUR IDENTITY
-- Name: ARIA (Advanced Brightpath Travel Scholars Intelligence Assistant)
+- Name: ARIA (Advanced RemedacareHMS Intelligence Assistant)
 - Deployed at: ${hospitalName || 'this hospital'}, Kenya
 - Today: ${formatKenyaDate(new Date())}
 - Hospital Tier: Not configured
@@ -831,13 +831,13 @@ const styles = {
   snapshotSub: { fontSize: '11px', color: '#666', marginTop: '4px' },
   chatWrap: { background: '#fff', border: '1px solid #e8ebe8', borderRadius: '10px', padding: '14px', height: '420px', display: 'flex', flexDirection: 'column' },
   chatMessages: { flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '10px' },
-  msgUser: { alignSelf: 'flex-end', background: '#5B21B6', color: '#fff', padding: '10px 14px', borderRadius: '10px 10px 2px 10px', maxWidth: '75%', fontSize: '13px' },
+  msgUser: { alignSelf: 'flex-end', background: '#0F6E56', color: '#fff', padding: '10px 14px', borderRadius: '10px 10px 2px 10px', maxWidth: '75%', fontSize: '13px' },
   msgBot: { alignSelf: 'flex-start', background: '#f9fbf9', border: '1px solid #e8ebe8', padding: '10px 14px', borderRadius: '10px 10px 10px 2px', maxWidth: '80%', fontSize: '13px' },
   botLabel: { fontSize: '10px', color: '#1D9E75', fontWeight: '600', marginBottom: '4px' },
   chatImage: { maxWidth: '200px', borderRadius: '8px', marginBottom: '8px', display: 'block' },
   chatInputRow: { display: 'flex', gap: '8px', alignItems: 'center' },
   chatInput: { flex: 1, padding: '10px 14px', border: '1px solid #ddd', borderRadius: '8px', fontSize: '13px' },
-  btnPrimary: { background: '#5B21B6', color: '#fff', border: 'none', padding: '10px 20px', borderRadius: '8px', cursor: 'pointer', fontWeight: '500', fontSize: '13px' },
+  btnPrimary: { background: '#0F6E56', color: '#fff', border: 'none', padding: '10px 20px', borderRadius: '8px', cursor: 'pointer', fontWeight: '500', fontSize: '13px' },
   uploadBtn: { padding: '9px 13px', background: '#f0f2f0', borderRadius: '8px', cursor: 'pointer', fontSize: '16px', border: '1px solid #ddd' },
   imagePreview: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px', padding: '8px 12px', background: '#f9fbf9', borderRadius: '8px', border: '1px dashed #ccc' },
   previewImg: { maxHeight: '70px', borderRadius: '6px' },
@@ -845,5 +845,5 @@ const styles = {
   quickQueries: { marginTop: '16px' },
   cardTitle: { fontSize: '13px', fontWeight: '600', color: '#111', marginBottom: '8px' },
   quickButtons: { display: 'flex', flexWrap: 'wrap', gap: '8px' },
-  quickBtn: { background: '#fff', color: '#5B21B6', border: '1px solid #5B21B6', padding: '6px 14px', borderRadius: '9999px', fontSize: '12px', cursor: 'pointer' }
+  quickBtn: { background: '#fff', color: '#0F6E56', border: '1px solid #0F6E56', padding: '6px 14px', borderRadius: '9999px', fontSize: '12px', cursor: 'pointer' }
 }

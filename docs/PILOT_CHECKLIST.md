@@ -1,4 +1,4 @@
-# Brightpath Travel Scholars Pilot Checklist
+# RemedacareHMS Pilot Checklist
 
 ## Before go-live
 

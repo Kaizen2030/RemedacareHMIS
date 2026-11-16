@@ -7,15 +7,24 @@ import { buildWorkflowInvoiceNote, createServiceLine, inferInvoiceSource, SERVIC
 import WardOverview from './wards/WardOverview'
 import WardBedGrid from './wards/WardBedGrid'
 import WardBedPanel from './wards/WardBedPanel'
+import WardHandover, { WardMedsDue } from './wards/WardHandover'
+import { WardEarlyWarnings } from './wards/WardObservations'
+import { confirmBedForIsolation, IsolationBoard } from './wards/WardIsolation'
+import { admittingDepartmentFrom, uniqueDepartmentNames } from '../utils/departmentNames'
+import { notifyError, notifyInfo, notifySuccess, notifyWarning } from '../notifications'
+import { performSyncableAction } from '../utils/offlineSync'
+import { notifyWarning as warnOffline } from '../notifications'
+import { priceForPayer } from '../utils/hospitalConfig'
 
 const WARD_TYPES = ['General', 'ICU', 'Maternity', 'Paediatrics', 'Surgical', 'Cardiac', 'Orthopaedic', 'Oncology', 'Emergency', 'Psychiatric', 'Private', 'Radiology', 'Dental', 'Cardiology', 'Eye', 'Mental Health', 'Physiotherapy', 'Nutrition', 'Community Health']
 const WARD_ICONS = { ICU: 'ICU', Maternity: 'MAT', General: 'GEN', Paediatrics: 'PEDS', Surgical: 'SURG', Cardiac: 'CARD', Orthopaedic: 'ORTHO', Oncology: 'ONC', Emergency: 'ER', Psychiatric: 'MH', Private: 'PVT', Radiology: 'RAD', Dental: 'DENT', Cardiology: 'CARD', Eye: 'EYE', 'Mental Health': 'MH', Physiotherapy: 'PT', Nutrition: 'NUT', 'Community Health': 'CH' }
 const BED_COLORS = {
- Free: { bg: '#F3E8FF', border: '#D8B4FE', color: '#5B21B6' },
+ Free: { bg: '#E1F5EE', border: '#B4E5D0', color: '#0F6E56' },
  Occupied: { bg: '#FDEAEA', border: '#F3A6A6', color: '#A32D2D' },
  Critical: { bg: '#FAD6D6', border: '#E07272', color: '#7F1D1D' },
  Reserved: { bg: '#FFF3DC', border: '#FAC775', color: '#C07000' },
  Maintenance: { bg: '#EEF1F4', border: '#C6CDD5', color: '#667085' },
+ Cleaning: { bg: '#EFF8FF', border: '#B2DDFF', color: '#175CD3' },
 }
 const BEDS_PER_PAGE = 60
 const ADMISSION_TYPES = ['Elective', 'Emergency', 'Transfer from another facility']
@@ -95,7 +104,9 @@ function readmissionWithin30Days(admission, admissions) {
 }
 
 export default function Wards() {
- const { hospitalId, hospitalName, userRole, navigate } = useHospital()
+ const { hospitalId, hospitalName, userRole, navigate, departments: hospitalDepartments = [] } = useHospital()
+ // departments a patient can be admitted under (one entry per real department)
+ const admittingDepartmentOptions = useMemo(() => uniqueDepartmentNames(hospitalDepartments.filter(d => !d?.dept_type || d.dept_type === 'clinical').map(d => d?.name)), [hospitalDepartments])
  const canManageWards = canPerformAction(userRole, 'create_department')
  const canAdmitPatient = canPerformAction(userRole, 'admit_patient')
  const canDischarge = canPerformAction(userRole, 'discharge_patient')
@@ -106,9 +117,11 @@ export default function Wards() {
  const [beds, setBeds] = useState([])
  const [transfers, setTransfers] = useState([])
  const [admissions, setAdmissions] = useState([])
+ const [showHandover, setShowHandover] = useState(false)
  const [bedRequests, setBedRequests] = useState([])
  const [wardRounds, setWardRounds] = useState([])
  const [loading, setLoading] = useState(true)
+ const [loadError, setLoadError] = useState('')
  const [saving, setSaving] = useState(false)
 
  // Navigation
@@ -156,6 +169,7 @@ export default function Wards() {
   patient_name: '',
   sha_number: '',
   admission_type: 'Elective',
+  admitting_department: '',
   referring_doctor: '',
   referring_facility: '',
   sha_preauth_number: '',
@@ -243,21 +257,46 @@ export default function Wards() {
 
  async function fetchAll() {
  setLoading(true)
- const [{ data: w }, { data: b }, { data: t }, { data: a }, { data: requests }, { data: rounds }] = await Promise.all([
- supabase.from('wards').select('*').eq('hospital_id', hospitalId).order('created_at'),
- supabase.from('beds').select('*, patients(*), visits(*)').eq('hospital_id', hospitalId),
- supabase.from('bed_transfers').select('*, patients(full_name)').eq('hospital_id', hospitalId).order('created_at', { ascending: false }).limit(20),
- supabase.from('admissions').select('*').eq('hospital_id', hospitalId).order('admission_date', { ascending: false }).limit(500),
- supabase.from('ward_bed_requests').select('*, patients(*), visits(*)').eq('hospital_id', hospitalId).order('created_at', { ascending: false }).limit(200),
- supabase.from('ward_round_notes').select('*').eq('hospital_id', hospitalId).order('note_date', { ascending: false }).limit(500),
- ])
- setWards(w || [])
- setBeds(b || [])
- setTransfers(t || [])
- setAdmissions(a || [])
- setBedRequests(requests || [])
- setWardRounds(rounds || [])
- setLoading(false)
+ setLoadError('')
+ try {
+  const results = await Promise.allSettled([
+   supabase.from('wards').select('*').eq('hospital_id', hospitalId).order('created_at'),
+   supabase.from('beds').select('*, patients(*), visits(*)').eq('hospital_id', hospitalId),
+   supabase.from('bed_transfers').select('*, patients(full_name)').eq('hospital_id', hospitalId).order('created_at', { ascending: false }).limit(20),
+  supabase.from('admissions').select('*').eq('hospital_id', hospitalId).limit(500),
+  supabase.from('ward_bed_requests').select('*, patients(*)').eq('hospital_id', hospitalId).order('created_at', { ascending: false }).limit(200),
+   supabase.from('ward_round_notes').select('*').eq('hospital_id', hospitalId).order('note_date', { ascending: false }).limit(500),
+  ])
+  const responses = results.map(result => result.status === 'fulfilled' ? result.value : { data: null, error: result.reason })
+  const [wardResult, bedResult, transferResult, admissionResult, requestResult, roundResult] = responses
+  const requiredError = wardResult.error || bedResult.error
+  if (requiredError) {
+   setLoadError(`Ward and bed data could not be fully loaded: ${requiredError.message || 'Database request failed.'}`)
+  }
+  ;[transferResult, admissionResult, requestResult, roundResult].forEach((result, index) => {
+   if (result.error) console.warn('Optional ward data unavailable:', ['transfers', 'admissions', 'bed requests', 'rounds'][index], result.error.message || result.error)
+  })
+  setWards(wardResult.data || [])
+  setBeds(bedResult.data || [])
+  setTransfers(transferResult.data || [])
+  setAdmissions([...(admissionResult.data || [])].sort((left, right) => {
+   const leftDate = new Date(left.admission_date || left.created_at || 0).getTime()
+   const rightDate = new Date(right.admission_date || right.created_at || 0).getTime()
+   return rightDate - leftDate
+  }))
+  setBedRequests(requestResult.data || [])
+  setWardRounds(roundResult.data || [])
+ } catch (error) {
+  setLoadError(`Ward data could not be loaded: ${error?.message || 'Database request failed.'}`)
+  setWards([])
+  setBeds([])
+  setTransfers([])
+  setAdmissions([])
+  setBedRequests([])
+  setWardRounds([])
+ } finally {
+  setLoading(false)
+ }
  }
 
 async function selectBed(bed) {
@@ -339,13 +378,13 @@ async function selectBed(bed) {
    isolation_required: Boolean(admission.isolation_required),
   }))
  }
- setNursingForm({
+  setNursingForm({
   nurse_name: currentUserName,
   note_type: 'General',
   note_text: '',
   created_at: new Date().toISOString().slice(0, 16),
  })
- setFluidForm({
+  setFluidForm({
   entry_type: 'Oral Intake',
   volume_ml: '',
   fluid_description: '',
@@ -355,8 +394,8 @@ async function selectBed(bed) {
  }
 
  async function handleAddWard() {
- if (!canManageWards) { window.notifyFromLegacyAlert('Only admins can create wards.'); return }
- if (!wardForm.name) { window.notifyFromLegacyAlert('Ward name required'); return }
+ if (!canManageWards) { notifyWarning('Only admins can create wards.'); return }
+ if (!wardForm.name) { notifyWarning('Ward name required'); return }
  setSaving(true)
  await supabase.from('wards').insert({ ...wardForm, hospital_id: hospitalId })
  setShowAddWard(false)
@@ -366,11 +405,11 @@ async function selectBed(bed) {
  }
 
  async function handleGenerateBeds() {
- if (!canManageWards) { window.notifyFromLegacyAlert('Only admins can add beds to wards.'); return }
+ if (!canManageWards) { notifyWarning('Only admins can add beds to wards.'); return }
  if (!selectedWard) return
  const { prefix, start, end } = bedGenForm
- if (!prefix || end < start) { window.notifyFromLegacyAlert('Check prefix and range'); return }
- if (end - start > 499) { window.notifyFromLegacyAlert('Max 500 beds at once'); return }
+ if (!prefix || end < start) { notifyInfo('Check prefix and range'); return }
+ if (end - start > 499) { notifyInfo('Max 500 beds at once'); return }
  setSaving(true)
  const rows = []
  for (let i = parseInt(start); i <= parseInt(end); i++) {
@@ -387,8 +426,8 @@ async function selectBed(bed) {
  }
 
  async function handleTransfer() {
- if (!canTransfer) { window.notifyFromLegacyAlert('Only doctors and nurses can transfer admitted patients.'); return }
- if (!transferForm.to_bed_id || !transferForm.requested_by) { window.notifyFromLegacyAlert('Select target bed and enter requester name'); return }
+ if (!canTransfer) { notifyWarning('Only doctors and nurses can transfer admitted patients.'); return }
+ if (!transferForm.to_bed_id || !transferForm.requested_by) { notifyWarning('Select target bed and enter requester name'); return }
  setSaving(true)
  const targetBed = beds.find(b => b.id === transferForm.to_bed_id)
  await supabase.from('bed_transfers').insert({
@@ -412,12 +451,14 @@ async function selectBed(bed) {
  }
 
 async function handleApproveTransfer(transfer) {
- if (!canTransfer) { window.notifyFromLegacyAlert('Only doctors and nurses can approve bed transfers.'); return }
+ if (!canTransfer) { notifyWarning('Only doctors and nurses can approve bed transfers.'); return }
+ const iso = await confirmBedForIsolation(transfer.to_bed_id, transfer.patient_id)
+ if (!iso.ok) return
  setSaving(true)
  // move patient to new bed, free old bed
  await supabase.from('beds').update({ status: 'Free', patient_id: null, visit_id: null, admitted_at: null }).eq('id', transfer.from_bed_id)
  const fromBed = beds.find(b => b.id === transfer.from_bed_id)
- await supabase.from('beds').update({ status: fromBed?.status === 'Critical' ? 'Critical' : 'Occupied', patient_id: transfer.patient_id, visit_id: fromBed?.visit_id, admitted_at: fromBed?.admitted_at }).eq('id', transfer.to_bed_id)
+ await supabase.from('beds').update({ status: fromBed?.status === 'Critical' ? 'Critical' : 'Occupied', patient_id: transfer.patient_id, visit_id: fromBed?.visit_id, admitted_at: fromBed?.admitted_at, ...(iso.reason ? { isolation_override_reason: iso.reason } : {}) }).eq('id', transfer.to_bed_id)
  await supabase.from('bed_transfers').update({ status: 'Approved' }).eq('id', transfer.id)
  setSelectedBed(null)
  try {
@@ -461,7 +502,10 @@ async function autoCreateBedChargeInvoice({ bed, wardType, hospitalId }) {
       .eq('code', chargeCode)
       .maybeSingle()
 
-    const nightlyRate = cc?.unit_price_kes || 2500
+    const { amount: nightlyRate } = await priceForPayer(supabase, hospitalId, chargeCode, cc?.unit_price_kes || 2500, {
+      paymentMethod: bed.visits?.admission_payment_method,
+      insurer: bed.patients?.insurer_name || bed.patients?.insurance,
+    })
     const amount = nightlyRate * nights
     const serviceLabel = `${cc?.name || 'General Ward'} × ${nights} night${nights !== 1 ? 's' : ''}`
     const patientName = bed.patients?.full_name || ''
@@ -563,10 +607,10 @@ async function printDischargeSummary() {
       .print-sheet { max-width: 210mm; margin: 0 auto; padding: 10mm 8mm; }
       .header { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 18px; }
       .logo-box { width: 74px; height: 74px; border: 1.5px dashed #8AAE9F; border-radius: 12px; display: flex; align-items: center; justify-content: center; color: #6B7F76; font-size: 11px; text-align: center; }
-      .title { font-size: 26px; font-weight: 800; color: #5B21B6; margin: 0; }
+      .title { font-size: 26px; font-weight: 800; color: #0F6E56; margin: 0; }
       .subtitle { margin-top: 4px; color: #555; font-size: 12px; }
       .section { border: 1px solid #DDE7E1; border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; }
-      .section-title { font-size: 12px; font-weight: 800; color: #5B21B6; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 10px; }
+      .section-title { font-size: 12px; font-weight: 800; color: #0F6E56; text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 10px; }
       .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 18px; }
       .row-label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 2px; }
       .row-value { font-size: 13px; color: #111; font-weight: 600; }
@@ -642,7 +686,7 @@ async function printDischargeSummary() {
         <div class="summary-box">${escapeHtml(instructionText || 'No discharge instructions entered yet.')}</div>
       </div>
 
-      <div class="muted">Generated from the ward admission record, consultations, lab tests and prescriptions in Brightpath Travel Scholars.</div>
+      <div class="muted">Generated from the ward admission record, consultations, lab tests and prescriptions in RemedacareHMS.</div>
     </div>
     <script>setTimeout(() => window.print(), 300)</script>
    </body>
@@ -654,11 +698,11 @@ async function printDischargeSummary() {
 async function handleDischarge() {
  if (!selectedBed) return
  if (!canDischarge) {
- window.notifyFromLegacyAlert('Only doctors, nurses and admins can discharge patients.')
+ notifyWarning('Only doctors, nurses and admins can discharge patients.')
  return
  }
  if (!dischargeChecklist.canDischarge && !(isAdmin && String(dischargeForm.override_reason || '').trim())) {
- window.notifyFromLegacyAlert('Discharge is blocked until the discharge checklist is complete, unless an admin enters an override reason.')
+ notifyWarning('Discharge is blocked until the discharge checklist is complete, unless an admin enters an override reason.')
  return
  }
  setSaving(true)
@@ -708,11 +752,11 @@ async function handleDischarge() {
 
  function openAdmitModal(request = null) {
   if (!canAdmitPatient) {
-   window.notifyFromLegacyAlert('Only authorized clinical staff can admit patients.')
+   notifyWarning('Only authorized clinical staff can admit patients.')
    return
   }
   if (!selectedBed || selectedBed.patient_id || !['Free', 'Reserved'].includes(selectedBed.status)) {
-   window.notifyFromLegacyAlert('Select an available or reserved bed first.')
+   notifyWarning('Select an available or reserved bed first.')
    return
   }
   const patient = request?.patients || null
@@ -723,6 +767,7 @@ async function handleDischarge() {
    patient_name: patient?.full_name || request?.patient_name || '',
    sha_number: patient?.sha_member_no || patient?.sha_number || '',
    admission_type: request?.admission_type || 'Elective',
+   admitting_department: admittingDepartmentFrom(request?.admitting_department || visit?.speciality),
    referring_doctor: request?.referring_doctor || '',
    referring_facility: request?.referring_facility || '',
    sha_preauth_number: request?.sha_preauth_number || '',
@@ -738,17 +783,19 @@ async function handleDischarge() {
  async function handleAdmitPatient() {
   if (!selectedBed) return
   if (!admitForm.patient_id || !admitForm.visit_id) {
-   window.notifyFromLegacyAlert('Choose a patient from the admission waiting list first.')
+   notifyWarning('Choose a patient from the admission waiting list first.')
    return
   }
   if (isShaPatientRecord({ sha_member_no: admitForm.sha_number }, null) && !String(admitForm.sha_preauth_number || '').trim()) {
-   window.notifyFromLegacyAlert('SHA pre-authorization number is required for SHA admissions.')
+   notifyWarning('SHA pre-authorization number is required for SHA admissions.')
    return
   }
   if (admitForm.resuscitation_status === 'DNR' && !canSetDnr) {
-   window.notifyFromLegacyAlert('Only admin or doctor roles can mark a patient as DNR.')
+   notifyWarning('Only admin or doctor roles can mark a patient as DNR.')
    return
   }
+  const iso = await confirmBedForIsolation(selectedBed.id, admitForm.patient_id)
+  if (!iso.ok) return
   setSaving(true)
   const nowIso = new Date().toISOString()
   const bedStatus = admitForm.isolation_required ? 'Reserved' : 'Occupied'
@@ -762,6 +809,7 @@ async function handleDischarge() {
    ward: selectedWard?.name || null,
    bed_no: selectedBed?.bed_number || null,
    admission_type: admitForm.admission_type,
+   admitting_department: admitForm.admitting_department || null,
    referring_doctor: admitForm.referring_doctor || null,
    referring_facility: admitForm.referring_facility || null,
    sha_preauth_number: admitForm.sha_preauth_number || null,
@@ -788,6 +836,7 @@ async function handleDischarge() {
     visit_id: admitForm.visit_id,
     admitted_at: nowIso,
     notes: admitForm.allergies_review || null,
+    ...(iso.reason ? { isolation_override_reason: iso.reason } : {}),
    }).eq('id', selectedBed.id),
    admissionMutation,
   ])
@@ -796,7 +845,7 @@ async function handleDischarge() {
   }
   setSaving(false)
   if (bedError || admissionError) {
-   window.notifyFromLegacyAlert(`Admission failed: ${(bedError || admissionError)?.message}`)
+   notifyError(`Admission failed: ${(bedError || admissionError)?.message}`)
    return
   }
   setShowAdmitModal(false)
@@ -818,7 +867,7 @@ async function handleDischarge() {
  async function handleSaveRoundNote() {
   if (!selectedBed?.id || !bedVisit?.id || !bedPatient?.id) return
   if (!roundForm.plan_for_today.trim()) {
-   window.notifyFromLegacyAlert('Enter the plan for today before saving the round note.')
+   notifyWarning('Enter the plan for today before saving the round note.')
    return
   }
   setSaving(true)
@@ -845,7 +894,7 @@ async function handleDischarge() {
   ])
   setSaving(false)
   if (roundError || admissionError) {
-   window.notifyFromLegacyAlert(`Could not save round note: ${(roundError || admissionError)?.message}`)
+   notifyError(`Could not save round note: ${(roundError || admissionError)?.message}`)
    return
   }
   setShowRoundModal(false)
@@ -870,7 +919,7 @@ async function handleDischarge() {
 async function handleSaveNursingNote() {
  if (!selectedBed?.id || !bedVisit?.id || !bedPatient?.id) return
  if (!nursingForm.note_text.trim()) {
-  window.notifyFromLegacyAlert('Enter the nursing progress note before saving.')
+  notifyWarning('Enter the nursing progress note before saving.')
   return
  }
  setSaving(true)
@@ -884,10 +933,11 @@ async function handleSaveNursingNote() {
   note_text: nursingForm.note_text.trim(),
   created_at: nursingForm.created_at ? new Date(nursingForm.created_at).toISOString() : new Date().toISOString(),
  }
- const { error } = await supabase.from('nursing_notes').insert(payload)
+ const { error, offlineQueued } = await performSyncableAction(supabase, { table: 'nursing_notes', operation: 'insert', payload, label: 'Nursing note — bed ' + (selectedBed?.bed_number || '') })
  if (error) {
-  window.notifyFromLegacyAlert('Error saving nursing note: ' + error.message)
+  notifyError('Error saving nursing note: ' + error.message)
  } else {
+  if (offlineQueued) warnOffline('Saved on this device. It will sync automatically when the connection returns.')
   setNursingForm({
    nurse_name: currentUserName,
    note_type: 'General',
@@ -902,7 +952,7 @@ async function handleSaveNursingNote() {
 async function handleSaveFluidEntry() {
  if (!selectedBed?.id || !bedVisit?.id || !bedPatient?.id) return
  if (!fluidForm.volume_ml || Number(fluidForm.volume_ml) <= 0) {
-  window.notifyFromLegacyAlert('Enter a valid fluid volume in millilitres.')
+  notifyWarning('Enter a valid fluid volume in millilitres.')
   return
  }
  setSaving(true)
@@ -918,10 +968,11 @@ async function handleSaveFluidEntry() {
   recorded_by: fluidForm.recorded_by || currentUserName,
   created_at: new Date().toISOString(),
  }
- const { error } = await supabase.from('fluid_balance').insert(payload)
+ const { error, offlineQueued } = await performSyncableAction(supabase, { table: 'fluid_balance', operation: 'insert', payload, label: 'Fluid balance — bed ' + (selectedBed?.bed_number || '') })
  if (error) {
-  window.notifyFromLegacyAlert('Error saving fluid balance entry: ' + error.message)
+  notifyError('Error saving fluid balance entry: ' + error.message)
  } else {
+  if (offlineQueued) warnOffline('Saved on this device. It will sync automatically when the connection returns.')
   setFluidForm({
    entry_type: 'Oral Intake',
    volume_ml: '',
@@ -937,7 +988,7 @@ async function handleSaveFluidEntry() {
 async function handleSaveVitalsShortcut() {
  if (!selectedBed?.id || !bedVisit?.id || !bedPatient?.id) return
  if (!vitalsShortcutForm.bp_systolic || !vitalsShortcutForm.weight_kg) {
-  window.notifyFromLegacyAlert('Weight and systolic blood pressure are required.')
+  notifyWarning('Weight and systolic blood pressure are required.')
   return
  }
  setSaving(true)
@@ -953,10 +1004,11 @@ async function handleSaveVitalsShortcut() {
   bmi,
   recorded_at: new Date().toISOString(),
  }
- const { error } = await supabase.from('vitals').insert(payload)
+ const { error, offlineQueued } = await performSyncableAction(supabase, { table: 'vitals', operation: 'insert', payload, label: 'Vitals — bed ' + (selectedBed?.bed_number || '') })
  if (error) {
-  window.notifyFromLegacyAlert('Error saving vitals: ' + error.message)
+  notifyError('Error saving vitals: ' + error.message)
  } else {
+  if (offlineQueued) warnOffline('Saved on this device. It will sync automatically when the connection returns.')
   setShowVitalsShortcut(false)
   setVitalsShortcutForm({
    weight_kg:'', height_cm:'', bp_systolic:'', bp_diastolic:'',
@@ -970,7 +1022,7 @@ async function handleSaveVitalsShortcut() {
 
 async function setBedStatus(bed, status) {
  if (!canManageWards) {
- window.notifyFromLegacyAlert('Only admins can update bed status.')
+ notifyWarning('Only admins can update bed status.')
  return
  }
  await supabase.from('beds').update({ status }).eq('id', bed.id)
@@ -983,12 +1035,12 @@ async function setBedStatus(bed, status) {
 
  async function handleDeleteBed(bed) {
  if (!canManageWards) {
- window.notifyFromLegacyAlert('Only Admin users can delete beds.')
+ notifyWarning('Only Admin users can delete beds.')
  return
  }
  if (!bed) return
  if (bed.patient_id || bed.status !== 'Free') {
- window.notifyFromLegacyAlert('Only a free bed can be deleted. Discharge or move patients first.')
+ notifyWarning('Only a free bed can be deleted. Discharge or move patients first.')
  return
  }
  if (!await window.openConfirmDialog(`Delete bed ${bed.bed_number}? This action cannot be undone.`)) return
@@ -1003,14 +1055,14 @@ async function setBedStatus(bed, status) {
 
  async function handleDeleteWard(ward) {
  if (!canManageWards) {
- window.notifyFromLegacyAlert('Only Admin users can delete wards.')
+ notifyWarning('Only Admin users can delete wards.')
  return
  }
  if (!ward) return
  const wardBeds = beds.filter(b => b.ward_id === ward.id)
  const hasOccupants = wardBeds.some(b => b.patient_id || b.status === 'Occupied' || b.status === 'Critical')
  if (hasOccupants) {
- window.notifyFromLegacyAlert('Cannot delete a ward with occupied or critical beds. Discharge or transfer patients first.')
+ notifyWarning('Cannot delete a ward with occupied or critical beds. Discharge or transfer patients first.')
  return
  }
  if (!await window.openConfirmDialog(`Delete ward \"${ward.name}\" and ${wardBeds.length} bed(s)? This action cannot be undone.`)) return
@@ -1151,7 +1203,7 @@ async function setBedStatus(bed, status) {
  }), [wards, admissions, beds])
 
  const statusMixData = useMemo(() => {
-  const statuses = ['Free', 'Occupied', 'Critical', 'Reserved', 'Maintenance']
+  const statuses = ['Free', 'Occupied', 'Critical', 'Reserved', 'Cleaning', 'Maintenance']
   return statuses.map((status) => ({ name: status, value: beds.filter(item => item.status === status).length, fill: BED_COLORS[status]?.border || '#CBD5E1' })).filter(item => item.value > 0)
  }, [beds])
 
@@ -1172,7 +1224,7 @@ async function setBedStatus(bed, status) {
  }, [admissions])
 
  if (loading) return (
- <div style={s.loadWrap}><div style={s.spinner}></div><p style={{ color: '#5B21B6', marginTop: 12 }}>Loading Wards...</p></div>
+ <div style={s.loadWrap}><div style={s.spinner}></div><p style={{ color: '#0F6E56', marginTop: 12 }}>Loading Wards...</p></div>
  )
 
  return (
@@ -1194,6 +1246,8 @@ async function setBedStatus(bed, status) {
  }
  </p>
  </div>
+
+ {loadError && <div role="alert" style={{ marginBottom: 14, padding: 11, border: '1px solid #D8E1DC', borderRadius: 8, background: '#F7F8F7', color: '#53655A', fontSize: 12 }}>{loadError}</div>}
  </div>
  <div style={{ display: 'flex', gap: 8 }}>
  {view === 'overview' && (
@@ -1205,8 +1259,9 @@ async function setBedStatus(bed, status) {
  )}
  {view === 'ward' && (
  <>
+ <button style={{ ...s.btn, background: '#fff', color: '#175CD3', border: '1px solid #175CD3' }} onClick={() => setShowHandover(true)}>Shift handover</button>
  <button
-  style={{ ...s.btn, background: '#fff', color: '#5B21B6', border: '1px solid #5B21B6', ...(canManageWards ? {} : s.btnDisabled) }}
+  style={{ ...s.btn, background: '#fff', color: '#0F6E56', border: '1px solid #0F6E56', ...(canManageWards ? {} : s.btnDisabled) }}
   onClick={() => setShowAddBeds(true)}
   disabled={!canManageWards}
   title="Only admins can add beds to wards">+ Add Beds</button>
@@ -1267,9 +1322,9 @@ async function setBedStatus(bed, status) {
             {request.request_source || 'OPD'} • {request.admission_type || 'Elective'} • Requested {formatDateTime(request.created_at)}
            </div>
            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 6 }}>
-            <span style={{ ...s.pill, background: request.priority === 'Emergency' ? '#FCEBEB' : request.priority === 'Urgent' ? '#FFF3DC' : '#EAF6F1', color: request.priority === 'Emergency' ? '#A32D2D' : request.priority === 'Urgent' ? '#C07000' : '#5B21B6' }}>{request.priority || 'Routine'}</span>
+            <span style={{ ...s.pill, background: request.priority === 'Emergency' ? '#FCEBEB' : request.priority === 'Urgent' ? '#FFF3DC' : '#EAF6F1', color: request.priority === 'Emergency' ? '#A32D2D' : request.priority === 'Urgent' ? '#C07000' : '#0F6E56' }}>{request.priority || 'Routine'}</span>
             {request.requested_ward_id && <span style={{ ...s.pill, background: '#EFF6FF', color: '#1D4ED8' }}>Preferred ward set</span>}
-            {request.isolation_required && <span style={{ ...s.pill, background: '#F3E8FF', color: '#7C3AED' }}>Isolation required</span>}
+            {request.isolation_required && <span style={{ ...s.pill, background: '#E1F5EE', color: '#0A9272' }}>Isolation required</span>}
            </div>
            {request.notes && <div style={{ fontSize: 12, color: '#444', marginTop: 6 }}>{request.notes}</div>}
           </div>
@@ -1283,7 +1338,7 @@ async function setBedStatus(bed, status) {
               setView('ward')
              }
             }
-            window.notifyFromLegacyAlert('Open a free bed in the target ward, then use Quick Admit to complete this admission request.')
+            notifySuccess('Open a free bed in the target ward, then use Quick Admit to complete this admission request.')
            }}
            disabled={!canAdmitPatient}
           >
@@ -1322,7 +1377,7 @@ async function setBedStatus(bed, status) {
     <div style={s.statsRow}>
      {[
       { label: 'Current Occupancy %', value: `${totalBeds ? Math.round(((totalOccupied + totalReserved) / totalBeds) * 100) : 0}%`, color: '#111', bg: '#F3F4F6' },
-      { label: 'Avg LOS This Month', value: `${occupancyAnalytics.length ? Number((occupancyAnalytics.reduce((sum, row) => sum + row.avgLos, 0) / occupancyAnalytics.length).toFixed(1)) : 0}d`, color: '#5B21B6', bg: '#F3E8FF' },
+      { label: 'Avg LOS This Month', value: `${occupancyAnalytics.length ? Number((occupancyAnalytics.reduce((sum, row) => sum + row.avgLos, 0) / occupancyAnalytics.length).toFixed(1)) : 0}d`, color: '#0F6E56', bg: '#E1F5EE' },
       { label: 'Bed Turnover', value: occupancyAnalytics.length ? Number((occupancyAnalytics.reduce((sum, row) => sum + row.turnover, 0) / occupancyAnalytics.length).toFixed(1)) : 0, color: '#1D4ED8', bg: '#EAF2FF' },
       { label: '30d Readmissions', value: admissions.filter(item => readmissionWithin30Days(item, admissions)).length, color: '#A32D2D', bg: '#FCEBEB' },
      ].map(stat => (
@@ -1344,7 +1399,7 @@ async function setBedStatus(bed, status) {
          <YAxis stroke="#6B7280" />
          <Tooltip />
          <Legend />
-         <Line type="monotone" dataKey="admissions" stroke="#5B21B6" strokeWidth={3} name="Admissions" />
+         <Line type="monotone" dataKey="admissions" stroke="#0F6E56" strokeWidth={3} name="Admissions" />
          <Line type="monotone" dataKey="discharges" stroke="#C07000" strokeWidth={3} name="Discharges" />
         </LineChart>
        </ResponsiveContainer>
@@ -1378,7 +1433,7 @@ async function setBedStatus(bed, status) {
          <YAxis stroke="#6B7280" />
          <Tooltip formatter={(value) => [`${value}%`, 'Occupancy']} />
          <Bar dataKey="occupancy" radius={[8, 8, 0, 0]}>
-          {occupancyAnalytics.map(item => <Cell key={item.ward} fill={item.occupancy > 90 ? '#A32D2D' : item.occupancy >= 75 ? '#C07000' : '#5B21B6'} />)}
+          {occupancyAnalytics.map(item => <Cell key={item.ward} fill={item.occupancy > 90 ? '#A32D2D' : item.occupancy >= 75 ? '#C07000' : '#0F6E56'} />)}
          </Bar>
         </BarChart>
        </ResponsiveContainer>
@@ -1413,7 +1468,11 @@ async function setBedStatus(bed, status) {
 
  {/* WARD BED MAP VIEW */}
  {view === 'ward' && selectedWard && (
- <div style={{ display: 'flex', gap: 16, minHeight: 0 }}>
+ <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))', gap: 16, minHeight: 0, alignItems: 'start' }}>
+ <WardEarlyWarnings beds={wardBeds} onOpenBed={bed => { selectBed(bed); setBedPanelTab("observations") }} />
+ <IsolationBoard hospitalId={hospitalId} refreshKey={beds} />
+ <WardMedsDue beds={wardBeds} onOpenBed={bed => { selectBed(bed); setBedPanelTab("medication") }} />
+ {showHandover && <WardHandover hospitalId={hospitalId} ward={selectedWard} beds={wardBeds} onClose={() => setShowHandover(false)} />}
  <WardBedGrid
   beds={wardBeds}
   selectedBed={selectedBed}
@@ -1434,9 +1493,11 @@ async function setBedStatus(bed, status) {
   latestRoundByVisit={latestRoundByVisit}
   daysAdmitted={daysAdmitted}
   bedsPerPage={BEDS_PER_PAGE}
+  isolationVisitIds={new Set(admissions.filter(a => a.isolation_required && a.visit_id).map(a => String(a.visit_id)))}
  />
 
  <WardBedPanel
+  hospitalId={hospitalId}
   bed={selectedBed}
   patient={bedPatient}
   visit={bedVisit}
@@ -1475,6 +1536,7 @@ async function setBedStatus(bed, status) {
   onOpenDischarge={() => setShowDischarge(true)}
   onOpenTransfer={() => setShowTransfer(true)}
   onDeleteBed={handleDeleteBed}
+  onIsolationChanged={fetchAll}
   nursingProps={{
    nursingForm,
   setNursingForm,
@@ -1507,20 +1569,20 @@ async function setBedStatus(bed, status) {
   <div style={{ ...s.modal, maxWidth: 720 }} onClick={e => e.stopPropagation()}>
    <div style={s.modalHeader}>
     <h2 style={s.modalTitle}>Record Vitals — {bedPatient?.full_name}</h2>
-    <button style={s.closeBtn} onClick={() => setShowVitalsShortcut(false)}></button>
+    <button style={s.closeBtn} onClick={() => setShowVitalsShortcut(false)} aria-label="Close" title="Close">✕</button>
    </div>
    <div style={s.modalBody}>
     <div style={s.formGrid2}>
-     <div style={s.formGroup}><label style={s.label}>Weight (kg) *</label><input style={s.input} type="number" value={vitalsShortcutForm.weight_kg} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, weight_kg: e.target.value })} /></div>
-     <div style={s.formGroup}><label style={s.label}>Height (cm)</label><input style={s.input} type="number" value={vitalsShortcutForm.height_cm} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, height_cm: e.target.value })} /></div>
-     <div style={s.formGroup}><label style={s.label}>BP Systolic *</label><input style={s.input} type="number" value={vitalsShortcutForm.bp_systolic} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, bp_systolic: e.target.value })} /></div>
-     <div style={s.formGroup}><label style={s.label}>BP Diastolic</label><input style={s.input} type="number" value={vitalsShortcutForm.bp_diastolic} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, bp_diastolic: e.target.value })} /></div>
-     <div style={s.formGroup}><label style={s.label}>Pulse (bpm)</label><input style={s.input} type="number" value={vitalsShortcutForm.pulse_bpm} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, pulse_bpm: e.target.value })} /></div>
-     <div style={s.formGroup}><label style={s.label}>Temperature (°C)</label><input style={s.input} type="number" value={vitalsShortcutForm.temperature_c} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, temperature_c: e.target.value })} /></div>
-     <div style={s.formGroup}><label style={s.label}>SpO2 (%)</label><input style={s.input} type="number" value={vitalsShortcutForm.oxygen_sat} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, oxygen_sat: e.target.value })} /></div>
-     <div style={s.formGroup}><label style={s.label}>Respiratory Rate</label><input style={s.input} type="number" value={vitalsShortcutForm.respiratory_rate} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, respiratory_rate: e.target.value })} /></div>
-     <div style={s.formGroup}><label style={s.label}>Blood Sugar</label><input style={s.input} type="number" value={vitalsShortcutForm.blood_sugar} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, blood_sugar: e.target.value })} /></div>
-     <div style={s.formGroup}><label style={s.label}>Recorded By</label><input style={s.input} value={vitalsShortcutForm.recorded_by} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, recorded_by: e.target.value })} /></div>
+     <div style={s.formGroup}><label htmlFor="ward-weight-kg" style={s.label}>Weight (kg) *</label><input id="ward-weight-kg" style={s.input} type="number" value={vitalsShortcutForm.weight_kg} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, weight_kg: e.target.value })} /></div>
+     <div style={s.formGroup}><label htmlFor="ward-height-cm" style={s.label}>Height (cm)</label><input id="ward-height-cm" style={s.input} type="number" value={vitalsShortcutForm.height_cm} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, height_cm: e.target.value })} /></div>
+     <div style={s.formGroup}><label htmlFor="ward-bp-systolic" style={s.label}>BP Systolic *</label><input id="ward-bp-systolic" style={s.input} type="number" value={vitalsShortcutForm.bp_systolic} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, bp_systolic: e.target.value })} /></div>
+     <div style={s.formGroup}><label htmlFor="ward-bp-diastolic" style={s.label}>BP Diastolic</label><input id="ward-bp-diastolic" style={s.input} type="number" value={vitalsShortcutForm.bp_diastolic} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, bp_diastolic: e.target.value })} /></div>
+     <div style={s.formGroup}><label htmlFor="ward-pulse-bpm" style={s.label}>Pulse (bpm)</label><input id="ward-pulse-bpm" style={s.input} type="number" value={vitalsShortcutForm.pulse_bpm} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, pulse_bpm: e.target.value })} /></div>
+     <div style={s.formGroup}><label htmlFor="ward-temperature-c" style={s.label}>Temperature (°C)</label><input id="ward-temperature-c" style={s.input} type="number" value={vitalsShortcutForm.temperature_c} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, temperature_c: e.target.value })} /></div>
+     <div style={s.formGroup}><label htmlFor="ward-spo2" style={s.label}>SpO2 (%)</label><input id="ward-spo2" style={s.input} type="number" value={vitalsShortcutForm.oxygen_sat} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, oxygen_sat: e.target.value })} /></div>
+     <div style={s.formGroup}><label htmlFor="ward-respiratory-rate" style={s.label}>Respiratory Rate</label><input id="ward-respiratory-rate" style={s.input} type="number" value={vitalsShortcutForm.respiratory_rate} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, respiratory_rate: e.target.value })} /></div>
+     <div style={s.formGroup}><label htmlFor="ward-blood-sugar" style={s.label}>Blood Sugar</label><input id="ward-blood-sugar" style={s.input} type="number" value={vitalsShortcutForm.blood_sugar} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, blood_sugar: e.target.value })} /></div>
+     <div style={s.formGroup}><label htmlFor="ward-recorded-by" style={s.label}>Recorded By</label><input id="ward-recorded-by" style={s.input} value={vitalsShortcutForm.recorded_by} onChange={e => setVitalsShortcutForm({ ...vitalsShortcutForm, recorded_by: e.target.value })} /></div>
     </div>
    </div>
    <div style={s.modalFooter}>
@@ -1537,47 +1599,54 @@ async function setBedStatus(bed, status) {
   <div style={{ ...s.modal, maxWidth: 760 }} onClick={e => e.stopPropagation()}>
    <div style={s.modalHeader}>
     <h2 style={s.modalTitle}>Admit Patient to Bed {selectedBed?.bed_number}</h2>
-    <button style={s.closeBtn} onClick={() => setShowAdmitModal(false)}></button>
+    <button style={s.closeBtn} onClick={() => setShowAdmitModal(false)} aria-label="Close" title="Close">✕</button>
    </div>
    <div style={s.modalBody}>
-    <div style={{ background: '#F8FBF9', border: '1px solid #F3E8FF', borderRadius: 12, padding: 12, marginBottom: 16 }}>
+    <div style={{ background: '#F8FBF9', border: '1px solid #E1F5EE', borderRadius: 12, padding: 12, marginBottom: 16 }}>
      <div style={{ fontWeight: 700, color: '#111' }}>{admitForm.patient_name || 'Select patient from waiting list'}</div>
      <div style={{ fontSize: 12, color: '#666', marginTop: 4 }}>Visit ID: {admitForm.visit_id || '—'} • SHA No: {admitForm.sha_number || 'Not recorded'}</div>
     </div>
     <div style={s.formGrid2}>
      <div style={s.formGroup}>
-      <label style={s.label}>Admission Type</label>
-      <select style={s.input} value={admitForm.admission_type} onChange={e => setAdmitForm({ ...admitForm, admission_type: e.target.value })}>
+      <label htmlFor="ward-admission-type" style={s.label}>Admission Type</label>
+      <select id="ward-admission-type" style={s.input} value={admitForm.admission_type} onChange={e => setAdmitForm({ ...admitForm, admission_type: e.target.value })}>
        {ADMISSION_TYPES.map(option => <option key={option} value={option}>{option}</option>)}
       </select>
      </div>
      <div style={s.formGroup}>
-      <label style={s.label}>Expected Length of Stay (days)</label>
-      <input style={s.input} type="number" min={1} value={admitForm.expected_length_of_stay} onChange={e => setAdmitForm({ ...admitForm, expected_length_of_stay: e.target.value })} />
+      <label htmlFor="ward-admitting-department" style={s.label}>Admitting department / team</label>
+      <select id="ward-admitting-department" style={s.input} value={admitForm.admitting_department} onChange={e => setAdmitForm({ ...admitForm, admitting_department: e.target.value })}>
+       <option value="">Not stated</option>
+       {[...new Set([...admittingDepartmentOptions, ...(admitForm.admitting_department ? [admitForm.admitting_department] : [])])].map(option => <option key={option} value={option}>{option}</option>)}
+      </select>
      </div>
      <div style={s.formGroup}>
-      <label style={s.label}>Referring Doctor</label>
-      <input style={s.input} value={admitForm.referring_doctor} onChange={e => setAdmitForm({ ...admitForm, referring_doctor: e.target.value })} placeholder="Dr. ..." />
+      <label htmlFor="ward-expected-length-of-stay-days" style={s.label}>Expected Length of Stay (days)</label>
+      <input id="ward-expected-length-of-stay-days" style={s.input} type="number" min={1} value={admitForm.expected_length_of_stay} onChange={e => setAdmitForm({ ...admitForm, expected_length_of_stay: e.target.value })} />
      </div>
      <div style={s.formGroup}>
-      <label style={s.label}>Referring Facility</label>
-      <input style={s.input} value={admitForm.referring_facility} onChange={e => setAdmitForm({ ...admitForm, referring_facility: e.target.value })} placeholder="Only for transfers / outside referral" />
+      <label htmlFor="ward-referring-doctor" style={s.label}>Referring Doctor</label>
+      <input id="ward-referring-doctor" style={s.input} value={admitForm.referring_doctor} onChange={e => setAdmitForm({ ...admitForm, referring_doctor: e.target.value })} placeholder="Dr. ..." />
      </div>
      <div style={s.formGroup}>
-      <label style={s.label}>SHA Pre-Authorization Number</label>
-      <input style={s.input} value={admitForm.sha_preauth_number} onChange={e => setAdmitForm({ ...admitForm, sha_preauth_number: e.target.value })} placeholder="Required for SHA patients" />
+      <label htmlFor="ward-referring-facility" style={s.label}>Referring Facility</label>
+      <input id="ward-referring-facility" style={s.input} value={admitForm.referring_facility} onChange={e => setAdmitForm({ ...admitForm, referring_facility: e.target.value })} placeholder="Only for transfers / outside referral" />
      </div>
      <div style={s.formGroup}>
-      <label style={s.label}>Resuscitation Status</label>
-      <select style={s.input} value={admitForm.resuscitation_status} onChange={e => setAdmitForm({ ...admitForm, resuscitation_status: e.target.value })} disabled={!canSetDnr}>
+      <label htmlFor="ward-sha-pre-authorization-number" style={s.label}>SHA Pre-Authorization Number</label>
+      <input id="ward-sha-pre-authorization-number" style={s.input} value={admitForm.sha_preauth_number} onChange={e => setAdmitForm({ ...admitForm, sha_preauth_number: e.target.value })} placeholder="Required for SHA patients" />
+     </div>
+     <div style={s.formGroup}>
+      <label htmlFor="ward-resuscitation-status" style={s.label}>Resuscitation Status</label>
+      <select id="ward-resuscitation-status" style={s.input} value={admitForm.resuscitation_status} onChange={e => setAdmitForm({ ...admitForm, resuscitation_status: e.target.value })} disabled={!canSetDnr}>
        {RESUSCITATION_OPTIONS.map(option => <option key={option} value={option}>{option}</option>)}
       </select>
       {!canSetDnr && <div style={s.inlineHint}>Only admin/doctor roles can change DNR status.</div>}
      </div>
     </div>
     <div style={s.formGroup}>
-     <label style={s.label}>Allergies Review</label>
-     <textarea style={{ ...s.input, minHeight: 82, resize: 'vertical' }} value={admitForm.allergies_review} onChange={e => setAdmitForm({ ...admitForm, allergies_review: e.target.value })} placeholder="Drug / food allergies reviewed at admission..." />
+     <label htmlFor="ward-allergies-review" style={s.label}>Allergies Review</label>
+     <textarea id="ward-allergies-review" style={{ ...s.input, minHeight: 82, resize: 'vertical' }} value={admitForm.allergies_review} onChange={e => setAdmitForm({ ...admitForm, allergies_review: e.target.value })} placeholder="Drug / food allergies reviewed at admission..." />
     </div>
     <label style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, color: '#333' }}>
      <input type="checkbox" checked={admitForm.isolation_required} onChange={e => setAdmitForm({ ...admitForm, isolation_required: e.target.checked })} />
@@ -1598,38 +1667,38 @@ async function setBedStatus(bed, status) {
   <div style={{ ...s.modal, maxWidth: 680 }} onClick={e => e.stopPropagation()}>
    <div style={s.modalHeader}>
     <h2 style={s.modalTitle}>Daily Ward Round • {bedPatient?.full_name}</h2>
-    <button style={s.closeBtn} onClick={() => setShowRoundModal(false)}></button>
+    <button style={s.closeBtn} onClick={() => setShowRoundModal(false)} aria-label="Close" title="Close">✕</button>
    </div>
    <div style={s.modalBody}>
     <div style={s.formGrid2}>
      <div style={s.formGroup}>
-      <label style={s.label}>Current Condition</label>
-      <select style={s.input} value={roundForm.current_condition} onChange={e => setRoundForm({ ...roundForm, current_condition: e.target.value })}>
+      <label htmlFor="ward-current-condition" style={s.label}>Current Condition</label>
+      <select id="ward-current-condition" style={s.input} value={roundForm.current_condition} onChange={e => setRoundForm({ ...roundForm, current_condition: e.target.value })}>
        {ROUND_CONDITIONS.map(option => <option key={option} value={option}>{option}</option>)}
       </select>
      </div>
      <div style={s.formGroup}>
-      <label style={s.label}>Target Discharge Date</label>
-      <input style={s.input} type="date" value={roundForm.target_discharge_date || ''} onChange={e => setRoundForm({ ...roundForm, target_discharge_date: e.target.value })} />
+      <label htmlFor="ward-target-discharge-date" style={s.label}>Target Discharge Date</label>
+      <input id="ward-target-discharge-date" style={s.input} type="date" value={roundForm.target_discharge_date || ''} onChange={e => setRoundForm({ ...roundForm, target_discharge_date: e.target.value })} />
      </div>
      <div style={s.formGroup}>
-      <label style={s.label}>Clinician Name</label>
-      <input style={s.input} value={roundForm.clinician_name} onChange={e => setRoundForm({ ...roundForm, clinician_name: e.target.value })} />
+      <label htmlFor="ward-clinician-name" style={s.label}>Clinician Name</label>
+      <input id="ward-clinician-name" style={s.input} value={roundForm.clinician_name} onChange={e => setRoundForm({ ...roundForm, clinician_name: e.target.value })} />
      </div>
      <div style={s.formGroup}>
-      <label style={s.label}>Round Date / Time</label>
-      <input style={s.input} type="datetime-local" value={roundForm.note_date} onChange={e => setRoundForm({ ...roundForm, note_date: e.target.value })} />
+      <label htmlFor="ward-round-date-time" style={s.label}>Round Date / Time</label>
+      <input id="ward-round-date-time" style={s.input} type="datetime-local" value={roundForm.note_date} onChange={e => setRoundForm({ ...roundForm, note_date: e.target.value })} />
      </div>
     </div>
-    <div style={{ background: '#F8FBF9', borderRadius: 10, padding: 12, border: '1px solid #F3E8FF', marginBottom: 14 }}>
-     <div style={{ fontWeight: 700, color: '#5B21B6', marginBottom: 6 }}>Latest Vitals Snapshot</div>
+    <div style={{ background: '#F8FBF9', borderRadius: 10, padding: 12, border: '1px solid #E1F5EE', marginBottom: 14 }}>
+     <div style={{ fontWeight: 700, color: '#0F6E56', marginBottom: 6 }}>Latest Vitals Snapshot</div>
      <div style={{ fontSize: 12, color: '#444' }}>
       BP {bedVitals?.bp_systolic ? `${bedVitals.bp_systolic}/${bedVitals.bp_diastolic || ''}` : '—'} • Pulse {bedVitals?.pulse_bpm || '—'} • Temp {bedVitals?.temperature_c || '—'} • SpO2 {bedVitals?.oxygen_sat || '—'}
      </div>
     </div>
     <div style={s.formGroup}>
-     <label style={s.label}>Plan for Today</label>
-     <textarea style={{ ...s.input, minHeight: 110, resize: 'vertical' }} value={roundForm.plan_for_today} onChange={e => setRoundForm({ ...roundForm, plan_for_today: e.target.value })} placeholder="Assessment, investigations, consultant review, antibiotics, discharge goals..." />
+     <label htmlFor="ward-plan-for-today" style={s.label}>Plan for Today</label>
+     <textarea id="ward-plan-for-today" style={{ ...s.input, minHeight: 110, resize: 'vertical' }} value={roundForm.plan_for_today} onChange={e => setRoundForm({ ...roundForm, plan_for_today: e.target.value })} placeholder="Assessment, investigations, consultant review, antibiotics, discharge goals..." />
     </div>
    </div>
    <div style={s.modalFooter}>
@@ -1646,28 +1715,28 @@ async function setBedStatus(bed, status) {
  <div style={{ ...s.modal, maxWidth: 480 }} onClick={e => e.stopPropagation()}>
  <div style={s.modalHeader}>
  <h2 style={s.modalTitle}>Add New Ward</h2>
- <button style={s.closeBtn} onClick={() => setShowAddWard(false)}></button>
+ <button style={s.closeBtn} onClick={() => setShowAddWard(false)} aria-label="Close" title="Close">✕</button>
  </div>
  <div style={s.modalBody}>
  <div style={s.formGroup}>
- <label style={s.label}>Ward Name *</label>
- <input style={s.input} placeholder="e.g. General Ward A, ICU Block 1" value={wardForm.name} onChange={e => setWardForm({ ...wardForm, name: e.target.value })} />
+ <label htmlFor="ward-ward-name" style={s.label}>Ward Name *</label>
+ <input id="ward-ward-name" style={s.input} placeholder="e.g. General Ward A, ICU Block 1" value={wardForm.name} onChange={e => setWardForm({ ...wardForm, name: e.target.value })} />
  </div>
  <div style={s.formGrid2}>
  <div style={s.formGroup}>
- <label style={s.label}>Ward Type</label>
- <select style={s.input} value={wardForm.ward_type} onChange={e => setWardForm({ ...wardForm, ward_type: e.target.value })}>
+ <label htmlFor="ward-ward-type" style={s.label}>Ward Type</label>
+ <select id="ward-ward-type" style={s.input} value={wardForm.ward_type} onChange={e => setWardForm({ ...wardForm, ward_type: e.target.value })}>
  {WARD_TYPES.map(t => <option key={t}>{t}</option>)}
  </select>
  </div>
  <div style={s.formGroup}>
- <label style={s.label}>Floor / Block</label>
- <input style={s.input} placeholder="e.g. 1, Ground, B" value={wardForm.floor} onChange={e => setWardForm({ ...wardForm, floor: e.target.value })} />
+ <label htmlFor="ward-floor-block" style={s.label}>Floor / Block</label>
+ <input id="ward-floor-block" style={s.input} placeholder="e.g. 1, Ground, B" value={wardForm.floor} onChange={e => setWardForm({ ...wardForm, floor: e.target.value })} />
  </div>
  </div>
  <div style={s.formGroup}>
- <label style={s.label}>Description (optional)</label>
- <input style={s.input} placeholder="e.g. For post-surgical female patients" value={wardForm.description} onChange={e => setWardForm({ ...wardForm, description: e.target.value })} />
+ <label htmlFor="ward-description-optional" style={s.label}>Description (optional)</label>
+ <input id="ward-description-optional" style={s.input} placeholder="e.g. For post-surgical female patients" value={wardForm.description} onChange={e => setWardForm({ ...wardForm, description: e.target.value })} />
  </div>
  </div>
  <div style={s.modalFooter}>
@@ -1688,7 +1757,7 @@ async function setBedStatus(bed, status) {
  <div style={{ ...s.modal, maxWidth: 460 }} onClick={e => e.stopPropagation()}>
  <div style={s.modalHeader}>
  <h2 style={s.modalTitle}>Generate Beds — {selectedWard?.name}</h2>
- <button style={s.closeBtn} onClick={() => setShowAddBeds(false)}></button>
+ <button style={s.closeBtn} onClick={() => setShowAddBeds(false)} aria-label="Close" title="Close">✕</button>
  </div>
  <div style={s.modalBody}>
  <div style={{ background: '#E3F0FB', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#1a6fb5', marginBottom: 16 }}>
@@ -1697,16 +1766,16 @@ async function setBedStatus(bed, status) {
  </div>
  <div style={s.formGrid2}>
  <div style={s.formGroup}>
- <label style={s.label}>Bed Prefix *</label>
- <input style={s.input} placeholder="e.g. ICU, B, G, OC" value={bedGenForm.prefix} onChange={e => setBedGenForm({ ...bedGenForm, prefix: e.target.value.toUpperCase() })} />
+ <label htmlFor="ward-bed-prefix" style={s.label}>Bed Prefix *</label>
+ <input id="ward-bed-prefix" style={s.input} placeholder="e.g. ICU, B, G, OC" value={bedGenForm.prefix} onChange={e => setBedGenForm({ ...bedGenForm, prefix: e.target.value.toUpperCase() })} />
  </div>
  <div style={s.formGroup}>
- <label style={s.label}>Start Number *</label>
- <input style={s.input} type="number" min={1} value={bedGenForm.start} onChange={e => setBedGenForm({ ...bedGenForm, start: parseInt(e.target.value) || 1 })} />
+ <label htmlFor="ward-start-number" style={s.label}>Start Number *</label>
+ <input id="ward-start-number" style={s.input} type="number" min={1} value={bedGenForm.start} onChange={e => setBedGenForm({ ...bedGenForm, start: parseInt(e.target.value) || 1 })} />
  </div>
  <div style={s.formGroup}>
- <label style={s.label}>End Number *</label>
- <input style={s.input} type="number" min={1} max={500} value={bedGenForm.end} onChange={e => setBedGenForm({ ...bedGenForm, end: parseInt(e.target.value) || 10 })} />
+ <label htmlFor="ward-end-number" style={s.label}>End Number *</label>
+ <input id="ward-end-number" style={s.input} type="number" min={1} max={500} value={bedGenForm.end} onChange={e => setBedGenForm({ ...bedGenForm, end: parseInt(e.target.value) || 10 })} />
  </div>
  </div>
  <div style={{ fontSize: 12, color: '#888' }}>Max 500 beds per batch. Run multiple batches for larger wards.</div>
@@ -1729,23 +1798,23 @@ async function setBedStatus(bed, status) {
  <div style={{ ...s.modal, maxWidth: 460 }} onClick={e => e.stopPropagation()}>
  <div style={s.modalHeader}>
  <h2 style={s.modalTitle}>Request Bed Transfer</h2>
- <button style={s.closeBtn} onClick={() => setShowTransfer(false)}></button>
+ <button style={s.closeBtn} onClick={() => setShowTransfer(false)} aria-label="Close" title="Close">✕</button>
  </div>
  <div style={s.modalBody}>
  <div style={{ background: '#f9fafb', borderRadius: 8, padding: '10px 14px', marginBottom: 14, fontSize: 13 }}>
  <strong>{bedPatient?.full_name}</strong> from Bed <strong>{selectedBed?.bed_number}</strong>
  </div>
  <div style={s.formGroup}>
- <label style={s.label}>Target Ward</label>
- <select style={s.input} value={transferForm.to_ward_id} onChange={e => setTransferForm({ ...transferForm, to_ward_id: e.target.value, to_bed_id: '' })}>
+ <label htmlFor="ward-target-ward" style={s.label}>Target Ward</label>
+ <select id="ward-target-ward" style={s.input} value={transferForm.to_ward_id} onChange={e => setTransferForm({ ...transferForm, to_ward_id: e.target.value, to_bed_id: '' })}>
  <option value="">-- Select Ward --</option>
  {wards.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
  </select>
  </div>
  {transferForm.to_ward_id && (
  <div style={s.formGroup}>
- <label style={s.label}>Target Bed (Free beds only)</label>
- <select style={s.input} value={transferForm.to_bed_id} onChange={e => setTransferForm({ ...transferForm, to_bed_id: e.target.value })}>
+ <label htmlFor="ward-target-bed-free-beds-only" style={s.label}>Target Bed (Free beds only)</label>
+ <select id="ward-target-bed-free-beds-only" style={s.input} value={transferForm.to_bed_id} onChange={e => setTransferForm({ ...transferForm, to_bed_id: e.target.value })}>
  <option value="">-- Select Bed --</option>
  {beds.filter(b => b.ward_id === transferForm.to_ward_id && b.status === 'Free').map(b => (
  <option key={b.id} value={b.id}>{b.bed_number}</option>
@@ -1754,12 +1823,12 @@ async function setBedStatus(bed, status) {
  </div>
  )}
  <div style={s.formGroup}>
- <label style={s.label}>Requested By *</label>
- <input style={s.input} placeholder="Dr. / Nurse name" value={transferForm.requested_by} onChange={e => setTransferForm({ ...transferForm, requested_by: e.target.value })} />
+ <label htmlFor="ward-requested-by" style={s.label}>Requested By *</label>
+ <input id="ward-requested-by" style={s.input} placeholder="Dr. / Nurse name" value={transferForm.requested_by} onChange={e => setTransferForm({ ...transferForm, requested_by: e.target.value })} />
  </div>
  <div style={s.formGroup}>
- <label style={s.label}>Reason</label>
- <input style={s.input} placeholder="e.g. Patient condition worsened" value={transferForm.reason} onChange={e => setTransferForm({ ...transferForm, reason: e.target.value })} />
+ <label htmlFor="ward-reason" style={s.label}>Reason</label>
+ <input id="ward-reason" style={s.input} placeholder="e.g. Patient condition worsened" value={transferForm.reason} onChange={e => setTransferForm({ ...transferForm, reason: e.target.value })} />
  </div>
  </div>
  <div style={s.modalFooter}>
@@ -1780,13 +1849,13 @@ async function setBedStatus(bed, status) {
  <div style={{ ...s.modal, maxWidth: 440 }} onClick={e => e.stopPropagation()}>
  <div style={s.modalHeader}>
  <h2 style={s.modalTitle}>Discharge Patient</h2>
- <button style={s.closeBtn} onClick={() => setShowDischarge(false)}></button>
+ <button style={s.closeBtn} onClick={() => setShowDischarge(false)} aria-label="Close" title="Close">✕</button>
  </div>
  <div style={s.modalBody}>
  <div style={{ background: '#FCEBEB', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#A32D2D', marginBottom: 14 }}>
  This will discharge <strong>{bedPatient?.full_name}</strong> from Bed <strong>{selectedBed?.bed_number}</strong> and mark the visit as Completed.
  </div>
- <div style={{ background: dischargeChecklist.canDischarge ? '#F3E8FF' : '#FFF3DC', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: dischargeChecklist.canDischarge ? '#5B21B6' : '#C07000', marginBottom: 14, border: `1px solid ${dischargeChecklist.canDischarge ? '#D8B4FE' : '#FAC775'}` }}>
+ <div style={{ background: dischargeChecklist.canDischarge ? '#E1F5EE' : '#FFF3DC', borderRadius: 8, padding: '10px 14px', fontSize: 12, color: dischargeChecklist.canDischarge ? '#0F6E56' : '#C07000', marginBottom: 14, border: `1px solid ${dischargeChecklist.canDischarge ? '#B4E5D0' : '#FAC775'}` }}>
  {dischargeChecklist.canDischarge
  ? 'The discharge checklist is complete. You can complete discharge.'
  : `Discharge is blocked: ${dischargeChecklist.openInvoices.length} open invoice(s), ${dischargeChecklist.unbilledLabs.length} unbilled lab test(s), or pending checklist items still need action.`}
@@ -1815,13 +1884,13 @@ async function setBedStatus(bed, status) {
  </div>
  {!dischargeChecklist.canDischarge && isAdmin && (
   <div style={s.formGroup}>
-   <label style={s.label}>Admin Override Reason</label>
-   <textarea style={{ ...s.input, minHeight: 72, resize: 'vertical' }} value={dischargeForm.override_reason} onChange={e => persistDischargeChecklist({ override_reason: e.target.value })} placeholder="Reason for bypassing incomplete discharge checklist..." />
+   <label htmlFor="ward-admin-override-reason" style={s.label}>Admin Override Reason</label>
+   <textarea id="ward-admin-override-reason" style={{ ...s.input, minHeight: 72, resize: 'vertical' }} value={dischargeForm.override_reason} onChange={e => persistDischargeChecklist({ override_reason: e.target.value })} placeholder="Reason for bypassing incomplete discharge checklist..." />
   </div>
  )}
  <div style={s.formGroup}>
- <label style={s.label}>Condition on Discharge</label>
- <select style={s.input} value={dischargeForm.condition_on_discharge} onChange={e => setDischargeForm({ ...dischargeForm, condition_on_discharge: e.target.value })}>
+ <label htmlFor="ward-condition-on-discharge" style={s.label}>Condition on Discharge</label>
+ <select id="ward-condition-on-discharge" style={s.input} value={dischargeForm.condition_on_discharge} onChange={e => setDischargeForm({ ...dischargeForm, condition_on_discharge: e.target.value })}>
  <option>Improved</option>
  <option>Stable</option>
  <option>Transferred</option>
@@ -1830,12 +1899,12 @@ async function setBedStatus(bed, status) {
  </select>
  </div>
  <div style={s.formGroup}>
- <label style={s.label}>Discharge Notes / Summary</label>
- <textarea style={{ ...s.input, height: 100, resize: 'vertical' }} placeholder="Clinical summary, final diagnosis, hospital course..." value={dischargeForm.discharge_notes} onChange={e => setDischargeForm({ ...dischargeForm, discharge_notes: e.target.value })} />
+ <label htmlFor="ward-discharge-notes-summary" style={s.label}>Discharge Notes / Summary</label>
+ <textarea id="ward-discharge-notes-summary" style={{ ...s.input, height: 100, resize: 'vertical' }} placeholder="Clinical summary, final diagnosis, hospital course..." value={dischargeForm.discharge_notes} onChange={e => setDischargeForm({ ...dischargeForm, discharge_notes: e.target.value })} />
  </div>
  <div style={s.formGroup}>
- <label style={s.label}>Discharge Instructions</label>
- <textarea style={{ ...s.input, height: 90, resize: 'vertical' }} placeholder="Medication instructions, follow-up clinic, danger signs..." value={dischargeForm.discharge_instructions} onChange={e => setDischargeForm({ ...dischargeForm, discharge_instructions: e.target.value })} />
+ <label htmlFor="ward-discharge-instructions" style={s.label}>Discharge Instructions</label>
+ <textarea id="ward-discharge-instructions" style={{ ...s.input, height: 90, resize: 'vertical' }} placeholder="Medication instructions, follow-up clinic, danger signs..." value={dischargeForm.discharge_instructions} onChange={e => setDischargeForm({ ...dischargeForm, discharge_instructions: e.target.value })} />
  </div>
  </div>
  <div style={s.modalFooter}>
@@ -1856,27 +1925,27 @@ async function setBedStatus(bed, status) {
 const s = {
  page: { padding: '20px 24px', flex: 1, overflowY: 'auto', background: '#f7f8f7', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif', minHeight: '100vh', boxSizing: 'border-box' },
  loadWrap: { height: '80vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' },
- spinner: { width: 36, height: 36, border: '3px solid #e8ebe8', borderTop: '3px solid #5B21B6', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
+ spinner: { width: 36, height: 36, border: '3px solid #e8ebe8', borderTop: '3px solid #0F6E56', borderRadius: '50%', animation: 'spin 0.9s linear infinite' },
  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20, flexWrap: 'wrap', gap: 10 },
  title: { fontSize: 24, fontWeight: 800, margin: 0, color: '#111' },
  subtitle: { color: '#777', margin: '4px 0 0', fontSize: 13 },
  backBtn: { background: '#fff', border: '1px solid #ddd', borderRadius: 8, padding: '8px 14px', cursor: 'pointer', fontSize: 13, fontWeight: 600, color: '#555' },
- btn: { background: '#5B21B6', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 8, fontWeight: 600, cursor: 'pointer', fontSize: 13 },
+ btn: { background: '#0F6E56', color: '#fff', border: 'none', padding: '10px 18px', borderRadius: 8, fontWeight: 600, cursor: 'pointer', fontSize: 13 },
  btnDisabled: { opacity: 0.5, cursor: 'not-allowed' },
  statsRow: { display: 'flex', gap: 10, marginBottom: 20, flexWrap: 'wrap' },
  statChip: { borderRadius: 12, padding: '12px 20px', minWidth: 100, textAlign: 'center' },
  chartCard: { background: '#fff', borderRadius: 14, border: '1px solid #E6ECE8', padding: 18, minHeight: 340 },
  wardGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 14 },
  wardCard: { background: '#fff', borderRadius: 14, padding: 18, cursor: 'pointer', transition: 'box-shadow 0.2s', boxShadow: '0 2px 8px rgba(0,0,0,0.04)' },
- sectionLabel: { fontSize: 11, fontWeight: 700, color: '#5B21B6', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 12, paddingBottom: 6, borderBottom: '1px solid #F3E8FF' },
+ sectionLabel: { fontSize: 11, fontWeight: 700, color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 12, paddingBottom: 6, borderBottom: '1px solid #E1F5EE' },
  bedGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(72px, 1fr))', gap: 8 },
  bedCard: { borderRadius: 8, padding: '8px 4px', cursor: 'pointer', textAlign: 'center', transition: 'all 0.15s', minHeight: 52, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', userSelect: 'none' },
  bedOverlay: { position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.42)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 950, padding: 24 },
- sidePanel: { width: 'min(880px, calc(100vw - 48px))', flexShrink: 0, background: '#fff', borderRadius: 18, border: '1px solid #E6ECE8', padding: 22, overflowY: 'auto', maxHeight: 'calc(100vh - 56px)', boxShadow: '0 24px 80px rgba(15,23,42,0.22)', animation: 'fadeIn 0.2s ease' },
- sideSectionLabel: { fontSize: 10, fontWeight: 700, color: '#5B21B6', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 8, marginTop: 2, paddingBottom: 4, borderBottom: '1px solid #F3E8FF' },
+ sidePanel: { width: '100%', minWidth: 0, maxWidth: 880, boxSizing: 'border-box', background: '#fff', borderRadius: 18, border: '1px solid #E6ECE8', padding: 22, overflowY: 'auto', maxHeight: 'calc(100vh - 56px)', boxShadow: '0 24px 80px rgba(15,23,42,0.22)', animation: 'fadeIn 0.2s ease' },
+ sideSectionLabel: { fontSize: 10, fontWeight: 700, color: '#0F6E56', textTransform: 'uppercase', letterSpacing: '0.8px', marginBottom: 8, marginTop: 2, paddingBottom: 4, borderBottom: '1px solid #E1F5EE' },
  pill: { fontSize: 11, fontWeight: 600, padding: '3px 9px', borderRadius: 99 },
  chip: { fontSize: 12, padding: '6px 12px', borderRadius: 99, border: '1px solid #e0e0e0', background: '#fff', cursor: 'pointer', fontWeight: 500, color: '#555', whiteSpace: 'nowrap' },
- chipActive: { background: '#5B21B6', color: '#fff', border: '1px solid #5B21B6' },
+ chipActive: { background: '#0F6E56', color: '#fff', border: '1px solid #0F6E56' },
  pageBtn: { padding: '4px 10px', border: '1px solid #ddd', borderRadius: 6, background: '#fff', cursor: 'pointer', fontSize: 12, color: '#555' },
  empty: { textAlign: 'center', padding: '60px 20px', color: '#999' },
  th: { fontSize: 11, color: '#888', fontWeight: 600, textAlign: 'left', padding: '10px 14px', borderBottom: '2px solid #f0f0f0', textTransform: 'uppercase' },
@@ -1894,6 +1963,6 @@ const s = {
  inlineHint: { fontSize: 11, color: '#777', marginTop: 4 },
  input: { width: '100%', padding: '10px 12px', border: '1px solid #ddd', borderRadius: 8, fontSize: 13, outline: 'none', boxSizing: 'border-box', background: '#fff', color: '#111', fontFamily: 'inherit' },
  cancelBtn: { padding: '10px 20px', border: '1px solid #ddd', borderRadius: 8, background: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 500, color: '#555' },
- submitBtn: { padding: '10px 24px', border: 'none', borderRadius: 8, background: '#5B21B6', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
+ submitBtn: { padding: '10px 24px', border: 'none', borderRadius: 8, background: '#0F6E56', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 600 },
 }
 

@@ -17,7 +17,7 @@ function PatientWorkflowCard({
   visit = {},
   latestVitals = null,
   badges = [],
-  accentColor = '#5B21B6',
+  accentColor = '#0F6E56',
   background = '#FFFFFF',
   compact = false,
   extraMeta = [],

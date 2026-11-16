@@ -5,7 +5,7 @@ import { useHospital } from '../context'
 import { executeWithFallback, omitKeys } from '../utils/dbCompat'
 import { broadcastWorkflowChanged } from '../utils/workflowEvents'
 import { colors as C, typography } from '../theme'
-import { searchIcd10Diagnoses } from '../utils/icd10Kenya'
+import { searchDiagnoses as searchIcd10Diagnoses } from '../utils/icd10Kenya'
 import { validatePrescriptionPpb } from '../utils/ppbCatalogue'
 import { buildMessage, DEFAULT_TEMPLATES, fetchNotificationConfig, getNotificationSetting, sendPatientNotification } from '../utils/notifications'
 import { submitShaClaimViaFhir } from '../utils/fhir/client'
@@ -23,6 +23,7 @@ import {
  XAxis,
  YAxis,
 } from 'recharts'
+import { notifyError, notifyFromLegacyAlert, notifyInfo, notifySuccess, notifyWarning } from '../notifications'
 
 const STATUS_COLORS = {
  Submitted: { bg: C.blueL, color: C.blue },
@@ -179,7 +180,7 @@ const REJECTION_REASON_GUIDE = {
 }
 
 const REJECTION_REASON_OPTIONS = Object.keys(REJECTION_REASON_GUIDE)
-const ANALYTICS_COLORS = ['#2563EB', '#0F766E', '#D97706', '#7C3AED', '#DC2626', '#475569', '#16A34A']
+const ANALYTICS_COLORS = ['#2563EB', '#0F766E', '#D97706', '#0A9272', '#DC2626', '#475569', '#16A34A']
 const PREAUTH_PIPELINE = ['Draft', 'Submitted to SHA', 'Pending', 'Approved', 'Rejected']
 
 function normalizeClaimMeta(meta = {}) {
@@ -957,22 +958,26 @@ export default function SHAClaims() {
    }
    const ppbResults = validatePrescriptionPpb(claimData.drugs || [])
    const ppbIssues = ppbResults
-    .filter(result => !result.approved || !result.sha_reimbursable)
+    .filter(result => result.approved === false || result.sha_reimbursable === false || result.catalogue_status === 'unverified')
     .map(result => ({
-      severity: 'error',
+      severity: result.catalogue_status === 'unverified' ? 'warning' : 'error',
       field: 'drugs',
-      message: !result.approved
-       ? `${result.drug_name || result.generic_name || 'Drug'} not on PPB catalogue`
-       : `${result.drug_name || result.generic_name || 'Drug'} is not eligible for SHA reimbursement`,
-      fix: 'Substitute with PPB-approved equivalent or document patient self-pay',
+      message: result.catalogue_status === 'unverified'
+       ? `PPB/SHA status for ${result.drug_name || result.generic_name || 'drug'} could not be verified because catalogue data is unavailable.`
+       : !result.approved
+        ? `${result.drug_name || result.generic_name || 'Drug'} not on PPB catalogue`
+        : `${result.drug_name || result.generic_name || 'Drug'} is not eligible for SHA reimbursement`,
+      fix: result.catalogue_status === 'unverified' ? 'Verify this item against the current PPB National Product Catalogue.' : 'Substitute with PPB-approved equivalent or document patient self-pay',
     }))
 
    if (ppbIssues.length > 0) {
     normalized.issues = [...normalized.issues, ...ppbIssues]
-    normalized.overall = 'FAIL'
-    normalized.score = Math.max(0, normalized.score - ppbIssues.length * 12)
-    normalized.estimated_approval_probability = Math.max(0, normalized.estimated_approval_probability - ppbIssues.length * 18)
-    normalized.recommendation = [normalized.recommendation, 'Resolve PPB/SHA reimbursement risks before submission.'].filter(Boolean).join(' ')
+    if (ppbIssues.some(issue => issue.severity === 'error')) normalized.overall = 'FAIL'
+    else if (normalized.overall === 'PASS') normalized.overall = 'WARN'
+    const confirmedIssues = ppbIssues.filter(issue => issue.severity === 'error').length
+    normalized.score = Math.max(0, normalized.score - confirmedIssues * 12)
+    normalized.estimated_approval_probability = Math.max(0, normalized.estimated_approval_probability - confirmedIssues * 18)
+    normalized.recommendation = [normalized.recommendation, 'Review PPB/SHA catalogue results before final submission.'].filter(Boolean).join(' ')
    }
    const savedReview = await saveClaimReview(claim.id, normalized)
    setReviewResult(savedReview)
@@ -1045,10 +1050,10 @@ export default function SHAClaims() {
    if (error) throw error
 
    await fetchAll()
-   window.notifyFromLegacyAlert('Reviewer fixes applied to the claim. Re-running the review now.')
+   notifyInfo('Reviewer fixes applied to the claim. Re-running the review now.')
    await handleReviewClaim(selectedReviewClaim.id)
   } catch (error) {
-   window.notifyFromLegacyAlert('Error applying review fixes: ' + (error instanceof Error ? error.message : 'Unknown error'))
+   notifyError('Error applying review fixes: ' + (error instanceof Error ? error.message : 'Unknown error'))
   } finally {
    setReviewSaveLoading(false)
   }
@@ -1061,7 +1066,7 @@ async function handleSubmitReviewedClaim() {
 }
 
  async function handleSave() {
- if (!form.patient_name || !form.amount_claimed) { window.notifyFromLegacyAlert('Patient name and amount are required'); return }
+ if (!form.patient_name || !form.amount_claimed) { notifyWarning('Patient name and amount are required'); return }
  setSaving(true)
  const payload = {
  hospital_id: hospitalId,
@@ -1088,7 +1093,7 @@ async function handleSubmitReviewedClaim() {
   () => supabase.from('sha_claims').insert(payload),
   async () => supabase.from('sha_claims').insert(omitKeys(payload, ['patient_id', 'visit_id', 'invoice_id'])),
  )
- if (error) window.notifyFromLegacyAlert('Error: ' + error.message)
+ if (error) notifyError('Error: ' + error.message)
  setShowAdd(false); setForm(emptyForm)
  await fetchAll(); setSaving(false)
  if (!error) broadcastWorkflowChanged({ source: 'sha-claim-create', patient_name: form.patient_name.trim() })
@@ -1140,15 +1145,15 @@ async function handleSubmitReviewedClaim() {
 
 async function handleSavePreauth(nextStatus = 'Draft') {
   if (!preauthForm.patient_id || !preauthForm.patient_name) {
-   window.notifyFromLegacyAlert('Select a patient before saving the pre-authorization request.')
+   notifyWarning('Select a patient before saving the pre-authorization request.')
    return
   }
   if (!preauthForm.icd10_description && !preauthForm.procedure_notes) {
-   window.notifyFromLegacyAlert('Enter the proposed procedure or diagnosis.')
+   notifyWarning('Enter the proposed procedure or diagnosis.')
    return
   }
   if (!preauthForm.estimated_cost) {
-   window.notifyFromLegacyAlert('Estimated cost is required.')
+   notifyWarning('Estimated cost is required.')
    return
   }
 
@@ -1185,7 +1190,7 @@ async function handleSavePreauth(nextStatus = 'Draft') {
    },
   )
   if (error) {
-   window.notifyFromLegacyAlert('Error: ' + error.message)
+   notifyError('Error: ' + error.message)
    setSaving(false)
    return
   }
@@ -1203,9 +1208,9 @@ async function handleSavePreauth(nextStatus = 'Draft') {
      patients: editingPreauth?.patients || preauthPatients.find(item => item.id === payload.patient_id),
     })
     await fetchAll()
-    window.notifyFromLegacyAlert('Pre-auth approved and claim auto-created.')
+    notifySuccess('Pre-auth approved and claim auto-created.')
    } catch (autoError) {
-    window.notifyFromLegacyAlert('Pre-auth saved, but claim auto-create failed: ' + (autoError instanceof Error ? autoError.message : 'Unknown error'))
+    notifyError('Pre-auth saved, but claim auto-create failed: ' + (autoError instanceof Error ? autoError.message : 'Unknown error'))
    }
   }
   setSaving(false)
@@ -1225,16 +1230,16 @@ async function handleSavePreauth(nextStatus = 'Draft') {
   }
   const { error } = await supabase.from('sha_preauth').update(payload).eq('id', record.id)
   if (error) {
-   window.notifyFromLegacyAlert('Error: ' + error.message)
+   notifyError('Error: ' + error.message)
    setSaving(false)
    return
   }
   if (status === 'Approved') {
    try {
     await ensureClaimFromPreauth({ ...record, ...payload })
-    window.notifyFromLegacyAlert('Pre-auth approved and claim auto-created.')
+    notifySuccess('Pre-auth approved and claim auto-created.')
    } catch (autoError) {
-    window.notifyFromLegacyAlert('Pre-auth approved, but claim auto-create failed: ' + (autoError instanceof Error ? autoError.message : 'Unknown error'))
+    notifyError('Pre-auth approved, but claim auto-create failed: ' + (autoError instanceof Error ? autoError.message : 'Unknown error'))
    }
   }
   await fetchAll()
@@ -1264,7 +1269,7 @@ async function handleSavePreauth(nextStatus = 'Draft') {
  const meta = parseClaimNotes(c.notes)
  return c.invoice_id === inv.id || meta.invoice_id === inv.id || meta.invoice_no === inv.invoice_no || c.notes?.includes(inv.invoice_no)
  })
- if (alreadyExists) { window.notifyFromLegacyAlert('This invoice is already tracked in SHA Claims.'); return }
+ if (alreadyExists) { notifyWarning('This invoice is already tracked in SHA Claims.'); return }
  setSaving(true)
  const payload = {
  hospital_id: hospitalId,
@@ -1292,7 +1297,7 @@ async function handleSavePreauth(nextStatus = 'Draft') {
   () => supabase.from('sha_claims').insert(payload),
   async () => supabase.from('sha_claims').insert(omitKeys(payload, ['patient_id', 'visit_id', 'invoice_id'])),
  )
- if (error) window.notifyFromLegacyAlert('Error: ' + error.message)
+ if (error) notifyError('Error: ' + error.message)
  else await fetchAll()
  setSaving(false)
  if (!error) broadcastWorkflowChanged({ source: 'sha-claim-import', invoice_no: inv.invoice_no })
@@ -1322,13 +1327,13 @@ async function handleSavePreauth(nextStatus = 'Draft') {
  invoiceQuery = invoiceId ? invoiceQuery.eq('id', invoiceId) : invoiceQuery.eq('invoice_no', invoiceNo)
  const { error } = await invoiceQuery
  if (error) {
-  window.notifyFromLegacyAlert('SHA claim status saved, but billing invoice sync failed: ' + error.message)
+  notifyError('SHA claim status saved, but billing invoice sync failed: ' + error.message)
  }
  }
 
 async function updateStatus(id, status) {
  if (!isAdmin && ['Approved','Paid','Rejected'].includes(status)) {
- window.notifyFromLegacyAlert('Only Admin users can approve or reject SHA claims.')
+ notifyWarning('Only Admin users can approve or reject SHA claims.')
  return
  }
  const claim = claims.find(r => r.id === id) || (showDetail?.id === id ? showDetail : null)
@@ -1342,7 +1347,7 @@ async function updateStatus(id, status) {
  }
  const { error } = await supabase.from('sha_claims').update({ status, notes: buildClaimNotes(nextMeta) }).eq('id', id)
  if (error) {
- window.notifyFromLegacyAlert('Error: ' + error.message)
+ notifyError('Error: ' + error.message)
  setSaving(false)
  return
  }
@@ -1369,7 +1374,7 @@ async function updateStatus(id, status) {
 
     const message = buildMessage(claimSetting.template || DEFAULT_TEMPLATES[notificationType], {
       patient_name: patient?.full_name || claim.patient_name || 'Patient',
-      hospital_name: hospitalName || 'Brightpath Travel Scholars',
+      hospital_name: hospitalName || 'RemedacareHMS',
       amount: Number(claim.amount_claimed || 0).toLocaleString(),
     })
 
@@ -1423,7 +1428,7 @@ async function updateStatus(id, status) {
   setSaving(true)
   const { error } = await supabase.from('sha_claims').update({ status: 'Rejected', notes: buildClaimNotes(nextMeta) }).eq('id', claim.id)
   if (error) {
-   window.notifyFromLegacyAlert('Error: ' + error.message)
+   notifyError('Error: ' + error.message)
    setSaving(false)
    return
   }
@@ -1455,17 +1460,17 @@ async function submitClaimToSha(claim, options = {}) {
 
   const { error } = await supabase.from('sha_claims').update({ status: 'Submitted to SHA', notes: buildClaimNotes(nextMeta) }).eq('id', claim.id)
   if (error) {
-   window.notifyFromLegacyAlert('Error: ' + error.message)
+   notifyError('Error: ' + error.message)
    return false
   }
-  if (!options.silent) window.notifyFromLegacyAlert('Claim validated and submitted to SHA.')
+  if (!options.silent) notifyInfo('Claim validated and submitted to SHA.')
  await fetchAll()
  return true
 }
 
  async function submitClaimViaFhir(claim, options = {}) {
   if (!hospitalId || !claim?.invoice_id) {
-   window.notifyFromLegacyAlert('This claim needs a linked invoice before it can be sent via FHIR.')
+   notifyWarning('This claim needs a linked invoice before it can be sent via FHIR.')
    return false
   }
 
@@ -1482,12 +1487,12 @@ async function submitClaimToSha(claim, options = {}) {
 
    await fetchAll()
    if (!options.silent) {
-    window.notifyFromLegacyAlert(`FHIR claim sent successfully. Status: ${nextStatus}.`)
+    notifySuccess(`FHIR claim sent successfully. Status: ${nextStatus}.`)
    }
    return true
   } catch (error) {
    const message = await readFunctionError(error)
-   window.notifyFromLegacyAlert('FHIR submission failed: ' + message)
+   notifyError('FHIR submission failed: ' + message)
    await fetchAll()
    return false
   } finally {
@@ -1513,7 +1518,7 @@ async function submitClaimToSha(claim, options = {}) {
 
   const { error } = await supabase.from('sha_claims').update({ status: 'Draft', notes: buildClaimNotes(nextMeta) }).eq('id', claim.id)
   if (error) {
-   window.notifyFromLegacyAlert('Error: ' + error.message)
+   notifyError('Error: ' + error.message)
    return
   }
   await fetchAll()
@@ -1549,7 +1554,7 @@ async function submitClaimToSha(claim, options = {}) {
   setSaving(true)
   const { error } = await supabase.from('sha_claims').update({ status: 'Appealed', notes: buildClaimNotes(nextMeta) }).eq('id', claim.id)
   if (error) {
-   window.notifyFromLegacyAlert('Error: ' + error.message)
+   notifyError('Error: ' + error.message)
    setSaving(false)
    return
   }
@@ -1561,7 +1566,7 @@ async function submitClaimToSha(claim, options = {}) {
  async function handleBatchSubmit() {
   const selectedDraftClaims = claims.filter(item => selectedClaimIds.includes(item.id) && ['Draft', 'Pending'].includes(item.status))
   if (!selectedDraftClaims.length) {
-   window.notifyFromLegacyAlert('Select draft or pending claims before batch submission.')
+   notifyWarning('Select draft or pending claims before batch submission.')
    return
   }
   if (!await window.openConfirmDialog(`Submit ${selectedDraftClaims.length} claim(s) to SHA in one batch?`)) return
@@ -1634,9 +1639,9 @@ async function submitClaimToSha(claim, options = {}) {
    }
 
    await fetchAll()
-   window.notifyFromLegacyAlert('SHA EOB import completed.')
+   notifySuccess('SHA EOB import completed.')
   } catch (error) {
-   window.notifyFromLegacyAlert(error instanceof Error ? error.message : 'EOB import failed.')
+   notifyFromLegacyAlert(error instanceof Error ? error.message : 'EOB import failed.')
   } finally {
    event.target.value = ''
    setEobImporting(false)

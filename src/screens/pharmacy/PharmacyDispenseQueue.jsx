@@ -1,6 +1,9 @@
 export default function PharmacyDispenseQueue({
   rxSearch,
   setRxSearch,
+  departmentFilter = 'All departments',
+  setDepartmentFilter = () => {},
+  pharmacyDepartments = [],
   rxFilter,
   setRxFilter,
   filteredGroups = [],
@@ -30,11 +33,20 @@ export default function PharmacyDispenseQueue({
         <div style={{ position: 'relative', flex: 1, minWidth: '240px' }}>
           <input
             style={css.input}
-            placeholder="Search patient, doctor, visit number, or drug"
+            placeholder="Search patient, department, doctor, visit number, or drug"
             value={rxSearch}
             onChange={e => setRxSearch(e.target.value)}
           />
         </div>
+        <select
+          style={{ ...css.input, width: 'auto', minWidth: '190px' }}
+          value={departmentFilter}
+          onChange={event => setDepartmentFilter(event.target.value)}
+          aria-label="Filter prescriptions by requesting department"
+        >
+          <option>All departments</option>
+          {pharmacyDepartments.map(department => <option key={department}>{department}</option>)}
+        </select>
         <div style={css.chips}>
           {FILTERS.map(filter => (
             <button

@@ -1,4 +1,9 @@
 import ConsultationPrescriptions from './ConsultationPrescriptions'
+import DiagnosisPicker from '../../components/DiagnosisPicker'
+import { PatientBanner } from '../../ui'
+import SpecialtyAssessment from './SpecialtyAssessment'
+import GrowthPanel, { isUnderFive } from './GrowthPanel'
+import { OrderSetPicker, PatientContinuity } from './PatientContinuity'
 
 export default function ConsultationForm({
   form,
@@ -9,6 +14,7 @@ export default function ConsultationForm({
   onSave,
   onSaveDraft,
   onCancel = () => {},
+  onBookFollowUp = null,
   departmentNames = [],
   referralGroups = [],
   wardsList = [],
@@ -29,9 +35,23 @@ export default function ConsultationForm({
   canSaveConsultation = true,
   canOrderLabs = true,
   styles = {},
+  cdsAlertsByRow = {},
+  onCdsAcknowledge = null,
+  onCdsReasonChange = null,
+  canAcknowledgeDanger = true,
+  showPregnancyPrompt = false,
+  patientAllergies = '',
+  patient = null,
+  accessBlocked = false,
+  hospitalId = null,
+  patientId = null,
+  visitId = null,
 }) {
+  if (accessBlocked) return <div role="alert" style={{ padding: 16, background: '#FEF3F2', color: '#B42318', borderRadius: 10, fontWeight: 700 }}>This record is confidential. Open it again and give a reason to continue.</div>
   return (
     <div>
+      {patient && <PatientBanner patient={{ ...patient, allergies: patient.allergies ?? patientAllergies }}
+        alerts={[/^pregnant/i.test(form.pregnancy_status || '') && 'Pregnant', /breastfeeding/i.test(form.pregnancy_status || '') && 'Breastfeeding']} />}
       <div style={styles.sectionLabel}>Doctor Details</div>
       <div style={styles.formGrid2}>
         <div style={styles.formGroup}>
@@ -63,6 +83,9 @@ export default function ConsultationForm({
         </div>
       </div>
 
+      {hospitalId && patientId && (
+        <PatientContinuity hospitalId={hospitalId} patientId={patientId} visitId={visitId} diagnoses={form.diagnoses || []} prescriptions={rxList} doctorName={form.doctor_name} />
+      )}
       <div style={styles.sectionLabel}>Clinical Information</div>
       <div style={styles.formGroup}>
         <label style={styles.label}>Presenting Complaint</label>
@@ -92,6 +115,14 @@ export default function ConsultationForm({
         />
       </div>
 
+      {hospitalId && patientId && (
+        <SpecialtyAssessment hospitalId={hospitalId} patientId={patientId} visitId={visitId} speciality={form.speciality} doctorName={form.doctor_name}
+          onInsertSummary={(text) => setForm({ ...form, examination_findings: [form.examination_findings, text].filter(Boolean).join('\n\n') })} />
+      )}
+      {hospitalId && patientId && (isUnderFive(patient) || /paed|child|nutrition/i.test(form.speciality || '')) && (
+        <GrowthPanel hospitalId={hospitalId} patientId={patientId} visitId={visitId} patient={patient} />
+      )}
+
       <div style={styles.sectionLabel}>Diagnosis</div>
       <div style={styles.formGrid2}>
         <div style={styles.formGroup}>
@@ -104,15 +135,30 @@ export default function ConsultationForm({
           />
         </div>
         <div style={styles.formGroup}>
-          <label style={styles.label}>ICD-10 Code (optional)</label>
-          <input
-            style={styles.input}
-            placeholder="e.g. B50.0, J18.9"
-            value={form.icd_code}
-            onChange={e => setForm({ ...form, icd_code: e.target.value })}
+          <label style={styles.label} htmlFor="consult-icd">ICD-10 code (search)</label>
+          <DiagnosisPicker
+            id="consult-icd"
+            inputStyle={styles.input}
+            code={form.icd_code}
+            description={form.icd10_description}
+            onPick={row => setForm({
+              ...form,
+              icd_code: row.code,
+              icd10_description: row.description,
+              icd11_code: row.icd11_code || '',
+              diagnosis: form.diagnosis?.trim() ? form.diagnosis : row.description,
+            })}
           />
         </div>
       </div>
+      {hospitalId && (
+        <OrderSetPicker hospitalId={hospitalId} patientId={patientId} visitId={visitId} diagnoses={form.diagnoses || []} diagnosisText={form.diagnosis || ''}
+          onApply={({ rx, labs }, set) => {
+            if (rx.length) { setRxList([...rxList.filter((r) => r.drug_name?.trim()), ...rx]); setShowRx(true) }
+            if (labs.length) { setLabOrders([...labOrders.filter((l) => l.test_type), ...labs]); setShowLabOrders(true) }
+            if (set.instructions) setForm({ ...form, treatment_plan: [form.treatment_plan, `${set.name}: ${set.instructions}`].filter(Boolean).join('\n') })
+          }} />
+      )}
       <div style={styles.formGroup}>
         <label style={styles.label}>Treatment Plan</label>
         <textarea
@@ -132,6 +178,24 @@ export default function ConsultationForm({
         />
       </div>
 
+      {showPregnancyPrompt && (
+        <div style={styles.formGroup}>
+          <label style={styles.label} htmlFor="consult-pregnancy">Pregnancy status * <span style={{ fontWeight: 400 }}>(needed for safe prescribing)</span></label>
+          <select id="consult-pregnancy" style={styles.input} value={form.pregnancy_status || ''} onChange={e => setForm({ ...form, pregnancy_status: e.target.value })}>
+            <option value="">-- Select --</option>
+            <option value="Not pregnant">Not pregnant</option>
+            <option value="Pregnant">Pregnant</option>
+            <option value="Possibly pregnant">Possibly pregnant / unsure</option>
+            <option value="Breastfeeding">Breastfeeding</option>
+          </select>
+        </div>
+      )}
+      {patientAllergies && !/^\s*(nil|none|nkda|no known)/i.test(patientAllergies) && (
+        <div role="note" style={{ background: '#FEF3F2', color: '#B42318', border: '1px solid #FDA29B', borderRadius: 8, padding: '8px 10px', fontSize: 12, fontWeight: 700, marginBottom: 10 }}>
+          Allergies: {patientAllergies}
+        </div>
+      )}
+
       <ConsultationPrescriptions
         showRx={showRx}
         setShowRx={setShowRx}
@@ -140,6 +204,10 @@ export default function ConsultationForm({
         inventory={inventory}
         setRxList={setRxList}
         styles={styles}
+        cdsAlertsByRow={cdsAlertsByRow}
+        onCdsAcknowledge={onCdsAcknowledge}
+        onCdsReasonChange={onCdsReasonChange}
+        canAcknowledgeDanger={canAcknowledgeDanger}
       />
 
       <div style={{ ...styles.sectionLabel, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -326,13 +394,13 @@ export default function ConsultationForm({
       </div>
 
       {form.disposition?.includes('Refer') && (
-        <div style={{ background: '#F0EAFC', border: '1.5px solid #C4B5FD', borderRadius: 12, padding: '16px', marginBottom: 16 }}>
+        <div style={{ background: '#EAF5EF', border: '1.5px solid #B4E5D0', borderRadius: 12, padding: '16px', marginBottom: 16 }}>
           <div style={{ fontWeight: 700, fontSize: 13, color: '#7B5EA7', marginBottom: 12 }}>↗ Referral Details</div>
           <div style={styles.formGrid2}>
             <div style={styles.formGroup}>
               <label style={styles.label}>Refer to Department *</label>
               <select
-                style={{ ...styles.input, borderColor: '#C4B5FD' }}
+                style={{ ...styles.input, borderColor: '#B4E5D0' }}
                 value={form.refer_department}
                 onChange={e => setForm({ ...form, refer_department: e.target.value, speciality: e.target.value })}
               >
@@ -351,7 +419,7 @@ export default function ConsultationForm({
             <div style={styles.formGroup}>
               <label style={styles.label}>Ward / Unit (optional)</label>
               <select
-                style={{ ...styles.input, borderColor: '#C4B5FD' }}
+                style={{ ...styles.input, borderColor: '#B4E5D0' }}
                 value={form.refer_ward}
                 onChange={e => setForm({ ...form, refer_ward: e.target.value })}
               >
@@ -374,7 +442,7 @@ export default function ConsultationForm({
           <div style={styles.formGroup}>
             <label style={styles.label}>Attention / Specialist Name (optional)</label>
             <input
-              style={{ ...styles.input, borderColor: '#C4B5FD' }}
+              style={{ ...styles.input, borderColor: '#B4E5D0' }}
               placeholder="e.g. Dr. Ochieng — Cardiology, or leave blank"
               value={form.refer_to}
               onChange={e => setForm({ ...form, refer_to: e.target.value })}
@@ -394,6 +462,18 @@ export default function ConsultationForm({
           value={form.follow_up_date}
           onChange={e => setForm({ ...form, follow_up_date: e.target.value })}
         />
+        {onBookFollowUp && (
+          <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '6px' }}>
+            {[[14, '2 weeks'], [28, '1 month'], [90, '3 months']].map(([days, label]) => (
+              <button key={days} type="button" style={{ ...styles.cancelBtn, padding: '5px 10px', fontSize: '11px' }}
+                onClick={() => onBookFollowUp({ inDays: days })}>Book in {label}</button>
+            ))}
+            {form.follow_up_date && (
+              <button type="button" style={{ ...styles.cancelBtn, padding: '5px 10px', fontSize: '11px' }}
+                onClick={() => onBookFollowUp({ date: form.follow_up_date })}>Book on {form.follow_up_date}</button>
+            )}
+          </div>
+        )}
       </div>
 
       <div style={{ display: 'flex', gap: '10px', marginTop: '8px' }}>

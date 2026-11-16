@@ -27,3 +27,23 @@ export function openConfirmDialog(message, options = {}) {
     })
   })
 }
+
+/** Ask for a line of text in the app's own dialog (replaces window.prompt). Resolves the text, or null if cancelled. */
+export function openPromptDialog(message, options = {}) {
+  const text = String(message ?? '').trim()
+  return new Promise((resolve) => {
+    emit({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      message: text,
+      title: options.title || 'Please enter',
+      confirmLabel: options.confirmLabel || 'OK',
+      cancelLabel: options.cancelLabel || 'Cancel',
+      tone: options.tone || 'info',
+      prompt: true,
+      required: options.required !== false,
+      defaultValue: options.defaultValue || '',
+      placeholder: options.placeholder || '',
+      resolve,
+    })
+  })
+}

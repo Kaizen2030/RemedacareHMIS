@@ -1,4 +1,5 @@
 import { findInventoryMatch } from '../../utils/pharmacy'
+import CdsAlertList from '../../components/CdsAlertList'
 
 function getDrugAvailability(drugName, quantity, inventory) {
   const match = findInventoryMatch(drugName, inventory)
@@ -18,6 +19,10 @@ export default function ConsultationPrescriptions({
   inventory = [],
   setRxList = () => {},
   styles = {},
+  cdsAlertsByRow = {},
+  onCdsAcknowledge = null,
+  onCdsReasonChange = null,
+  canAcknowledgeDanger = true,
 }) {
   return (
     <>
@@ -133,6 +138,15 @@ export default function ConsultationPrescriptions({
                   )}
                 </div>
               </div>
+              <CdsAlertList
+                idPrefix={`cds-${index}`}
+                alerts={cdsAlertsByRow[index] || []}
+                acknowledged={Boolean(rx.cds_acknowledged)}
+                reason={rx.cds_override_reason || ''}
+                canAcknowledge={canAcknowledgeDanger}
+                onAcknowledge={onCdsAcknowledge ? (checked) => onCdsAcknowledge(index, checked) : null}
+                onReasonChange={onCdsReasonChange ? (text) => onCdsReasonChange(index, text) : null}
+              />
             </div>
           ))}
 

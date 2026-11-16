@@ -20,6 +20,10 @@ import { executeWithFallback } from '../utils/dbCompat'
 import { buildAmrInterventions, formatAntibioticLabel, getSusceptibilityEntries, summarizeAmrInterventions } from '../utils/hospitalSignals'
 import { executeMicrobiologyQuery } from '../utils/microbiologyResults'
 import { colors as themeColors, typography } from '../theme'
+import MohReports from './reports/MohReports'
+import { notifySuccess, notifyWarning } from '../notifications'
+import { openPromptDialog } from '../confirmDialog'
+import NetworkSummary from './reports/NetworkSummary'
 
 const C = {
   primary: themeColors.primaryDark,
@@ -32,7 +36,7 @@ const C = {
   danger: '#DC2626',
   warn: '#D97706',
   info: themeColors.info,
-  purple: '#7C3AED',
+  purple: '#0A9272',
   green: themeColors.success,
   teal: '#0F766E',
   bars: themeColors.chartBars,
@@ -47,6 +51,8 @@ const RANGE_OPTIONS = [
 
 const TAB_OPTIONS = [
   { id: 'overview', label: 'Overview' },
+  { id: 'moh', label: 'MOH & KHIS' },
+  { id: 'network', label: 'All facilities' },
   { id: 'statutory', label: 'MOH & Statutory' },
   { id: 'finance', label: 'Financial' },
   { id: 'clinical', label: 'Clinical' },
@@ -294,10 +300,10 @@ function openPrintWindow(title, bodyHtml) {
           .meta { font-size: 12px; color: #333; text-align: right; }
           .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
           .summary-card { border: 1px solid #D7DED9; border-radius: 8px; padding: 10px 12px; }
-          .summary-value { font-size: 17px; font-weight: 700; color: #5B21B6; }
+          .summary-value { font-size: 17px; font-weight: 700; color: #0F6E56; }
           .summary-label { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 0.4px; margin-top: 2px; }
           .block { border: 1px solid #D7DED9; border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
-          .block-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: #5B21B6; margin-bottom: 8px; }
+          .block-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; color: #0F6E56; margin-bottom: 8px; }
           table { width: 100%; border-collapse: collapse; font-size: 12px; }
           th, td { border: 1px solid #CFD8D3; padding: 6px 8px; text-align: left; vertical-align: top; }
           th { background: #EEF6F2; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
@@ -350,7 +356,7 @@ function buildReportHtml({ hospitalName, title, subtitle, summary = [], columns 
           </tbody>
         </table>
       </div>
-      <div class="footer">Generated from live Supabase hospital data in Brightpath Travel Scholars.</div>
+      <div class="footer">Generated from live Supabase hospital data in RemedacareHMS.</div>
     </div>
   `
 }
@@ -1325,7 +1331,7 @@ export default function Reports() {
 
   async function saveBuilderTemplate() {
     if (!builder.templateName.trim()) {
-      window.notifyFromLegacyAlert('Enter a template name first.')
+      notifyWarning('Enter a template name first.')
       return
     }
     const template = {
@@ -1345,7 +1351,7 @@ export default function Reports() {
       templates: [template, ...(reportingConfig.templates || [])].slice(0, 40),
     })
     setBuilder(current => ({ ...current, templateName: '' }))
-    window.notifyFromLegacyAlert('Custom report template saved.')
+    notifySuccess('Custom report template saved.')
   }
 
   function loadBuilderTemplate(template) {
@@ -1364,7 +1370,7 @@ export default function Reports() {
   async function scheduleReport(reportKey) {
     const option = REPORT_OPTIONS.find(item => item.key === reportKey)
     if (!option) return
-    const frequency = window.prompt('Enter schedule frequency: daily, weekly, or monthly', 'monthly')
+    const frequency = await openPromptDialog('How often? Type daily, weekly or monthly.', { title: 'Schedule frequency', defaultValue: 'monthly' })
     if (!['daily', 'weekly', 'monthly'].includes(String(frequency || '').toLowerCase())) return
     const schedule = {
       id: `sch-${Date.now()}`,
@@ -1379,7 +1385,7 @@ export default function Reports() {
       ...reportingConfig,
       schedules: [schedule, ...(reportingConfig.schedules || [])].slice(0, 40),
     })
-    window.notifyFromLegacyAlert('Report schedule saved.')
+    notifySuccess('Report schedule saved.')
   }
 
   async function exportCustomReport(format = 'excel') {
@@ -1471,6 +1477,9 @@ export default function Reports() {
           </div>
         </div>
       )}
+
+      {tab === 'moh' && <MohReports hospitalId={hospitalId} hospitalName={hospitalName} />}
+      {tab === 'network' && <NetworkSummary hospitalId={hospitalId} />}
 
       {tab === 'statutory' && (
         <div style={{ display: 'grid', gap: 18 }}>

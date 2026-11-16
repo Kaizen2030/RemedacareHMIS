@@ -10,14 +10,14 @@ function popupOrNotify(title = 'Print Preview') {
 export function buildLetterheadMarkup(hospitalProfile = {}) {
   const logo = hospitalProfile.logoBase64
     ? `<img src="${hospitalProfile.logoBase64}" alt="Hospital logo" style="width:64px;height:64px;object-fit:cover;border-radius:14px;border:1px solid #E5E7EB;" />`
-    : `<div style="width:64px;height:64px;border-radius:14px;border:1px solid #E5E7EB;display:flex;align-items:center;justify-content:center;font-weight:800;color:#5B21B6;background:#EFF6F2;">RC</div>`
+    : `<div style="width:64px;height:64px;border-radius:14px;border:1px solid #E5E7EB;display:flex;align-items:center;justify-content:center;font-weight:800;color:#0F6E56;background:#EFF6F2;">RC</div>`
 
   return `
     <div style="display:flex;align-items:center;justify-content:space-between;gap:16px;border-bottom:2px solid #E5E7EB;padding-bottom:14px;margin-bottom:18px;">
       <div style="display:flex;align-items:center;gap:14px;">
         ${logo}
         <div>
-          <div style="font-size:22px;font-weight:800;color:#111827;">${hospitalProfile.name || 'Brightpath Travel Scholars'}</div>
+          <div style="font-size:22px;font-weight:800;color:#111827;">${hospitalProfile.name || 'RemedacareHMS'}</div>
           <div style="font-size:12px;color:#6B7280;">${hospitalProfile.address || ''} ${hospitalProfile.county ? `• ${hospitalProfile.county}` : ''}</div>
           <div style="font-size:12px;color:#6B7280;">${hospitalProfile.phone || ''} ${hospitalProfile.email ? `• ${hospitalProfile.email}` : ''}</div>
         </div>
@@ -41,7 +41,7 @@ export function buildPrintPreviewDocument({ title, hospitalProfile, bodyHtml }) 
           body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #F3F4F6; color: #111827; }
           .toolbar { position: sticky; top: 0; display:flex; justify-content:space-between; align-items:center; gap:12px; padding:14px 18px; background:#111827; color:#fff; z-index:10; }
           .toolbar button { border:none; border-radius:10px; padding:10px 14px; cursor:pointer; font-weight:700; }
-          .toolbar .primary { background:#5B21B6; color:#fff; }
+          .toolbar .primary { background:#0F6E56; color:#fff; }
           .toolbar .secondary { background:#E5E7EB; color:#111827; }
           .sheet { max-width: 210mm; margin: 20px auto; background:#fff; min-height: 297mm; padding: 18mm 14mm; box-shadow: 0 18px 40px rgba(0,0,0,0.12); }
           @media print {

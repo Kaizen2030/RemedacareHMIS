@@ -8,6 +8,7 @@ import { broadcastWorkflowChanged } from '../utils/workflowEvents'
 import { COMMON_ICD10 } from '../utils/icd10Kenya'
 import { colors as C, typography } from '../theme'
 import { Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip, XAxis, YAxis } from 'recharts'
+import { notifyError, notifyFromLegacyAlert, notifySuccess, notifyWarning } from '../notifications'
 
 /* ═══════════════════════════════════════════════════════════════════════════
  DESIGN TOKENS — matches MPesa / SHAClaims design system exactly
@@ -460,7 +461,7 @@ export default function InsuranceClaims() {
   /* ── Save new claim ────────────────────────────────────────────────────── */
   async function handleSave() {
     if (!f.patient_name || !f.amount_kes || !f.insurer) {
-      window.notifyFromLegacyAlert('Patient name, insurer, and amount are required')
+      notifyWarning('Patient name, insurer, and amount are required')
       return
     }
     setSaving(true)
@@ -510,7 +511,7 @@ export default function InsuranceClaims() {
       () => supabase.from('insurance_claims').insert(payload),
       async () => supabase.from('insurance_claims').insert(omitKeys(payload, ['patient_id', 'visit_id', 'invoice_id'])),
     )
-    if (error) { window.notifyFromLegacyAlert('Error: ' + error.message); setSaving(false); return }
+    if (error) { notifyError('Error: ' + error.message); setSaving(false); return }
     setShowAdd(false)
     setForm(emptyForm)
     setAiSuggestions([])
@@ -523,7 +524,7 @@ export default function InsuranceClaims() {
   async function importFromBilling(inv) {
     setSaving(true)
     const existing = records.find(r => getInvoiceId(r) === inv.id || getInvoiceRef(r) === inv.invoice_no)
-    if (existing) { window.notifyFromLegacyAlert('This invoice is already imported.'); setSaving(false); return }
+    if (existing) { notifyWarning('This invoice is already imported.'); setSaving(false); return }
     const serviceText = parseServicesField(inv.services) || 'Pharmacy / Drugs'
     const tariffEntry = getTariffEntry(inv.insurer, serviceText)
     const payload = {
@@ -558,7 +559,7 @@ export default function InsuranceClaims() {
       () => supabase.from('insurance_claims').insert(payload),
       async () => supabase.from('insurance_claims').insert(omitKeys(payload, ['patient_id', 'visit_id', 'invoice_id'])),
     )
-    if (error) window.notifyFromLegacyAlert('Error: ' + error.message)
+    if (error) notifyError('Error: ' + error.message)
     await fetchAll()
     setSaving(false)
     if (!error) broadcastWorkflowChanged({ source: 'insurance-claim-import', invoice_no: inv.invoice_no })
@@ -567,7 +568,7 @@ export default function InsuranceClaims() {
   /* ── Import all unimported billing invoices ────────────────────────────── */
   async function importAllBilling(unimported) {
     if (!isAdmin) {
-      window.notifyFromLegacyAlert('Only Admin users can import billing invoices into insurance claims.')
+      notifyWarning('Only Admin users can import billing invoices into insurance claims.')
       return
     }
     setSaving(true)
@@ -606,7 +607,7 @@ export default function InsuranceClaims() {
       () => supabase.from('insurance_claims').insert(inserts),
       async () => supabase.from('insurance_claims').insert(fallbackInserts),
     )
-    if (error) window.notifyFromLegacyAlert('Error: ' + error.message)
+    if (error) notifyError('Error: ' + error.message)
     await fetchAll()
     setSaving(false)
     if (!error) broadcastWorkflowChanged({ source: 'insurance-claim-import-all', count: inserts.length })
@@ -615,7 +616,7 @@ export default function InsuranceClaims() {
   /* ── Status update ─────────────────────────────────────────────────────── */
   async function updateStatus(id, status) {
     if (!isAdmin && ['Approved','Paid','Rejected'].includes(status)) {
-      window.notifyFromLegacyAlert('Only Admin users can approve, pay, or reject insurance claims.')
+      notifyWarning('Only Admin users can approve, pay, or reject insurance claims.')
       return
     }
     const claim = records.find(r => r.id === id) || showDetail
@@ -633,7 +634,7 @@ export default function InsuranceClaims() {
       }),
     }).eq('id', id)
     if (error) {
-      window.notifyFromLegacyAlert('Error updating claim: ' + error.message)
+      notifyError('Error updating claim: ' + error.message)
       setSaving(false)
       return
     }
@@ -647,7 +648,7 @@ export default function InsuranceClaims() {
         invoiceQuery = invoiceId ? invoiceQuery.eq('id', invoiceId) : invoiceQuery.eq('invoice_no', invoiceRef)
         const { error: invError } = await invoiceQuery
         if (invError) {
-          window.notifyFromLegacyAlert('Warning: claim updated, but billing invoice sync failed: ' + invError.message)
+          notifyError('Warning: claim updated, but billing invoice sync failed: ' + invError.message)
         }
       }
     }
@@ -721,13 +722,13 @@ export default function InsuranceClaims() {
       updated_at: new Date().toISOString(),
     }, { onConflict: 'hospital_id' })
     if (error) {
-      window.notifyFromLegacyAlert('Error saving insurance configuration: ' + error.message)
+      notifyError('Error saving insurance configuration: ' + error.message)
       setConfigSaving(false)
       return false
     }
     setInsuranceConfig(payload)
     setConfigSaving(false)
-    window.notifyFromLegacyAlert('Insurance configuration saved.')
+    notifySuccess('Insurance configuration saved.')
     return true
   }
 
@@ -744,7 +745,7 @@ export default function InsuranceClaims() {
     if (!showChecklistModal?.record) return
     const allChecked = showChecklistModal.documents.every(item => item.checked)
     if (!allChecked) {
-      window.notifyFromLegacyAlert('Tick every required document before submitting this claim.')
+      notifyWarning('Tick every required document before submitting this claim.')
       return
     }
     const record = showChecklistModal.record
@@ -757,7 +758,7 @@ export default function InsuranceClaims() {
       }),
     }).eq('id', record.id)
     if (error) {
-      window.notifyFromLegacyAlert('Error submitting claim: ' + error.message)
+      notifyError('Error submitting claim: ' + error.message)
       return
     }
     setShowChecklistModal(null)
@@ -794,7 +795,7 @@ export default function InsuranceClaims() {
   async function importBundledInpatientClaim(invoiceRecord) {
     const bundle = buildInpatientBundle(invoiceRecord)
     if (!bundle.related.length) {
-      window.notifyFromLegacyAlert('No related inpatient invoices found to bundle.')
+      notifyWarning('No related inpatient invoices found to bundle.')
       return
     }
     const tariffEntry = getTariffEntry(invoiceRecord.insurer, 'Inpatient Admission')
@@ -832,11 +833,11 @@ export default function InsuranceClaims() {
       async () => supabase.from('insurance_claims').insert(omitKeys(payload, ['patient_id', 'visit_id', 'invoice_id'])),
     )
     if (error) {
-      window.notifyFromLegacyAlert('Error creating bundled claim: ' + error.message)
+      notifyError('Error creating bundled claim: ' + error.message)
       return
     }
     await fetchAll()
-    window.notifyFromLegacyAlert(`Bundled ${bundle.related.length} inpatient invoice(s) into one claim.`)
+    notifySuccess(`Bundled ${bundle.related.length} inpatient invoice(s) into one claim.`)
   }
 
   async function importRemittanceCsv(event) {
@@ -886,9 +887,9 @@ export default function InsuranceClaims() {
 
       setReconciliationReport(report)
       await fetchAll()
-      window.notifyFromLegacyAlert('Insurance remittance import complete.')
+      notifySuccess('Insurance remittance import complete.')
     } catch (error) {
-      window.notifyFromLegacyAlert(error instanceof Error ? error.message : 'Remittance import failed.')
+      notifyFromLegacyAlert(error instanceof Error ? error.message : 'Remittance import failed.')
     } finally {
       event.target.value = ''
       setRemittanceImporting(false)
@@ -1100,7 +1101,7 @@ export default function InsuranceClaims() {
                 })
                 await saveInsuranceConfig({ ...insuranceConfig, tariffGuide: nextGuide })
               } catch (error) {
-                window.notifyFromLegacyAlert(error instanceof Error ? error.message : 'Tariff upload failed.')
+                notifyFromLegacyAlert(error instanceof Error ? error.message : 'Tariff upload failed.')
               } finally {
                 event.target.value = ''
               }
@@ -2452,7 +2453,7 @@ export default function InsuranceClaims() {
                 style={{...css.btn,...css.btnGhost}}
                 onClick={async () => {
                   await navigator.clipboard.writeText(showCollectionsModal.text)
-                  window.notifyFromLegacyAlert('Collections letter copied.')
+                  notifySuccess('Collections letter copied.')
                 }}
               >
                 Copy Letter

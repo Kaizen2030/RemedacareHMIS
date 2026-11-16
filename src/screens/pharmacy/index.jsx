@@ -19,6 +19,11 @@ import { colors as C, typography } from '../../theme'
 import PharmacyDispenseQueue from './PharmacyDispenseQueue'
 import PharmacyPOS from './PharmacyPOS'
 import PharmacyStockPanel from './PharmacyStockPanel'
+import { notifySentToCashier, unpaidInvoiceFields } from '../../utils/payments/invoices'
+import { buildQuoteMap, checkPaidQuoteMatches, findQuoteFor, QUOTE_NOTE_PATTERN, QUOTE_PREFIX, quoteState } from '../../utils/pharmacyQuotes'
+import { loadHospitalInteractions, pharmacyCdsAlerts } from '../../utils/cds'
+import { notifyError, notifyFromLegacyAlert, notifyInfo, notifyWarning } from '../../notifications'
+import { controlledShortfalls, fefoIssue, recordControlledIssues } from '../../utils/pharmacyDispense'
 
 const PAYMENT_OPTIONS = [
   'Cash',
@@ -67,7 +72,7 @@ const css = {
   statLabel: { fontSize: '11px', color: C.sub, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '.06em' },
   statValue: { fontSize: '28px', fontWeight: 800, lineHeight: 1.1, marginTop: '4px' },
   statSub: { fontSize: '12px', color: C.sub, marginTop: '6px' },
-  banner: { background: 'linear-gradient(135deg, #EFF6FF, #F0FDF4)', border: '1px solid #BFDBFE', borderRadius: '14px', padding: '14px 16px', marginBottom: '16px', display: 'flex', gap: '18px', alignItems: 'center', flexWrap: 'wrap' },
+  banner: { background: C.bgAlt, border: `1px solid ${C.border}`, borderRadius: '8px', padding: '14px 16px', marginBottom: '16px', display: 'flex', gap: '18px', alignItems: 'center', flexWrap: 'wrap' },
   chips: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '14px' },
   chip: { padding: '6px 14px', borderRadius: '999px', border: `1px solid ${C.border}`, background: C.surface, color: C.sub, cursor: 'pointer', fontSize: '12px', fontWeight: 700 },
   chipActive: { background: C.primary, color: '#fff', borderColor: C.primary },
@@ -183,6 +188,16 @@ function normalizeText(value) {
   return String(value || '').trim().toLowerCase()
 }
 
+function getRequestingDepartmentLabel(value) {
+  const department = String(value || '').trim()
+  const normalized = normalizeText(department)
+  if (!normalized || /outpatient|out patient|opd|general medicine|general practice/.test(normalized)) return 'Outpatient Pharmacy'
+  if (/paediatric|pediatric|children/.test(normalized)) return 'Paediatrics Pharmacy'
+  if (/oncology|cancer/.test(normalized)) return 'Oncology Pharmacy'
+  if (/pharmacy$/.test(normalized)) return department
+  return `${department} Pharmacy`
+}
+
 function isPharmacyStaffMember(member) {
   if (!member) return false
   const department = normalizeText(member.department)
@@ -218,9 +233,9 @@ function Badge({ color = 'gray', label }) {
   )
 }
 
-function StatCard({ label, value, sub, accent }) {
+function StatCard({ label, value, sub }) {
   return (
-    <div style={{ ...css.stat, borderTop: `4px solid ${accent || C.primary}` }}>
+    <div style={css.stat}>
       <div style={css.statLabel}>{label}</div>
       <div style={css.statValue}>{value}</div>
       <div style={css.statSub}>{sub}</div>
@@ -843,6 +858,9 @@ function RxRow({ rx, meta, actionBusy, canApprovePrescription, canReleaseDrugs, 
             <Badge color="purple" label={`${formatKES(meta.unitPrice)} each`} />
             <Badge color="gray" label={`Line total ${formatKES(meta.lineTotal)}`} />
             {isAntibioticDrug(rx.drug_name) && <Badge color="blue" label={`AWaRe ${getAwareClassification(rx.drug_name)}`} />}
+            {status === 'Approved' && meta.quote && (quoteState(meta.quote) === 'paid'
+              ? <Badge color="green" label={`Paid at cashier · ${meta.quote.invoice_no}`} />
+              : <Badge color="yellow" label={`Awaiting payment · ${formatKES(meta.quote.balance_kes)} · ${meta.quote.invoice_no}`} />)}
           </div>
           {(rx.approved_by || rx.dispensed_by || rx.reject_reason) && (
             <div style={{ marginTop: '10px', fontSize: '11px', color: C.sub, lineHeight: 1.6 }}>
@@ -878,7 +896,7 @@ function RxRow({ rx, meta, actionBusy, canApprovePrescription, canReleaseDrugs, 
                 title={!canReleaseDrugs ? 'Only pharmacists can release drugs' : ''}
                 onClick={() => onRelease(rx)}
               >
-                {actionBusy ? 'Working...' : 'Release'}
+                {actionBusy ? 'Working...' : !meta.quote ? 'Bill / Release' : quoteState(meta.quote) === 'paid' ? 'Release (paid)' : 'Check payment'}
               </button>
               <button style={{ ...css.btn, ...css.btnDanger }} disabled={actionBusy} onClick={() => onReject(rx)}>
                 Reject
@@ -967,7 +985,7 @@ function PatientGroupCard({
               {group.visitNumber && <span>Visit {group.visitNumber}</span>}
               {group.visitType && <span>{group.visitType}</span>}
               {group.doctor && <span>Dr. {group.doctor}</span>}
-              {group.speciality && <span>{group.speciality}</span>}
+              <span>Requested by {group.requestingDepartment || getRequestingDepartmentLabel(group.speciality)}</span>
               {(group.ward || group.bedNo) && <span>{group.ward || 'Ward'}{group.bedNo ? ` / ${group.bedNo}` : ''}</span>}
               {latestDate > 0 && <span>{new Date(latestDate).toLocaleString('en-KE')}</span>}
             </div>
@@ -1013,7 +1031,9 @@ function PatientGroupCard({
                 title={!canReleaseDrugs ? 'Only pharmacists can release drugs' : ''}
                 onClick={() => onRelease(group, approvedDrugs)}
               >
-                {actionBusy ? 'Working...' : `Release approved (${approvedDrugs.length})`}
+                {actionBusy ? 'Working...' : approvedDrugs.every(rx => quoteState(getRxMeta(rx).quote) === 'paid')
+                  ? `Release paid (${approvedDrugs.length})`
+                  : `Bill / Release approved (${approvedDrugs.length})`}
               </button>
             )}
             <button style={{ ...css.btn, ...css.btnGhost }} onClick={onToggle}>
@@ -1084,6 +1104,8 @@ export default function Pharmacy() {
   const [drugBatches, setDrugBatches] = useState([])
   const [salesLedgerRows, setSalesLedgerRows] = useState([])
   const [invoiceRows, setInvoiceRows] = useState([])
+  const [rxQuotes, setRxQuotes] = useState([])
+  const quoteMap = useMemo(() => buildQuoteMap(rxQuotes), [rxQuotes])
   const [purchaseOrders, setPurchaseOrders] = useState([])
   const [microbiologyResults, setMicrobiologyResults] = useState([])
   const [stewardshipInterventions, setStewardshipInterventions] = useState([])
@@ -1093,6 +1115,7 @@ export default function Pharmacy() {
   const [nowTick, setNowTick] = useState(Date.now())
   const [rxSearch, setRxSearch] = useState('')
   const [rxFilter, setRxFilter] = useState('Pending')
+  const [departmentFilter, setDepartmentFilter] = useState('All departments')
   const [pharmacistName, setPharmacistName] = useState('')
   const [expandedGroups, setExpandedGroups] = useState({})
   const [actionBusy, setActionBusy] = useState(false)
@@ -1133,6 +1156,19 @@ export default function Pharmacy() {
     return () => window.clearInterval(timer)
   }, [])
 
+  // Live pharmacy bills (pay-before-dispense) from the last 14 days.
+  async function loadPharmacyQuotes() {
+    if (!hospitalId) return []
+    const { data } = await supabase.from('invoices')
+      .select('id, invoice_no, status, amount_kes, paid_kes, balance_kes, services, notes, created_at, visit_id, patient_id')
+      .eq('hospital_id', hospitalId)
+      .like('notes', QUOTE_NOTE_PATTERN)
+      .neq('status', 'Cancelled')
+      .gte('created_at', new Date(Date.now() - 14 * 86400000).toISOString())
+      .order('created_at', { ascending: false })
+    return data || []
+  }
+
   async function fetchData() {
     if (!hospitalId) {
       setPrescriptions([])
@@ -1160,7 +1196,10 @@ export default function Pharmacy() {
 
       const [rxResult, stockResult, batchResult, ledgerResult, invoiceResult, purchaseOrdersResult] = await Promise.all([
         supabase.from('prescriptions').select('*').eq('hospital_id', hospitalId).in('status', ['Pending', 'Approved', 'Released', 'Rejected']).order('created_at', { ascending: false }),
-        supabase.from('pharmacy_inventory').select('id, drug_name, generic_name, category, dosage_form, strength, quantity_in_stock, reorder_level, selling_price, unit_cost, expiry_date, supplier, location').eq('hospital_id', hospitalId).order('drug_name'),
+        executeWithFallback(
+          () => supabase.from('pharmacy_inventory').select('id, drug_name, generic_name, category, dosage_form, strength, quantity_in_stock, reorder_level, selling_price, unit_cost, expiry_date, supplier, location').eq('hospital_id', hospitalId).order('drug_name'),
+          async () => supabase.from('pharmacy_inventory').select('*').eq('hospital_id', hospitalId).order('drug_name'),
+        ),
         executeWithFallback(
           () => supabase.from('drug_batches').select('id, drug_name, batch_number, quantity_remaining, expiry_date, supplier, status, created_at').eq('hospital_id', hospitalId).order('expiry_date', { ascending: true }),
           async () => ({ data: [], error: null, compatFallback: true }),
@@ -1275,6 +1314,7 @@ export default function Pharmacy() {
       setDrugBatches(batchResult?.data || [])
       setSalesLedgerRows(ledgerResult?.data || [])
       setInvoiceRows(invoiceResult?.data || [])
+      setRxQuotes(await loadPharmacyQuotes())
       setPurchaseOrders(purchaseOrdersResult?.data || [])
       setMicrobiologyResults(microRows)
       setStewardshipInterventions(interventionRows)
@@ -1289,6 +1329,7 @@ export default function Pharmacy() {
 
   useEffect(() => {
     fetchData()
+    void loadHospitalInteractions(supabase, hospitalId)
   }, [hospitalId])
 
   useEffect(() => {
@@ -1299,6 +1340,7 @@ export default function Pharmacy() {
     const channel = supabase
       .channel(`pharmacy-screen-${hospitalId}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'prescriptions', filter: `hospital_id=eq.${hospitalId}` }, () => fetchData())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'invoices', filter: `hospital_id=eq.${hospitalId}` }, () => fetchData())
       .on('postgres_changes', { event: '*', schema: 'public', table: 'pharmacy_inventory', filter: `hospital_id=eq.${hospitalId}` }, () => fetchData())
       .on('postgres_changes', { event: '*', schema: 'public', table: 'microbiology_results', filter: `hospital_id=eq.${hospitalId}` }, () => fetchData())
       .subscribe()
@@ -1306,12 +1348,14 @@ export default function Pharmacy() {
     window.addEventListener('remedacare:prescriptions_changed', localHandler)
     window.addEventListener('remedacare:antibiogram_updated', localHandler)
     window.addEventListener('remedacare:stewardship_changed', localHandler)
+    window.addEventListener('remedacare:workflow_changed', localHandler)
 
     return () => {
       clearInterval(timer)
       window.removeEventListener('remedacare:prescriptions_changed', localHandler)
       window.removeEventListener('remedacare:antibiogram_updated', localHandler)
       window.removeEventListener('remedacare:stewardship_changed', localHandler)
+      window.removeEventListener('remedacare:workflow_changed', localHandler)
       supabase.removeChannel(channel)
     }
   }, [hospitalId])
@@ -1357,6 +1401,7 @@ export default function Pharmacy() {
       stockLeft,
       stockLabel,
       stockColor,
+      quote: rx?.id != null ? quoteMap[String(rx.id)] || null : null,
     }
   }
 
@@ -1450,6 +1495,9 @@ export default function Pharmacy() {
           visitType: rx.visits?.visit_type || null,
           doctor: rx.visits?.assigned_doctor_name || rx.prescribed_by || null,
           speciality: rx.visits?.speciality || null,
+          requestingDepartment: getRequestingDepartmentLabel(
+            rx.requesting_department || rx.department_name || rx.visits?.department || rx.visits?.speciality || rx.department || rx.speciality,
+          ),
           allergies: rx.patients?.allergies || null,
           chronicConditions: rx.patients?.chronic_conditions || null,
           chiefComplaint: rx.visits?.chief_complaint || null,
@@ -1486,20 +1534,27 @@ export default function Pharmacy() {
     })
   }, [latestVitalsByVisit, nowTick, prescriptions, stewardshipAlerts])
 
+  const pharmacyDepartments = useMemo(
+    () => [...new Set(grouped.map(group => group.requestingDepartment).filter(Boolean))].sort((left, right) => left.localeCompare(right)),
+    [grouped],
+  )
+
   const filteredGroups = useMemo(() => {
     return grouped.filter(group => {
       const search = rxSearch.trim().toLowerCase()
       const statusMatch = rxFilter === 'All' || group.drugs.some(rx => getRxStatus(rx) === rxFilter)
+      const departmentMatch = departmentFilter === 'All departments' || group.requestingDepartment === departmentFilter
       const searchMatch = !search ||
         group.patientName.toLowerCase().includes(search) ||
         String(group.phone || '').toLowerCase().includes(search) ||
         String(group.visitNumber || '').toLowerCase().includes(search) ||
         String(group.doctor || '').toLowerCase().includes(search) ||
+        String(group.requestingDepartment || '').toLowerCase().includes(search) ||
         group.drugs.some(rx => matchesDrugSearch(search, { drug_name: rx.drug_name }))
 
-      return statusMatch && searchMatch
+      return statusMatch && departmentMatch && searchMatch
     })
-  }, [grouped, rxFilter, rxSearch])
+  }, [departmentFilter, grouped, rxFilter, rxSearch])
 
   const statusCounts = useMemo(() => {
     const counts = { All: prescriptions.length, Pending: 0, Approved: 0, Released: 0, Rejected: 0 }
@@ -1611,13 +1666,13 @@ export default function Pharmacy() {
   async function handleSaveStewardshipAdvice() {
     if (!stewardshipModal?.id) return
     if (!pharmacistName.trim()) {
-      window.notifyFromLegacyAlert('Select the pharmacist handling this queue before saving an AMR intervention note.')
+      notifyWarning('Select the pharmacist handling this queue before saving an AMR intervention note.')
       return
     }
 
     const note = String(stewardshipModal.note || '').trim()
     if (!note) {
-      window.notifyFromLegacyAlert('Enter the stewardship advice to save.')
+      notifyWarning('Enter the stewardship advice to save.')
       return
     }
 
@@ -1677,13 +1732,13 @@ export default function Pharmacy() {
     setStewardshipSaving(false)
 
     if (result.error) {
-      window.notifyFromLegacyAlert(`Could not save stewardship advice: ${result.error.message}`)
+      notifyError(`Could not save stewardship advice: ${result.error.message}`)
       return
     }
 
     if (result.compatFallback) {
       setStewardshipSchemaReady(false)
-      window.notifyFromLegacyAlert('The new stewardship table is not available yet, so the note was saved in the legacy microbiology field. Run next_upgrade_relations_and_stewardship.sql to enable prescriber acknowledgement tracking.')
+      notifyWarning('The new stewardship table is not available yet, so the note was saved in the legacy microbiology field. Run next_upgrade_relations_and_stewardship.sql to enable prescriber acknowledgement tracking.')
     }
 
     broadcastAntibiogramUpdated({ id: stewardshipModal.id })
@@ -1716,21 +1771,21 @@ export default function Pharmacy() {
   async function handleApprove(rxList) {
     if (!rxList?.length) return
     if (!canApprovePrescription) {
-      window.notifyFromLegacyAlert('Only pharmacists can approve prescriptions.')
+      notifyWarning('Only pharmacists can approve prescriptions.')
       return
     }
     if (!pharmacistName.trim()) {
-      window.notifyFromLegacyAlert('Select the pharmacist handling this queue before approving.')
+      notifyWarning('Select the pharmacist handling this queue before approving.')
       return
     }
 
     const { eligible, blocked } = validateApprovalItems(rxList)
     if (eligible.length === 0) {
-      window.notifyFromLegacyAlert(`Approval blocked:\n\n${blocked.join('\n')}`)
+      notifyWarning(`Approval blocked:\n\n${blocked.join('\n')}`)
       return
     }
     if (blocked.length > 0) {
-      window.notifyFromLegacyAlert(`Some lines stayed pending because inventory could not support approval yet:\n\n${blocked.join('\n')}`)
+      notifyError(`Some lines stayed pending because inventory could not support approval yet:\n\n${blocked.join('\n')}`)
     }
 
     setActionBusy(true)
@@ -1750,7 +1805,7 @@ export default function Pharmacy() {
     setActionBusy(false)
 
     if (error) {
-      window.notifyFromLegacyAlert(`Could not approve prescription(s): ${error.message}`)
+      notifyError(`Could not approve prescription(s): ${error.message}`)
       return
     }
 
@@ -1781,7 +1836,7 @@ export default function Pharmacy() {
   async function handleReject(reason) {
     if (!rejectModal?.rx) return
     if (!reason.trim()) {
-      window.notifyFromLegacyAlert('Please enter a rejection reason.')
+      notifyWarning('Please enter a rejection reason.')
       return
     }
 
@@ -1801,7 +1856,7 @@ export default function Pharmacy() {
     setActionBusy(false)
 
     if (error) {
-      window.notifyFromLegacyAlert(`Could not reject the prescription: ${error.message}`)
+      notifyError(`Could not reject the prescription: ${error.message}`)
       return
     }
 
@@ -1842,7 +1897,7 @@ export default function Pharmacy() {
       .single()
 
     if (error) {
-      window.notifyFromLegacyAlert(`Could not create the LPO: ${error.message}`)
+      notifyError(`Could not create the LPO: ${error.message}`)
       return
     }
 
@@ -1860,7 +1915,7 @@ export default function Pharmacy() {
     })
 
     if (itemError) {
-      window.notifyFromLegacyAlert(`LPO header saved, but line item creation failed: ${itemError.message}`)
+      notifyError(`LPO header saved, but line item creation failed: ${itemError.message}`)
       return
     }
 
@@ -1908,7 +1963,7 @@ export default function Pharmacy() {
     return validatePrescriptionPpb(selectedItems.map(item => ({
       drug_name: item.inventoryItem?.drug_name || item.rx?.drug_name || '',
       generic_name: item.inventoryItem?.generic_name || item.rx?.generic_name || '',
-    }))).filter(result => !result.approved || !result.sha_reimbursable)
+    }))).filter(result => result.approved === false || result.sha_reimbursable === false || result.catalogue_status === 'unverified')
   }
 
   function validateReleaseItems(items) {
@@ -1961,38 +2016,22 @@ export default function Pharmacy() {
   async function handleRelease(form, options = {}) {
     if (!releaseModal?.items?.length) return
     if (!canReleaseDrugs) {
-      window.notifyFromLegacyAlert('Only pharmacists can release drugs.')
+      notifyWarning('Only pharmacists can release drugs.')
       return
     }
     if (!form.released_by.trim()) {
-      window.notifyFromLegacyAlert('Select the pharmacist handling the release.')
+      notifyWarning('Select the pharmacist handling the release.')
       return
     }
 
     const paymentMethod = normalizePaymentMethod(form.payment_method)
     const finalPaymentMethod = options.forceCash ? 'Cash' : paymentMethod
-    if (paymentMethod === 'M-Pesa' && !form.mpesa_ref.trim()) {
-      window.notifyFromLegacyAlert('Enter the M-Pesa reference before releasing.')
-      return
-    }
     const pharmacistMember = pharmacyStaff.find(member => member.full_name === form.released_by.trim()) || null
     const expectedPin = String(pharmacistMember?.dispense_pin || pharmacistMember?.pin_code || pharmacistMember?.pin || '').trim()
     const enteredCode = String(form.security_code || '').trim()
     if (expectedPin ? enteredCode !== expectedPin : enteredCode.toUpperCase() !== 'RELEASE') {
-      window.notifyFromLegacyAlert(expectedPin ? 'Incorrect pharmacist PIN.' : 'Type RELEASE to confirm this dispense.')
+      notifyFromLegacyAlert(expectedPin ? 'Incorrect pharmacist PIN.' : 'Type RELEASE to confirm this dispense.')
       return
-    }
-    if (paymentMethod === SPLIT_METHOD) {
-      const splitCashAmount = Math.max(0, Number(form.split_cash_amount || 0))
-      const splitMpesaAmount = Math.max(0, Number(form.split_mpesa_amount || 0))
-      if (splitCashAmount + splitMpesaAmount <= 0) {
-        window.notifyFromLegacyAlert('Enter the cash and/or M-Pesa amounts for split payment.')
-        return
-      }
-      if (splitMpesaAmount > 0 && !form.mpesa_ref.trim()) {
-        window.notifyFromLegacyAlert('Enter the M-Pesa reference for the split payment.')
-        return
-      }
     }
 
     const reviewItems = releaseModal.group?.drugs?.length
@@ -2006,7 +2045,7 @@ export default function Pharmacy() {
       .map(rx => rx.drug_name)
 
     if (unresolvedSelections.length > 0) {
-      window.notifyFromLegacyAlert(`Some selected lines do not have a POS stock match yet:\n\n${unresolvedSelections.join('\n')}`)
+      notifyWarning(`Some selected lines do not have a POS stock match yet:\n\n${unresolvedSelections.join('\n')}`)
       return
     }
 
@@ -2026,26 +2065,30 @@ export default function Pharmacy() {
       .filter(Boolean)
 
     if (selectedItems.length === 0) {
-      window.notifyFromLegacyAlert('Add at least one approved drug to the POS cart before releasing.')
+      notifyWarning('Add at least one approved drug to the POS cart before releasing.')
       return
     }
 
     const missingInventory = selectedItems.filter(item => !item.inventoryItem).map(item => item.rx.drug_name)
     if (missingInventory.length > 0) {
-      window.notifyFromLegacyAlert(`These cart lines lost their inventory match and need to be selected again:\n\n${missingInventory.join('\n')}`)
+      notifyWarning(`These cart lines lost their inventory match and need to be selected again:\n\n${missingInventory.join('\n')}`)
       return
     }
 
-    const majorInteractions = detectPrescriptionInteractions(selectedItems.map(item => ({
-      drug_name: item.inventoryItem?.drug_name || item.rx?.drug_name,
-    }))).filter(interaction => interaction.severity === 'Major')
-    const allergyWarnings = extractAllergyWarnings(releaseModal.group?.allergies, selectedItems)
+    // Decision support: allergy, age, pregnancy, dose and interactions. Serious alerts need a reason (audited).
+    const cdsDangers = pharmacyCdsAlerts(releaseModal.group, selectedItems).filter(alert => alert.severity === 'danger')
+    if (cdsDangers.length > 0 && (!form.cds_acknowledged || String(form.cds_reason || '').trim().length < 5)) {
+      notifyWarning(`Safety alert:\n\n${cdsDangers.map(a => a.message).join('\n')}\n\nTick "I have reviewed this alert" and write the reason in the release window, or change the cart.`)
+      return
+    }
+    const majorInteractions = []
+    const allergyWarnings = []
     if (majorInteractions.length > 0 && !form.acknowledge_interactions) {
-      window.notifyFromLegacyAlert(`Major drug interaction warning:\n\n${majorInteractions.map(item => `${item.pair.join(' + ')}: ${item.message}`).join('\n')}\n\nAcknowledge the warning in the release modal before dispensing.`)
+      notifyWarning(`Major drug interaction warning:\n\n${majorInteractions.map(item => `${item.pair.join(' + ')}: ${item.message}`).join('\n')}\n\nAcknowledge the warning in the release modal before dispensing.`)
       return
     }
     if (allergyWarnings.length > 0 && !form.acknowledge_allergies) {
-      window.notifyFromLegacyAlert(`Patient allergy warning:\n\n${allergyWarnings.join('\n')}\n\nAcknowledge the warning in the release modal before dispensing.`)
+      notifyWarning(`Patient allergy warning:\n\n${allergyWarnings.join('\n')}\n\nAcknowledge the warning in the release modal before dispensing.`)
       return
     }
 
@@ -2063,7 +2106,12 @@ export default function Pharmacy() {
 
     const { problems, stockByInventoryId, batchPlans } = validateReleaseItems(selectedItems)
     if (problems.length > 0) {
-      window.notifyFromLegacyAlert(`Release blocked:\n\n${problems.join('\n')}`)
+      notifyWarning(`Release blocked:\n\n${problems.join('\n')}`)
+      return
+    }
+    const cdProblems = await controlledShortfalls(supabase, hospitalId, selectedItems)
+    if (cdProblems.length > 0) {
+      notifyWarning(`Release blocked:\n\n${cdProblems.join('\n')}`)
       return
     }
 
@@ -2109,10 +2157,60 @@ export default function Pharmacy() {
     const isCredit = isCreditPaymentMethod(finalPaymentMethod)
     const splitCashAmount = Math.max(0, Number(form.split_cash_amount || 0))
     const splitMpesaAmount = Math.max(0, Number(form.split_mpesa_amount || 0))
-    const splitTotal = splitCashAmount + splitMpesaAmount
-    const paidAmount = finalPaymentMethod === SPLIT_METHOD ? Math.min(amount, splitTotal) : (NON_INSURANCE.includes(finalPaymentMethod) ? amount : 0)
-    const balanceAmount = Math.max(0, amount - paidAmount)
-    const invoiceStatus = balanceAmount <= 0 ? 'Paid' : 'Pending'
+    // The bill starts unpaid; the money is taken in the payment window (real receipt, change, M-Pesa code).
+    const selfPay = !isInsurance && !isCredit && amount > 0
+
+    // ── Pay before dispense (self-pay) ── step 1: bill to the cashier; step 2: release what was paid.
+    let paidQuote = null
+    if (selfPay) {
+      const rxIds = selectedItems.map(item => String(item.rx.id))
+      const { quote, conflict } = findQuoteFor(buildQuoteMap(await loadPharmacyQuotes()), rxIds)
+      if (conflict) {
+        notifyInfo('These items are on different cashier bills. Release the items on each bill separately.')
+        return
+      }
+      if (!quote) {
+        setActionBusy(true)
+        const { data: bill, error: billError } = await supabase.from('invoices').insert({
+          hospital_id: hospitalId,
+          patient_id: patientId,
+          visit_id: visitId,
+          patient_name: patientName,
+          invoice_no: invoiceNo,
+          services: stringifyServiceLines(items),
+          ...unpaidInvoiceFields(amount),
+          payment_method: finalPaymentMethod,
+          insurer: null,
+          notes: buildWorkflowInvoiceNote({
+            source: SERVICE_SOURCES.PHARMACY,
+            sourceId: `${QUOTE_PREFIX}${receiptNumber}`,
+            visitId,
+            summary: `Pharmacy bill — pay before dispensing (${items.length} item${items.length !== 1 ? 's' : ''})`,
+          }),
+          created_at: soldAt,
+        }).select('*').single()
+        setActionBusy(false)
+        if (billError) {
+          notifyError(`Could not send the bill to the cashier: ${billError.message}`)
+          return
+        }
+        setReleaseModal(null)
+        broadcastWorkflowChanged({ source: 'pharmacy-bill', invoice_no: bill.invoice_no, visit_id: visitId })
+        notifySentToCashier(bill, 'Bill sent. Nothing has been dispensed yet')
+        fetchData()
+        return
+      }
+      if (quoteState(quote) !== 'paid') {
+        notifyWarning(`Not paid yet. Bill ${quote.invoice_no} (KES ${Number(quote.balance_kes || 0).toLocaleString('en-KE')} due) is waiting at the cashier.`)
+        return
+      }
+      const match = checkPaidQuoteMatches(quote, rxIds, amount)
+      if (!match.ok) {
+        notifyFromLegacyAlert(match.reason)
+        return
+      }
+      paidQuote = quote
+    }
     const insurer = finalPaymentMethod === 'SHA' ? 'SHA' : (isInsurance ? finalPaymentMethod : null)
     const splitSummary = finalPaymentMethod === SPLIT_METHOD
       ? `Split payment: ${formatKES(splitCashAmount)} Cash + ${formatKES(splitMpesaAmount)} M-Pesa${form.mpesa_ref?.trim() ? ` (${form.mpesa_ref.trim()})` : ''}`
@@ -2131,6 +2229,14 @@ export default function Pharmacy() {
     setActionBusy(true)
 
     for (const [, stock] of stockByInventoryId) {
+      // Database FEFO issue (batches + stock level in one transaction); falls back to the old path if not installed.
+      const fefo = await fefoIssue(supabase, stock.item.id, stock.quantityNeeded, receiptNumber)
+      if (fefo.error) {
+        setActionBusy(false)
+        notifyError(`Stock update failed for ${stock.item.drug_name}: ${fefo.error}`)
+        return
+      }
+      if (fefo.installed) continue
       const newQty = Math.max(0, stock.stockLeft - stock.quantityNeeded)
       const relatedSelections = selectedItems.filter(item => String(item.inventoryItem.id) === String(stock.item.id))
       const allocations = relatedSelections.flatMap(item => batchPlans.get(item.rx.id)?.allocations || [])
@@ -2153,10 +2259,13 @@ export default function Pharmacy() {
 
       if (error) {
         setActionBusy(false)
-        window.notifyFromLegacyAlert(`Stock update failed for ${stock.item.drug_name}: ${error.message}`)
+        notifyError(`Stock update failed for ${stock.item.drug_name}: ${error.message}`)
         return
       }
     }
+
+    const cdPostProblems = await recordControlledIssues(supabase, hospitalId, selectedItems, { patientId, recordedBy: form.released_by.trim() })
+    if (cdPostProblems.length > 0) notifyWarning(`Dispensed, but the controlled drug register entry failed — record it by hand:\n\n${cdPostProblems.join('\n')}`)
 
     for (const item of selectedItems) {
       const releasePayload = {
@@ -2178,7 +2287,7 @@ export default function Pharmacy() {
 
       if (rxError) {
         setActionBusy(false)
-        window.notifyFromLegacyAlert(`Prescription release failed: ${rxError.message}`)
+        notifyError(`Prescription release failed: ${rxError.message}`)
         return
       }
 
@@ -2258,7 +2367,7 @@ export default function Pharmacy() {
 
     if (ledgerError) {
       setActionBusy(false)
-      window.notifyFromLegacyAlert(`Sales ledger save failed: ${ledgerError.message}`)
+      notifyError(`Sales ledger save failed: ${ledgerError.message}`)
       return
     }
 
@@ -2269,33 +2378,31 @@ export default function Pharmacy() {
       patient_name: patientName,
       invoice_no: invoiceNo,
       services: stringifyServiceLines(items),
-      amount_kes: amount,
-      paid_kes: paidAmount,
-      balance_kes: balanceAmount,
+      ...unpaidInvoiceFields(amount),
       payment_method: finalPaymentMethod,
       insurer,
       sha_member_no: null,
-      status: invoiceStatus,
       notes: buildWorkflowInvoiceNote({
         source: SERVICE_SOURCES.PHARMACY,
         sourceId: receiptNumber,
         visitId,
         summary: receiptSummary,
       }),
-      paid_at: invoiceStatus === 'Paid' ? soldAt : null,
       created_at: soldAt,
     }
 
-    const { data: createdInvoice, error: invoiceError } = await supabase
-      .from('invoices')
-      .insert(invoicePayload)
-      .select('*')
-      .single()
+    const { data: createdInvoice, error: invoiceError } = paidQuote
+      ? await supabase.from('invoices').select('*').eq('id', paidQuote.id).single()
+      : await supabase
+        .from('invoices')
+        .insert(invoicePayload)
+        .select('*')
+        .single()
 
     setActionBusy(false)
 
     if (invoiceError) {
-      window.notifyFromLegacyAlert(`Invoice creation failed: ${invoiceError.message}`)
+      notifyError(`Invoice creation failed: ${invoiceError.message}`)
       return
     }
 
@@ -2319,8 +2426,25 @@ export default function Pharmacy() {
       const { error: creditError } = await supabase.from('credit_debts').insert(creditPayload)
       if (creditError) {
         console.warn('Credit ledger insert failed', creditError)
-        window.notifyFromLegacyAlert(`Receipt created, but automatic credit ledger posting failed: ${creditError.message}`)
+        notifyError(`Receipt created, but automatic credit ledger posting failed: ${creditError.message}`)
       }
+    }
+
+    if (cdsDangers.length > 0) {
+      const { error: overrideError } = await supabase.from('cds_overrides').insert(cdsDangers.map(alert => ({
+        hospital_id: hospitalId,
+        visit_id: visitId || null,
+        patient_id: patientId || null,
+        doctor_name: form.released_by.trim(),
+        drug_name: alert.message.split(':')[0],
+        rule: alert.rule,
+        severity: alert.severity,
+        message: alert.message,
+        reason: String(form.cds_reason || '').trim(),
+        user_role: userRole || null,
+        acknowledged_at: new Date().toISOString(),
+      })))
+      if (overrideError) console.warn('CDS override logging failed', overrideError)
     }
 
     await logAudit(supabase, {
@@ -2358,7 +2482,7 @@ export default function Pharmacy() {
         const { error: flagError } = await supabase.from('ppb_dispensing_flags').insert(flagRows)
         if (flagError) {
           console.warn('PPB flag logging failed', flagError)
-          window.notifyFromLegacyAlert(`Receipt created, but PPB risk logging failed: ${flagError.message}`)
+          notifyError(`Receipt created, but PPB risk logging failed: ${flagError.message}`)
         }
       }
     }
@@ -2378,7 +2502,7 @@ export default function Pharmacy() {
 
         const message = buildMessage(rxSetting.template || DEFAULT_TEMPLATES.prescription_ready, {
           patient_name: patientName,
-          hospital_name: hospitalName || 'Brightpath Travel Scholars',
+          hospital_name: hospitalName || 'RemedacareHMS',
           drug_name: drugLabel,
         })
 
@@ -2401,11 +2525,13 @@ export default function Pharmacy() {
 
     setReleaseModal(null)
     setPpbRiskModal(null)
-    setReceiptModal({
-      ...(createdInvoice || invoicePayload),
+    const showSlip = (inv) => setReceiptModal({
+      ...(inv || createdInvoice || invoicePayload),
       receipt_number: receiptNumber,
       served_by: form.released_by.trim(),
     })
+    // Money is taken at the cashier only.
+    showSlip(createdInvoice)
 
     broadcastPrescriptionsChanged({ ids, source: 'pharmacy-release' })
     broadcastWorkflowChanged({
@@ -2472,6 +2598,9 @@ export default function Pharmacy() {
         <PharmacyDispenseQueue
           rxSearch={rxSearch}
           setRxSearch={setRxSearch}
+          departmentFilter={departmentFilter}
+          setDepartmentFilter={setDepartmentFilter}
+          pharmacyDepartments={pharmacyDepartments}
           rxFilter={rxFilter}
           setRxFilter={setRxFilter}
           filteredGroups={filteredGroups}
@@ -2529,7 +2658,7 @@ export default function Pharmacy() {
               <div>
                 <h3 style={css.modalTitle}>⚠️ SHA Reimbursement Risk</h3>
                 <div style={css.modalSub}>
-                  The drugs below are not PPB-verified for SHA reimbursement. Continuing will convert this release to patient self-pay.
+                  Confirmed PPB/SHA restrictions or unavailable catalogue data require manual review. Continuing this release converts it to patient self-pay.
                 </div>
               </div>
               <button style={{ ...css.btn, ...css.btnGhost, padding: '7px 12px' }} onClick={() => !actionBusy && setPpbRiskModal(null)}>Close</button>
@@ -2544,9 +2673,11 @@ export default function Pharmacy() {
                   <div key={`${result.drug_name}-${result.generic_name}`} style={{ border: `1px solid ${C.border}`, borderRadius: '12px', padding: '11px 12px', background: C.surface }}>
                     <div style={{ fontSize: '13px', fontWeight: 800, color: C.text }}>{result.drug_name || result.generic_name || 'Drug'}</div>
                     <div style={{ fontSize: '11px', color: C.sub, marginTop: '4px' }}>
-                      {!result.approved
-                        ? 'Not found in the bundled PPB catalogue.'
-                        : 'Found in PPB catalogue but marked non-reimbursable for SHA.'}
+                      {result.catalogue_status === 'unverified'
+                        ? 'Could not verify: authoritative PPB catalogue data is not bundled. Confirm status manually before reimbursement.'
+                        : !result.approved
+                          ? 'Confirmed not found in the PPB catalogue.'
+                          : 'Found in the PPB catalogue but marked non-reimbursable for SHA.'}
                     </div>
                     {result.ppb_reg_number && (
                       <div style={{ fontSize: '11px', color: C.sub, marginTop: '4px' }}>PPB Reg: {result.ppb_reg_number}</div>

@@ -1,0 +1,11 @@
+# Add to supabase/config.toml — gateways call this endpoint without a Supabase JWT.
+[functions.payments-webhook]
+verify_jwt = false
+
+# Everything else verifies the user's JWT inside the function.
+[functions.payments-initiate]
+verify_jwt = false
+[functions.payments-status]
+verify_jwt = false   # the cron sweep uses x-cron-secret; user calls are verified in code
+[functions.payments-refund]
+verify_jwt = false

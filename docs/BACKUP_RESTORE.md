@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Brightpath Travel Scholars now includes an admin backup export designed for pilot recovery and operational assurance.
+RemedacareHMS now includes an admin backup export designed for pilot recovery and operational assurance.
 
 ## What the backup includes
 

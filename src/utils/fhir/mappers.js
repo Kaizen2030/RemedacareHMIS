@@ -2,7 +2,6 @@ const KENYA_ID_SYSTEM = 'https://health.go.ke/identifier'
 const REMEDACARE_ID_SYSTEM = 'https://remedacare.health/identifier'
 
 const DRUG_SNOMED_RXNORM = {
-  'artemether-lumefantrine': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '197361', display: 'Artemether / Lumefantrine' },
   'amoxicillin': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '723', display: 'Amoxicillin' },
   'co-trimoxazole': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '10831', display: 'Sulfamethoxazole / Trimethoprim' },
   'metformin': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '6809', display: 'Metformin' },
@@ -11,23 +10,19 @@ const DRUG_SNOMED_RXNORM = {
   'losartan': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '52175', display: 'Losartan' },
   'warfarin': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '11289', display: 'Warfarin' },
   'aspirin': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '1191', display: 'Aspirin' },
-  'tenofovir': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '1147521', display: 'Tenofovir' },
-  'dolutegravir': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '1659151', display: 'Dolutegravir' },
-  'efavirenz': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '301542', display: 'Efavirenz' },
   'isoniazid': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '6038', display: 'Isoniazid' },
   'rifampicin': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '9384', display: 'Rifampicin' },
   'insulin': { system: 'http://www.nlm.nih.gov/research/umls/rxnorm', code: '5856', display: 'Insulin' },
 }
 
 const LAB_LOINC = {
-  'cd4 count': createFHIRCoding('http://loinc.org', '8123-2', 'CD4 cells [#/volume] in Blood'),
-  'viral load': createFHIRCoding('http://loinc.org', '25836-8', 'HIV 1 RNA [#/volume]'),
+  'cd4 count': createFHIRCoding('http://loinc.org', '24467-3', 'CD3+CD4+ (T4 helper) cells [#/volume] in Blood'),
+  'viral load': createFHIRCoding('http://loinc.org', '20447-9', 'HIV 1 RNA [#/volume] (viral load) in Serum or Plasma by NAA with probe detection'),
   'hba1c': createFHIRCoding('http://loinc.org', '4548-4', 'Hemoglobin A1c/Hemoglobin.total in Blood'),
   'fasting glucose': createFHIRCoding('http://loinc.org', '1558-6', 'Glucose [Mass/volume] in Serum or Plasma --Fasting'),
   'random glucose': createFHIRCoding('http://loinc.org', '2345-7', 'Glucose [Mass/volume] in Serum or Plasma'),
   'creatinine': createFHIRCoding('http://loinc.org', '2160-0', 'Creatinine [Mass/volume] in Serum or Plasma'),
-  'lft': createFHIRCoding('http://loinc.org', '24323-8', 'Comprehensive metabolic 2000 panel'),
-  'genexpert': createFHIRCoding('http://loinc.org', '62467-6', 'Mycobacterium tuberculosis DNA [Presence] in Specimen by NAA with probe detection'),
+  'lft': createFHIRCoding('http://loinc.org', '24325-3', 'Hepatic function 2000 panel - Serum or Plasma'),
   'full hemogram': createFHIRCoding('http://loinc.org', '57021-8', 'CBC W Auto Differential panel - Blood'),
   'urea and electrolytes': createFHIRCoding('http://loinc.org', '24321-2', 'Basic metabolic 2000 panel'),
 }
@@ -116,7 +111,7 @@ export function patientToFHIR(patient, hospitalId) {
     id: String(patient?.id || ''),
     meta: {
       profile: ['http://hl7.org/fhir/StructureDefinition/Patient'],
-      tag: [createFHIRCoding(encodeInternalIdentifier('hospital', hospitalId), String(hospitalId), 'Brightpath Travel Scholars Hospital Scope')],
+      tag: [createFHIRCoding(encodeInternalIdentifier('hospital', hospitalId), String(hospitalId), 'RemedacareHMS Hospital Scope')],
     },
     identifier: createKenyaIdentifiers(patient),
     name: [{
@@ -148,7 +143,7 @@ export function patientToFHIR(patient, hospitalId) {
         valueString: String(patient.allergies),
       }] : []),
     ],
-    managingOrganization: createFHIRReference('Organization', hospitalId, 'Brightpath Travel Scholars Facility'),
+    managingOrganization: createFHIRReference('Organization', hospitalId, 'RemedacareHMS Facility'),
   }
 }
 
@@ -184,7 +179,7 @@ export function visitToFHIREncounter(visit, patient, practitioner, hospitalId) {
     participant: practitioner?.id ? [{
       individual: createFHIRReference('Practitioner', practitioner.id, practitioner.full_name || practitioner.name || practitioner.email || 'Practitioner'),
     }] : [],
-    serviceProvider: createFHIRReference('Organization', hospitalId, firstDefined(visit?.hospital_name, 'Brightpath Travel Scholars Facility')),
+    serviceProvider: createFHIRReference('Organization', hospitalId, firstDefined(visit?.hospital_name, 'RemedacareHMS Facility')),
     period: {
       start: firstDefined(visit?.created_at, visit?.visit_date, new Date().toISOString()),
       ...(firstDefined(visit?.discharged_at, visit?.discharge_date, visit?.updated_at) ? { end: firstDefined(visit?.discharged_at, visit?.discharge_date, visit?.updated_at) } : {}),
@@ -352,7 +347,7 @@ export function prescriptionToFHIRMedicationRequest(prescription, visit, patient
 
 export function labResultToFHIRDiagnosticReport(labTest, patient, visit, hospitalId) {
   const key = makeSlug(firstDefined(labTest?.test_name, labTest?.test_type))
-  const loinc = LAB_LOINC[key] || null
+  const loinc = LAB_LOINC[key.replace(/-/g, ' ')] || null
   return {
     resourceType: 'DiagnosticReport',
     id: String(labTest?.id || ''),
@@ -369,7 +364,7 @@ export function labResultToFHIRDiagnosticReport(labTest, patient, visit, hospita
     encounter: createFHIRReference('Encounter', visit?.id || labTest?.visit_id, firstDefined(visit?.visit_number, 'Clinical encounter')),
     effectiveDateTime: firstDefined(labTest?.ordered_at, labTest?.created_at, new Date().toISOString()),
     issued: firstDefined(labTest?.results_ready_at, labTest?.updated_at, labTest?.ordered_at),
-    performer: [createFHIRReference('Organization', hospitalId, 'Brightpath Travel Scholars Laboratory')],
+    performer: [createFHIRReference('Organization', hospitalId, 'RemedacareHMS Laboratory')],
     result: Array.isArray(labTest?.observations)
       ? labTest.observations.map((observation) => createFHIRReference('Observation', observation.id || observation.reference || `${labTest.id}-obs`, observation.label || observation.test_name))
       : [],
@@ -427,7 +422,7 @@ export function invoiceToFHIRClaim(invoice, patient, visit, hospitalId, shaClaim
     patient: createFHIRReference('Patient', patient?.id || invoice?.patient_id, patient?.full_name || invoice?.patient_name),
     created: firstDefined(invoice?.created_at, shaClaim?.created_at, new Date().toISOString()),
     insurer: createFHIRReference('Organization', 'SHA', 'Social Health Authority'),
-    provider: createFHIRReference('Organization', hospitalId, 'Brightpath Travel Scholars Facility'),
+    provider: createFHIRReference('Organization', hospitalId, 'RemedacareHMS Facility'),
     priority: {
       coding: [createFHIRCoding('http://terminology.hl7.org/CodeSystem/processpriority', 'normal', 'Normal')],
     },
@@ -460,7 +455,7 @@ export function hospitalToFHIROrganization(hospital) {
       ...(hospital?.moh_facility_code ? [{ system: `${KENYA_ID_SYSTEM}/moh-facility-code`, value: String(hospital.moh_facility_code) }] : []),
       ...(hospital?.sha_provider_number ? [{ system: `${KENYA_ID_SYSTEM}/sha-provider-number`, value: String(hospital.sha_provider_number) }] : []),
     ],
-    name: String(firstDefined(hospital?.name, 'Brightpath Travel Scholars Facility')),
+    name: String(firstDefined(hospital?.name, 'RemedacareHMS Facility')),
     telecom: hospital?.phone ? [{ system: 'phone', value: String(hospital.phone) }] : [],
     address: [{
       text: String(firstDefined(hospital?.physical_address, hospital?.location, '')),
@@ -525,7 +520,7 @@ export function createVisitDocumentBundle({ hospital, patient, encounter, practi
     encounter: encounter?.id ? createFHIRReference('Encounter', encounter.id) : undefined,
     date: new Date().toISOString(),
     author: practitioner?.id ? [createFHIRReference('Practitioner', practitioner.id, practitioner?.name?.[0]?.text)] : [],
-    title: `Brightpath Travel Scholars Visit Bundle - ${patient?.name?.[0]?.text || patient?.id}`,
+    title: `RemedacareHMS Visit Bundle - ${patient?.name?.[0]?.text || patient?.id}`,
     section: [
       { title: 'Vitals', entry: observations.map(item => createFHIRReference('Observation', item.id)) },
       { title: 'Prescriptions', entry: medicationRequests.map(item => createFHIRReference('MedicationRequest', item.id)) },

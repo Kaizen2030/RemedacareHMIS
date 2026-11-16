@@ -10,7 +10,7 @@ function createWindow() {
       contextIsolation: true
     },
     icon: path.join(__dirname, '..', 'icon.ico'), // optional
-    title: 'Brightpath Travel Scholars'
+    title: 'RemedacareHMS'
   })
 
   win.loadURL('http://localhost:5173') // your Vite dev port

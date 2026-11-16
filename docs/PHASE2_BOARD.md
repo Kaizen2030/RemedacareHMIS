@@ -1,4 +1,4 @@
-# Brightpath Travel Scholars Phase 2 Board
+# RemedacareHMS Phase 2 Board
 
 Phase 2 is about enterprise hardening: trust, recoverability, traceability, and operational visibility.
 

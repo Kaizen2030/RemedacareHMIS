@@ -208,7 +208,7 @@ function createWindow() {
     height: 800,
     minWidth: 1100,
     minHeight: 650,
-    title: 'Brightpath Travel Scholars',
+    title: 'RemedacareHMS',
     icon: path.join(__dirname, '..', 'icon.ico'),
     backgroundColor: '#ffffff',
     show: false,

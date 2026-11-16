@@ -2,12 +2,13 @@ import { useEffect, useMemo, useState } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import PaginationBar, { paginateItems } from '../components/PaginationBar'
-import { buildFunctionUrl, fetchFhirBundle } from '../utils/fhir/client'
-import { searchIcd10Diagnoses } from '../utils/icd10Kenya'
+import { fetchFhirBundle } from '../utils/fhir/client'
+import { searchDiagnoses as searchIcd10Diagnoses } from '../utils/icd10Kenya'
 import { resolveRole } from '../access'
 import { useHospital } from '../context'
 import supabase from '../supabase'
 import { colors as C, typography } from '../theme'
+import { notifyError, notifyFromLegacyAlert, notifyInfo, notifySuccess, notifyWarning } from '../notifications'
 
 const COMMON_FACILITIES = [
   'Kenyatta National Hospital',
@@ -111,12 +112,15 @@ function createStatusNote(status, note, author) {
   }
 }
 
-function buildReferralQrValue(referral) {
-  return JSON.stringify({
-    resourceType: 'Reference',
-    reference: `Bundle/${referral.visit_id || referral.id}`,
-    fhirEndpoint: buildFunctionUrl('fhir-bundle', { hospitalId: referral.hospital_id, visitId: referral.visit_id || '' }),
-  })
+/** Public web address of the app (the desktop build runs from file://, so fall back to the hosted site). */
+function appBaseUrl() {
+  const origin = typeof window !== 'undefined' ? window.location.origin : ''
+  return /^https?:/.test(origin) ? origin : (import.meta.env.VITE_SITE_URL || 'https://remedacarehms.com')
+}
+
+/** The QR code opens the read-only visit summary for the receiving facility (time-limited share link). */
+export function referralShareUrl(token) {
+  return `${appBaseUrl().replace(/\/$/, '')}/#/shared/referral/${encodeURIComponent(token)}`
 }
 
 function DiagnosisPicker({ value, label, onCodeChange, disabled = false }) {
@@ -190,7 +194,7 @@ function DiagnosisPicker({ value, label, onCodeChange, disabled = false }) {
   )
 }
 
-function ReferralLetter({ referral, hospitalName, hospitalProfile }) {
+function ReferralLetter({ referral, hospitalName, hospitalProfile, share = null }) {
   const logo = hospitalProfile?.logoBase64
     ? `<img src="${hospitalProfile.logoBase64}" alt="Hospital logo" style="width:72px;height:72px;object-fit:cover;border-radius:16px;border:1px solid #E5E7EB;" />`
     : `<div style="width:72px;height:72px;border:2px dashed #94A3B8;border-radius:16px;display:flex;align-items:center;justify-content:center;color:#64748B;font-size:11px;">Logo</div>`
@@ -201,9 +205,10 @@ function ReferralLetter({ referral, hospitalName, hospitalProfile }) {
     : '<li>None documented</li>'
 
   const vitals = referral.vitals_at_referral || {}
-  const qrMarkup = renderToStaticMarkup(
-    <QRCodeSVG value={buildReferralQrValue(referral)} size={96} fgColor="#0F6E56" bgColor="#FFFFFF" />
-  )
+  const qrMarkup = share?.url
+    ? renderToStaticMarkup(<QRCodeSVG value={share.url} size={110} fgColor="#0F6E56" bgColor="#FFFFFF" />)
+      + `<div style="font-size:10px;color:#475467;max-width:180px;margin-top:4px">Receiving clinician: scan to view this visit's record (vitals, diagnoses, medicines, labs). Valid until ${new Date(share.expires_at).toLocaleDateString('en-KE')}.</div>`
+    : `<div style="font-size:10px;color:#475467;max-width:180px">${share?.error ? 'Electronic record link unavailable: ' + share.error : ''}</div>`
 
   return `
     <html>
@@ -525,11 +530,16 @@ export default function Referrals() {
 
   async function handleCreateReferral() {
     if (!canCreate) {
-      window.notifyFromLegacyAlert('You do not have permission to create referrals.')
+      notifyWarning('You do not have permission to create referrals.')
       return
     }
+    const isInternalReferral = normalizeText(form.receiving_facility) === normalizeText(hospitalName)
     if (!form.patient_id || !form.receiving_facility || !form.clinical_summary || !form.referral_reason) {
-      window.notifyFromLegacyAlert('Patient, receiving facility, clinical summary and referral reason are required.')
+      notifyWarning('Patient, receiving facility, clinical summary and referral reason are required.')
+      return
+    }
+    if (isInternalReferral && (!form.visit_id || !form.receiving_department)) {
+      notifyInfo('Internal referrals require a linked visit and receiving department.')
       return
     }
 
@@ -561,18 +571,37 @@ export default function Referrals() {
     })
     setSaving(false)
     if (error) {
-      window.notifyFromLegacyAlert(`Unable to save referral: ${error.message}`)
+      notifyError(`Unable to save referral: ${error.message}`)
       return
+    }
+    if (isInternalReferral) {
+      const { error: visitError } = await supabase
+        .from('visits')
+        .update({
+          status: 'Doctor',
+          speciality: form.receiving_department,
+          assigned_doctor_name: null,
+          doctor_notes: `Internal referral: ${form.referral_reason}`,
+        })
+        .eq('id', form.visit_id)
+        .eq('hospital_id', hospitalId)
+      if (visitError) {
+        notifyError(`Referral saved, but the department handoff failed: ${visitError.message}`)
+        return
+      }
+      window.dispatchEvent(new CustomEvent('remedacare:workflow_changed', {
+        detail: { visit_id: form.visit_id, status: 'Doctor', department: form.receiving_department, source: 'internal-referral' },
+      }))
     }
     await loadData()
     setForm(emptyReferralForm(hospitalName))
     setSelectedPatient(null)
-    window.notifyFromLegacyAlert('Referral created successfully.')
+    notifySuccess('Referral created successfully.')
   }
 
   async function handleUpdateStatus(nextStatus) {
     if (!canUpdate || !selectedReferral) {
-      window.notifyFromLegacyAlert('Only Doctor and Admin can update referral status.')
+      notifyWarning('Only Doctor and Admin can update referral status.')
       return
     }
 
@@ -587,32 +616,40 @@ export default function Referrals() {
 
     const { error } = await supabase.from('referrals').update(payload).eq('id', selectedReferral.id)
     if (error) {
-      window.notifyFromLegacyAlert(`Unable to update referral status: ${error.message}`)
+      notifyError(`Unable to update referral status: ${error.message}`)
       return
     }
     setStatusNote('')
     await loadData()
-    window.notifyFromLegacyAlert(`Referral marked as ${nextStatus}.`)
+    notifySuccess(`Referral marked as ${nextStatus}.`)
   }
 
-  function printReferral(referral) {
+  async function printReferral(referral) {
+    // Open the window first (browsers block pop-ups opened after an await), then create the share link
     const win = window.open('', '_blank', 'width=980,height=820')
     if (!win) return
-    win.document.write(ReferralLetter({ referral, hospitalName: hospitalName || referral.referring_facility, hospitalProfile }))
+    win.document.write('<p style="font-family:Arial;padding:24px">Preparing the referral letter…</p>')
+    let share = null
+    if (referral.visit_id) {
+      const { data, error } = await supabase.rpc('referral_share_create', { p_referral: String(referral.id), p_days: 30 })
+      share = error ? { error: /does not exist|schema cache/i.test(error.message) ? 'not installed yet' : error.message } : { url: referralShareUrl(data.token), expires_at: data.expires_at }
+    }
+    win.document.open()
+    win.document.write(ReferralLetter({ referral, hospitalName: hospitalName || referral.referring_facility, hospitalProfile, share }))
     win.document.close()
   }
 
   async function handleSendViaFhir(referral) {
     if (!canUpdate) {
-      window.notifyFromLegacyAlert('Only Doctor and Admin can send referral bundles.')
+      notifyWarning('Only Doctor and Admin can send referral bundles.')
       return
     }
     if (!referral?.visit_id) {
-      window.notifyFromLegacyAlert('This referral is not linked to a visit yet.')
+      notifyWarning('This referral is not linked to a visit yet.')
       return
     }
     if (!referral?.receiving_fhir_endpoint) {
-      window.notifyFromLegacyAlert('Enter the receiving facility FHIR endpoint first.')
+      notifyWarning('Enter the receiving facility FHIR endpoint first.')
       return
     }
 
@@ -653,14 +690,14 @@ export default function Referrals() {
       if (error) throw error
       await loadData()
       if (response.ok) {
-        window.notifyFromLegacyAlert(`Referral bundle sent to ${referral.receiving_facility}.`)
+        notifySuccess(`Referral bundle sent to ${referral.receiving_facility}.`)
       } else {
         setResponseModal({ title: `FHIR send failed · ${referral.patient_name}`, payload: parsed })
-        window.notifyFromLegacyAlert('FHIR send failed. Review the response for details.')
+        notifyError('FHIR send failed. Review the response for details.')
       }
     } catch (error) {
       setResponseModal({ title: `FHIR send failed · ${referral.patient_name}`, payload: { error: error instanceof Error ? error.message : 'Unknown error' } })
-      window.notifyFromLegacyAlert(error instanceof Error ? error.message : 'Unable to send referral via FHIR.')
+      notifyFromLegacyAlert(error instanceof Error ? error.message : 'Unable to send referral via FHIR.')
     }
   }
 
@@ -772,8 +809,12 @@ export default function Referrals() {
                 placeholder="Select or type receiving facility"
               />
               <datalist id="receiving-facilities">
+                {hospitalName && <option value={hospitalName} />}
                 {COMMON_FACILITIES.map(item => <option key={item} value={item} />)}
               </datalist>
+              {normalizeText(form.receiving_facility) === normalizeText(hospitalName) && (
+                <div style={{ fontSize: 11, color: C.primary, marginTop: 6 }}>Internal referral: the linked visit will move into the selected department queue.</div>
+              )}
             </Field>
 
             <Field label="Receiving Facility FHIR Endpoint (optional)">

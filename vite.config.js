@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { fileURLToPath } from 'node:url'
 
 export default defineConfig({
   plugins: [react()],
@@ -8,12 +9,18 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     setupFiles: './src/test/setup.js',
+    // supabase/tests/db runs on node:test + PGlite (npm run test:db), not vitest
+    exclude: ['e2e/**', 'node_modules/**', 'dist/**', 'dist-electron/**', 'supabase/tests/db/**'],
+    // Edge functions import supabase-js from esm.sh (Deno); unit tests swap in a stub.
+    alias: {
+      'https://esm.sh/@supabase/supabase-js@2.45.4': fileURLToPath(new URL('./supabase/tests/stubs/supabase-js.ts', import.meta.url)),
+    },
   },
   server: {
     port: 5173,
     strictPort: true,
     watch: {
-      ignored: ['**/dist-electron/**', '**/dist/**']
+      ignored: ['**/dist-electron/**', '**/dist/**', '**/*.zip', '**/supabase/tests/db/**']
     }
   },
   build: {
@@ -24,18 +31,6 @@ export default defineConfig({
           return
         }
         warn(warning)
-      },
-      output: {
-        manualChunks(id) {
-          if (id.includes('node_modules')) {
-            if (id.includes('node_modules/react') || id.includes('node_modules/react-dom')) return 'react-vendor'
-            if (id.includes('node_modules/@supabase')) return 'supabase-vendor'
-            if (id.includes('node_modules/pdfjs-dist')) return 'pdfjs'
-            if (id.includes('node_modules/tesseract.js')) return 'tesseract'
-            if (id.includes('node_modules/xlsx')) return 'xlsx'
-            return 'vendor'
-          }
-        }
       }
     }
   }

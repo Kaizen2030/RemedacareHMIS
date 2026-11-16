@@ -12,16 +12,14 @@ export function getAuthResetRedirectUrl() {
   const electronRedirect = getElectronRedirect('reset')
   if (electronRedirect) return electronRedirect
 
-  const origin = getAppOrigin()
-  // Supabase appends the recovery token in the URL fragment. A HashRouter path
-  // would create a second fragment and prevent the token from being restored.
-  return origin ? `${origin}/?type=recovery` : undefined
+  // The app is expected to reopen through the RemedacareHMS custom URL scheme
+  // so recovery tokens can be processed by the desktop/mobile client.
+  return 'remedacarehms://reset'
 }
 
 export function getAuthConfirmRedirectUrl() {
   const electronRedirect = getElectronRedirect('activate')
   if (electronRedirect) return electronRedirect
 
-  const origin = getAppOrigin()
-  return origin ? `${origin}/?type=signup` : undefined
+  return 'remedacarehms://activate'
 }

@@ -1,5 +1,6 @@
 import React from 'react'
 import { colors, typography } from '../theme'
+import { recordAppError } from '../utils/problemReport'
 
 export default class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -13,6 +14,7 @@ export default class ErrorBoundary extends React.Component {
 
   componentDidCatch(error, info) {
     console.error('Screen render failed:', error, info)
+    recordAppError(error, 'screen crashed')
   }
 
   handleReload = () => {

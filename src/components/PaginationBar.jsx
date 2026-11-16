@@ -66,9 +66,9 @@ export default function PaginationBar({
     ...styles.button,
   }
   const activeButtonStyle = {
-    background: '#5B21B6',
+    background: '#0F6E56',
     color: '#fff',
-    border: '1px solid #5B21B6',
+    border: '1px solid #0F6E56',
     ...styles.activeButton,
   }
   const disabledStyle = {
