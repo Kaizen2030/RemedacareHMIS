@@ -165,9 +165,9 @@ export function getThemePalette(mode = THEME_MODES.light) {
 
 export function getStoredThemeMode() {
   if (typeof window === 'undefined') return THEME_MODES.light
-  const stored = window.localStorage.getItem(THEME_STORAGE_KEY)
-  if (stored === THEME_MODES.dark || stored === THEME_MODES.light) return stored
-  if (window.matchMedia?.('(prefers-color-scheme: dark)').matches) return THEME_MODES.dark
+  // Keep each fresh app launch in the requested normal light appearance. The old
+  // setting and device dark-mode preference must not turn a new visit dark.
+  try { window.localStorage.setItem(THEME_STORAGE_KEY, THEME_MODES.light) } catch (_) {}
   return THEME_MODES.light
 }
 

@@ -1630,7 +1630,10 @@ const RESPONSIVE_CSS = `
 
 const styles = {
   fullscreen: {
-    minHeight: '100%', // fills #root (the visible screen); 100vh is taller than the screen on iPhone
+    height: '100%',
+    minHeight: 0,
+    overflowY: 'auto',
+    overscrollBehavior: 'contain',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
@@ -1656,7 +1659,10 @@ const styles = {
   },
   container: {
     display: 'flex',
-    height: '100%', // exactly the visible screen: only the menu and the content area scroll
+    height: '100%', // #root is fixed to the visible device viewport; only app panels scroll
+    minHeight: 0,
+    minWidth: 0,
+    overflow: 'hidden',
     background: colors.bgAlt,
     fontFamily: typography.systemFontFamily,
   },
@@ -1690,7 +1696,7 @@ const styles = {
     overflow: 'hidden',
     textOverflow: 'ellipsis',
   },
-  nav: { flex: 1, overflowY: 'auto', padding: '8px 0' },
+  nav: { flex: 1, minHeight: 0, overflowY: 'auto', overscrollBehavior: 'contain', WebkitOverflowScrolling: 'touch', padding: '8px 0' },
   navSection: { marginBottom: '6px' },
   navSectionTitle: {
     fontSize: '9px',
@@ -1805,7 +1811,7 @@ const styles = {
     justifyContent: 'center',
     flexShrink: 0,
   },
-  main: { flex: 1, overflowY: 'auto', overflowX: 'hidden', overscrollBehavior: 'contain', WebkitOverflowScrolling: 'touch', background: colors.bgAlt, minWidth: 0 },
+  main: { flex: 1, minWidth: 0, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', overscrollBehavior: 'contain', WebkitOverflowScrolling: 'touch', background: colors.bgAlt },
   topbar: {
     position: 'sticky',
     top: 0,

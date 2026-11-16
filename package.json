@@ -11,7 +11,9 @@
   },
   "main": "electron/main.js",
   "scripts": {
+    "predev": "node scripts/check-browser-key.mjs development",
     "dev": "vite",
+    "prebuild": "node scripts/check-browser-key.mjs production",
     "build": "vite build",
     "test": "vitest run",
     "test:smoke": "vitest run src/app.smoke.test.jsx",
@@ -19,6 +21,7 @@
     "test:watch": "vitest",
     "preview": "vite preview",
     "electron:dev": "node electron/start-dev.js",
+    "preelectron:build": "node scripts/check-browser-key.mjs production",
     "electron:build": "vite build && electron-builder",
     "test:e2e": "playwright test",
     "test:e2e:live": "npx playwright test e2e/live-app.spec.js",

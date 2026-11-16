@@ -1446,14 +1446,18 @@ export default function Login({ onLogin, isPasswordRecovery, onResetDone, brandi
 
 const st = {
   page: {
-    minHeight: '100vh',
+    height: '100%',
+    minHeight: 0,
     background: 'linear-gradient(180deg, #F7FCF9 0%, #F0F2F0 100%)',
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'center',
+    justifyContent: 'flex-start',
     padding: '32px 16px',
     position: 'relative',
-    overflow: 'hidden',
+    overflowX: 'hidden',
+    overflowY: 'auto',
+    overscrollBehavior: 'contain',
+    WebkitOverflowScrolling: 'touch',
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
   },
   heroGlow: (accent) => ({
@@ -1468,6 +1472,7 @@ const st = {
     pointerEvents: 'none',
   }),
   card: {
+    margin: 'auto',
     background: '#fff',
     borderRadius: '20px',
     padding: '38px',
