@@ -6,6 +6,7 @@ import { DEPARTMENT_CONFIG } from './department'
 import { logAudit } from '../utils/audit'
 import { broadcastWorkflowChanged } from '../utils/workflowEvents'
 import SettingsPayments from './settings/SettingsPayments'
+import SettingsAi from './settings/SettingsAi'
 import SettingsPrivacy from './settings/SettingsPrivacy'
 import SettingsConfiguration from './settings/SettingsConfiguration'
 import SettingsFhir from './settings/SettingsFhir'
@@ -175,6 +176,7 @@ const TABS = [
  { key:'staff', label:'👥 Staff & Users', adminOnly: true },
  { key:'audit', label:'📝 Audit Log', adminOnly: true },
  { key:'payments', label:'💳 Payments', adminOnly: true },
+ { key:'ai', label:'🤖 AI providers', adminOnly: true },
  { key:'privacy', label:'🔒 Privacy & access log', adminOnly: true },
  { key:'config', label:'🧩 Configuration', adminOnly: true },
  { key:'fhir', label:'🔌 FHIR API', adminOnly: true },
@@ -1479,6 +1481,7 @@ export default function Settings() {
   )}
 
   {activeTab==='payments' && <SettingsPayments hospitalId={hospitalId} />}
+  {activeTab==='ai' && <SettingsAi hospitalId={hospitalId} />}
   {activeTab==='privacy' && <SettingsPrivacy hospitalId={hospitalId} />}
   {activeTab==='config' && <SettingsConfiguration hospitalId={hospitalId} />}
   {activeTab==='fhir' && <SettingsFhir hospitalId={hospitalId} />}

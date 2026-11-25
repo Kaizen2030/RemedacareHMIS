@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import supabase from '../supabase'
 import { useHospital } from '../context'
 import { executeWithFallback } from '../utils/dbCompat'
-import { extractGeminiText, generateGeminiContent } from '../utils/geminiProxy'
+import { streamGeminiContent } from '../utils/geminiProxy'
 import { buildAmrInterventions, summarizeAmrInterventions } from '../utils/hospitalSignals'
 import { executeMicrobiologyQuery } from '../utils/microbiologyResults'
 
@@ -35,6 +35,8 @@ export default function AI() {
   const [fileName, setFileName] = useState('')
   const [extracting, setExtracting] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [answeringWith, setAnsweringWith] = useState('') // AI provider currently answering
+  const [answerStarted, setAnswerStarted] = useState(false) // first words have arrived
   const [hospitalData, setHospitalData] = useState({
     inventory: [],
     pharmacyInventory: [],
@@ -702,22 +704,37 @@ answer both parts sequentially, clearly labeled.
         parts.push({ inlineData: { mimeType: selectedFile.type, data: filePreview.split(',')[1] } })
       }
 
-      const data = await generateGeminiContent({
+      // The answer streams in word by word; the server falls back to the next AI provider if one is busy or slow.
+      const showLive = (text) => setMessages(prev => {
+        const last = prev[prev.length - 1]
+        if (last?.streaming) return text ? [...prev.slice(0, -1), { ...last, text }] : prev.slice(0, -1)
+        return text ? [...prev, { type: 'bot', text, streaming: true }] : prev
+      })
+      const result = await streamGeminiContent({
         contents: [{ parts }],
         generationConfig: {
           temperature: 0.3,
           maxOutputTokens: 1800,
           topP: 0.95,
           topK: 40
-        }
+        },
+        hospitalId,
+      }, (text, providerLabel) => {
+        if (providerLabel) setAnsweringWith(providerLabel)
+        setAnswerStarted(Boolean(text))
+        showLive(text)
       })
 
-      const aiText = extractGeminiText(data, '\n\n') || 'I could not generate a response.'
-      setMessages(prev => [...prev, { type: 'bot', text: aiText.trim() }])
+      setMessages(prev => {
+        const finished = { type: 'bot', text: result.text, answeredBy: result.provider }
+        return prev[prev.length - 1]?.streaming ? [...prev.slice(0, -1), finished] : [...prev, finished]
+      })
     } catch (err) {
       console.error(err)
-      setMessages(prev => [...prev, { type: 'bot', text: `Error: ${err.message || 'Failed to connect to AI.'}` }])
+      setMessages(prev => [...prev.filter(message => !message.streaming), { type: 'bot', text: `Error: ${err.message || 'Failed to connect to AI.'}` }])
     }
+    setAnswerStarted(false)
+    setAnsweringWith('')
 
     setSelectedFile(null)
     setFilePreview(null)
@@ -733,7 +750,7 @@ answer both parts sequentially, clearly labeled.
           <h2 style={styles.title}>AI Clinical Assist</h2>
           <div style={styles.subtitle}>HMIS assistant for {hospitalName || 'your hospital'}</div>
         </div>
-        <span style={styles.powered}>Powered by Google Gemini • hospital-aware</span>
+        <span style={styles.powered}>Multi-AI with automatic fallback • hospital-aware</span>
       </div>
 
       <div style={styles.snapshotRow}>
@@ -760,10 +777,10 @@ answer both parts sequentially, clearly labeled.
               <div style={{ whiteSpace: 'pre-wrap', lineHeight: '1.6' }}>{msg.text}</div>
             </div>
           ))}
-          {loading && (
+          {loading && !answerStarted && (
             <div style={styles.msgBot}>
               <div style={styles.botLabel}>HMIS AI</div>
-              Thinking...
+              {answeringWith ? `Thinking (${answeringWith})...` : 'Thinking...'}
             </div>
           )}
         </div>
